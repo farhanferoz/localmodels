@@ -1,0 +1,47 @@
+# systemd --user unit template for `localmodels serve` (B12.4).
+#
+# This is a TEMPLATE: copy it, then fill in the placeholders below for your project before
+# installing it -- it is not meant to be used verbatim from this repository.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user ~/.config/localmodels
+#   cp deploy/localmodels.service ~/.config/systemd/user/<your-project>-models.service
+#   # edit the copy: WorkingDirectory, ExecStart's --config path, and the config file itself
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now <your-project>-models.service
+#
+# `loginctl show-user <you> -p Linger` must report `Linger=yes` for this unit to keep running
+# after you log out (mirrors service_a's own model unit, deploy/systemd/service_a-models.service,
+# verified on the DGX 2026-09-25).
+#
+# Configuration (~/.config/localmodels/<your-project>-serve.toml, a [server] table --
+# localmodels.service.ServeConfig):
+#   [server]
+#   host = "127.0.0.1"          # never 0.0.0.0: llama-server has no auth of its own
+#   port = 8091                 # this project's port -- never 8080 (D5's reservation)
+#   model_path = "/absolute/path/to/model.gguf"
+#   project = "<your-project>"  # the GPU lease file's name: <project>.json
+#   reserved_ports = [8080]     # ports this server refuses to start or stop on
+#   contention = "refuse"       # "refuse": never start while another project holds the GPU
+#                                # "wait": queue for it instead (service_c's policy)
+#
+# Serving parameters (n_gpu_layers/n_ctx/n_parallel) are never in this config -- `localmodels
+# serve` derives them fresh from measured hardware each time it (re)starts (code standard:
+# hardware-aware, never hardware-keyed).
+#
+# SIGTERM/SIGINT (systemctl --user stop) are handled: `localmodels serve` stops the child
+# llama-server cleanly (SIGTERM, 20s grace, then SIGKILL) before this unit's own process exits.
+
+[Unit]
+Description=localmodels: <your-project> local llama-server (localmodels serve)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/localmodels
+ExecStart=%h/.local/bin/uv run localmodels serve --config %h/.config/localmodels/<your-project>-serve.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

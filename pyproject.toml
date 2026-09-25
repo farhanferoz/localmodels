@@ -1,13 +1,17 @@
 [project]
 name = "localmodels"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hardware-aware local LLM serving, GPU-lease coordination and model catalogue, torch-free"
 requires-python = ">=3.12,<3.14"
 license = "MIT"
 dependencies = [
   "pydantic>=2.13",
   "httpx>=0.28",
+  "huggingface-hub==2.0.0",
 ]
+
+[project.scripts]
+localmodels = "localmodels.cli:main"
 
 [project.optional-dependencies]
 hub = ["huggingface_hub>=0.26"]

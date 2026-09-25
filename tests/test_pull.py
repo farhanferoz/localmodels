@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from localmodels.catalogue import ModelCategory, ModelSpec
+from localmodels.enums import ModelSizeClass
 from localmodels.pull import model_status
 
 _GGUF_SPEC = ModelSpec(
@@ -11,6 +12,7 @@ _GGUF_SPEC = ModelSpec(
     description="workhorse generator",
     licence="apache-2.0",
     osi_approved=True,
+    size_class=ModelSizeClass.LARGE,
 )
 
 _SNAPSHOT_SPEC = ModelSpec(
@@ -20,6 +22,7 @@ _SNAPSHOT_SPEC = ModelSpec(
     description="embedding model",
     licence="mit",
     osi_approved=True,
+    size_class=ModelSizeClass.LARGE,
 )
 
 

@@ -30,7 +30,15 @@ for a different accelerator.
 - `localmodels.catalogue` / `localmodels.pull` — the shared shape of a model catalogue entry
   (`ModelSpec`), a `LicencePolicy` gate a caller applies to its own catalogue, and download/status
   helpers over the Hugging Face Hub. Catalogue *entries* are each caller's own data; this package
-  never ships a model list of its own.
+  never ships a *production* model list of its own (service_a's OSI-gated list and service_c's,
+  including non-commercial detectors, each stay in their own repository). The one exception is
+  `localmodels.setup.DEFAULT_CATALOGUE`, a small bootstrapping default so `localmodels setup`
+  works standalone with no `--catalogue` given — pass `--catalogue` to override it entirely.
+- `localmodels.backend` / `localmodels.bench` — detects which compute backend (`CUDA`/`Metal`/
+  `Vulkan`/`CPU`) a `llama-server` build actually serves on (`--list-devices`, falling back to
+  `ldd`), and runs/parses `llama-bench` for measured prompt/decode throughput.
+- `localmodels.setup` / `localmodels.service` — the `localmodels setup`/`localmodels serve` CLI
+  commands (below).
 
 ## Installing
 
@@ -38,8 +46,43 @@ for a different accelerator.
 uv add localmodels
 ```
 
-`huggingface_hub` is an optional extra (`localmodels[hub]`) — only `pull_model`, `check_updates`
-and `search_hub` need it; `model_status` reads the local disk only.
+`huggingface_hub` is a core dependency (Apache-2.0, pinned): `localmodels setup` needs it
+unconditionally to download a model, not just the callers who use `pull_model` directly.
+
+## CLI
+
+```
+localmodels setup [--role chat] [--models-dir DIR] [--catalogue FILE] [--yes]
+                   [--llama-server-bin PATH] [--device OVERRIDE]
+localmodels serve --config <toml>
+localmodels lease {status,acquire,wait,begin-wait,admitted,release} --project NAME ...
+```
+
+`localmodels setup` inspects the host, picks the largest OSI-licensed catalogue model for the
+measured size class, downloads it (pinned to its recorded revision), checks the `llama-server`
+backend, and benchmarks it under the shared GPU lease — one command, hardware-aware, idempotent,
+and safe to run repeatedly. Without `--yes` (or under `--dry-run`) it stops before downloading or
+benchmarking and shows the plan; every other step (hardware, model choice, backend detection) is
+always real, so the plan is accurate.
+
+**Pointing `setup`/`serve` at your `llama-server` build:** this package never guesses another
+project's binary location (torch-free/host-agnostic by design — no card-name tables, no
+hardcoded paths belonging to service_a or service_c). Resolution order: `--llama-server-bin
+PATH` (setup) / a server binary in your `ServeConfig`, then the `$LLAMA_SERVER_BIN` environment
+variable, then `PATH`. On a host where `llama-server` isn't on `PATH` (the common case — it is
+usually a project-local build, not a system package), set one of the first two or the backend
+check reports `FAILED` and `localmodels setup` exits non-zero, even under `--dry-run` — a
+`FAILED` step means the command could not truthfully complete what it was asked, and `--dry-run`
+does not change that meaning (matching service_c's own `setup.py`).
+
+`localmodels serve --config <toml>` runs one configured server (`[server]` table: `host`, `port`,
+`model_path`, `project`, `reserved_ports`, `contention`) under `LocalServerManager`/`supervise`,
+restarting after a yield once the other project's lease clears. `deploy/localmodels.service` is a
+systemd user-unit template.
+
+`localmodels lease ...` gives the shared GPU-lease protocol's operations as a command with
+documented exit codes (`0` ok, `2` another project's lease is live, `3` `wait` timed out), so a
+caller that cannot import this package (e.g. a bash queue) can still speak the protocol.
 
 ## Development
 

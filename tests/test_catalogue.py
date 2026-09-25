@@ -1,4 +1,5 @@
 from localmodels.catalogue import LicencePolicy, ModelCategory, ModelSpec, licence_allowed, select
+from localmodels.enums import ModelSizeClass
 
 _MIT_ENTRY = ModelSpec(
     alias="qwen3-moe",
@@ -8,6 +9,7 @@ _MIT_ENTRY = ModelSpec(
     description="workhorse generator",
     licence="apache-2.0",
     osi_approved=True,
+    size_class=ModelSizeClass.LARGE,
 )
 _NON_OSI_ENTRY = ModelSpec(
     alias="gemma-license",
@@ -16,6 +18,7 @@ _NON_OSI_ENTRY = ModelSpec(
     description="non-OSI custom licence",
     licence="gemma-terms-of-use",
     osi_approved=False,
+    size_class=ModelSizeClass.SMALL,
 )
 
 

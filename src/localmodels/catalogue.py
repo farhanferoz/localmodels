@@ -11,6 +11,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from localmodels.enums import ModelSizeClass  # noqa: TC001 - pydantic resolves field annotations at runtime
+
 
 class ModelCategory(StrEnum):
     """What a catalogue entry is for."""
@@ -35,9 +37,11 @@ class ModelSpec(BaseModel):
     category: ModelCategory
     repo_id: str
     filename: str | None = None
+    revision: str | None = None  # a pinned Hub revision; None = the default branch
     description: str
     licence: str
     osi_approved: bool
+    size_class: ModelSizeClass
     tier_recommendation: str = "high"
     default_for_category: bool = False
     local: bool = False

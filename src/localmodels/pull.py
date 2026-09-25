@@ -1,9 +1,8 @@
 """Model download and catalogue status over the Hugging Face Hub, torch-free.
 
-``huggingface_hub`` is imported lazily inside each function that touches the network: this
-package's own dependency list does not carry it (B12.4 adds it to the package that runs
-``localmodels setup``/``serve``), so a caller who only wants ``model_status`` never needs it
-installed. ``model_status`` itself never imports it — it only reads the local disk.
+``huggingface_hub`` is imported lazily inside each function that touches the network, so a caller
+who only wants ``model_status`` never loads it. ``model_status`` itself never imports it — it only
+reads the local disk.
 """
 
 from __future__ import annotations
@@ -81,8 +80,11 @@ def pull_model(spec: ModelSpec, *, models_dir: Path, filename: str | None = None
     fn = filename or spec.filename
     if fn:
         models_dir.mkdir(parents=True, exist_ok=True)
-        return Path(hf_hub_download(repo_id=spec.repo_id, filename=fn, local_dir=models_dir))
-    return Path(snapshot_download(repo_id=spec.repo_id))
+        path = hf_hub_download(
+            repo_id=spec.repo_id, filename=fn, revision=spec.revision, local_dir=models_dir
+        )
+        return Path(path)
+    return Path(snapshot_download(repo_id=spec.repo_id, revision=spec.revision))
 
 
 def check_updates(
