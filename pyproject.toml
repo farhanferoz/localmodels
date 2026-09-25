@@ -1,0 +1,80 @@
+[project]
+name = "localmodels"
+version = "0.1.0"
+description = "Hardware-aware local LLM serving, GPU-lease coordination and model catalogue, torch-free"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+dependencies = [
+  "pydantic>=2.13",
+  "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+hub = ["huggingface_hub>=0.26"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "hypothesis>=6.100",
+  "ruff>=0.16",
+  "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/localmodels"]
+
+[tool.uv]
+required-version = ">=0.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "D100", "D104", "D107",      # module/package/__init__ docstrings not required
+  "COM812", "ISC001",          # conflict with formatter
+  "ANN401",                    # Any allowed only in the JSON-decoding layer
+  "TRY003", "EM101", "EM102",  # exception message style
+  "FBT001", "FBT002",          # boolean positional args in small internal helpers
+  "CPY001",                    # no copyright-header convention in this repo
+]
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "D", "ANN", "SLF001", "ARG", "S105", "S607", "FURB167", "PERF401", "PLR0402", "PLR0913"]
+"tests/property/**" = ["INP001"]
+# LocalServerManager's constructor is this package's one entry point for dependency injection
+# (code standard: "construction by injection, never a global") — the arg count is the cost of
+# not reaching for a Settings singleton, not a design smell to hide behind a config object.
+"src/localmodels/launcher.py" = ["PLR0913"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["localmodels"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+[tool.ruff.lint.pylint]
+max-args = 8
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+namespace_packages = true
+
+[[tool.mypy.overrides]]
+module = ["pynvml.*", "huggingface_hub.*"]
+ignore_missing_imports = true
