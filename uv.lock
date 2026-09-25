@@ -345,17 +345,12 @@ wheels = [
 
 [[package]]
 name = "localmodels"
-version = "0.2.0"
+version = "0.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "pydantic" },
-]
-
-[package.optional-dependencies]
-hub = [
-    { name = "huggingface-hub" },
 ]
 
 [package.dev-dependencies]
@@ -370,11 +365,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
-    { name = "huggingface-hub", specifier = "==2.0.0" },
-    { name = "huggingface-hub", marker = "extra == 'hub'", specifier = ">=0.26" },
+    { name = "huggingface-hub", specifier = ">=0.26" },
     { name = "pydantic", specifier = ">=2.13" },
 ]
-provides-extras = ["hub"]
 
 [package.metadata.requires-dev]
 dev = [

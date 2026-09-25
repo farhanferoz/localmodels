@@ -46,8 +46,11 @@ for a different accelerator.
 uv add localmodels
 ```
 
-`huggingface_hub` is a core dependency (Apache-2.0, pinned): `localmodels setup` needs it
-unconditionally to download a model, not just the callers who use `pull_model` directly.
+`huggingface_hub` is a core dependency (Apache-2.0): `localmodels setup` needs it unconditionally
+to download a model, not just the callers who use `pull_model` directly. It is declared as a range
+(`>=0.26`, the oldest release carrying every call `pull.py` makes), never an exact pin: each
+consumer's own lockfile pins it, and an exact pin here made the package unusable beside
+`transformers`, whose every release requires `huggingface-hub<2.0` (found adopting it in service_c).
 
 ## CLI
 
