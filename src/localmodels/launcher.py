@@ -28,7 +28,9 @@ from .process import (
     ServerStatus,
     _is_pid_alive,
     _process_args,
+    auth_headers,
     build_args,
+    require_key_off_loopback,
 )
 
 if TYPE_CHECKING:
@@ -191,7 +193,11 @@ class LocalServerManager:
             return None
 
         with contextlib.suppress(httpx.HTTPError, OSError):
-            resp = await self._http.get(f"http://{self.spec.host}:{self.spec.port}/props", timeout=2.0)
+            resp = await self._http.get(
+                f"http://{self.spec.host}:{self.spec.port}/props",
+                timeout=2.0,
+                headers=auth_headers(self.spec.api_key_file),
+            )
             if resp.status_code == _HTTP_OK:
                 data = resp.json()
                 if Path(data.get("model_path", "")).name == self.spec.model_path.name:
@@ -202,8 +208,7 @@ class LocalServerManager:
         try:
             with socket.create_connection((self.spec.host, self.spec.port), timeout=0.2):
                 msg = (
-                    f"port {self.spec.port} is held by a process this manager did not start; "
-                    "free it by hand"
+                    f"port {self.spec.port} is held by a process this manager did not start; free it by hand"
                 )
                 raise PortHeldError(msg)
         except OSError:
@@ -266,7 +271,11 @@ class LocalServerManager:
         if self.min_slot_tokens <= 0:
             return
         try:
-            resp = await self._http.get(f"http://{self.spec.host}:{self.spec.port}/props", timeout=5.0)
+            resp = await self._http.get(
+                f"http://{self.spec.host}:{self.spec.port}/props",
+                timeout=5.0,
+                headers=auth_headers(self.spec.api_key_file),
+            )
             data = resp.json() if resp.status_code == _HTTP_OK else {}
         except Exception as exc:
             await self.stop()
@@ -306,6 +315,7 @@ class LocalServerManager:
             lease_written = True
 
         log_path = self.pid_dir / f"{self.spec.port}.log"
+        require_key_off_loopback(self.spec)
         args = build_args(self.binary, self.spec, self.params, self.extra_flags)
 
         with _open_log(log_path) as log_file:
@@ -395,7 +405,11 @@ class LocalServerManager:
         model_path = ""
         if alive:
             with contextlib.suppress(httpx.HTTPError, OSError):
-                resp = await self._http.get(f"http://{self.spec.host}:{self.spec.port}/props", timeout=1.0)
+                resp = await self._http.get(
+                    f"http://{self.spec.host}:{self.spec.port}/props",
+                    timeout=1.0,
+                    headers=auth_headers(self.spec.api_key_file),
+                )
                 if resp.status_code == _HTTP_OK:
                     healthy = True
                     model_path = resp.json().get("model_path", "")

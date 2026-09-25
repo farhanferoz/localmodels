@@ -65,6 +65,7 @@ class ServeConfig(BaseModel):
     poll_s: float = _DEFAULT_POLL_S
     device_override: str | None = None
     extra_flags: tuple[str, ...] = ()
+    api_key_file: Path | None = None
 
 
 def load_serve_config(path: Path) -> ServeConfig:
@@ -80,7 +81,12 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     binary = config.binary or resolve_llama_server_bin()
     lease = GpuLease(config.lease_dir, project=config.project)
     return LocalServerManager(
-        ServerSpec(host=config.host, port=config.port, model_path=config.model_path),
+        ServerSpec(
+            host=config.host,
+            port=config.port,
+            model_path=config.model_path,
+            api_key_file=config.api_key_file,
+        ),
         params,
         lease,
         reserved_ports=config.reserved_ports,

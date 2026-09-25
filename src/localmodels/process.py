@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import os
 import shutil
 import subprocess
@@ -111,6 +112,8 @@ class ServerSpec:
     host: str
     port: int
     model_path: Path
+    #: llama-server's ``--api-key-file``; required whenever ``host`` is not loopback.
+    api_key_file: Path | None = None
 
 
 def build_args(
@@ -140,8 +143,46 @@ def build_args(
         spec.host,
         "--port",
         str(spec.port),
+        *(["--api-key-file", str(spec.api_key_file)] if spec.api_key_file is not None else []),
         *extra_flags,
     ]
+
+
+class ApiKeyRequiredError(LocalModelsError):
+    """Serving on a non-loopback address without ``api_key_file``."""
+
+
+def require_key_off_loopback(spec: ServerSpec) -> None:
+    """Refuse to serve off loopback without a key: llama-server has no other access control.
+
+    Reachable from a non-loopback address (a docker bridge included), any container or process on
+    the host could otherwise fill its slots.
+    """
+    if spec.api_key_file is not None or spec.host == "localhost":
+        return
+    try:
+        loopback = ipaddress.ip_address(spec.host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        msg = f"api_key_file is required to serve on {spec.host} (not loopback)"
+        raise ApiKeyRequiredError(msg)
+
+
+def auth_headers(api_key_file: Path | None) -> dict[str, str]:
+    """The ``Authorization`` header for a keyed llama-server; empty when no key is configured.
+
+    llama-server exempts only ``/health`` and ``/v1/health`` from the key
+    (``tools/server/server-http.cpp`` at ``ccc3646``), so every ``/props`` probe needs this. The key
+    is the file's first line that is not blank or a ``#`` comment, llama-server's own rule.
+    """
+    if api_key_file is None:
+        return {}
+    for line in api_key_file.read_text().splitlines():
+        if line and not line.startswith("#"):
+            return {"Authorization": f"Bearer {line}"}
+    msg = f"{api_key_file} holds no key"
+    raise ApiKeyRequiredError(msg)
 
 
 @dataclass(frozen=True)
