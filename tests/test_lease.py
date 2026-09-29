@@ -15,6 +15,8 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING
 
+import pytest
+
 from localmodels.lease import GpuLease, LeaseRecord
 
 if TYPE_CHECKING:
@@ -66,6 +68,38 @@ def test_live_others_purges_dead_pid_and_ignores_garbage(tmp_path: Path) -> None
         assert no_pid_path.exists()
 
         assert lease.requested_by_other() == "service_c"
+    finally:
+        sub.terminate()
+        sub.wait()
+
+
+@pytest.mark.parametrize(
+    "bad_field",
+    [
+        {"port": "abc"},
+        {"model_path": 5},
+        {"started_at": 1.5},
+        {"pid": 2**70},
+        {"pid": 0},
+        {"pid": -1},
+    ],
+    ids=["port-str", "model_path-int", "started_at-float", "pid-huge", "pid-zero", "pid-negative"],
+)
+def test_type_malformed_lease_is_skipped_and_live_ones_still_reported(
+    tmp_path: Path, bad_field: dict[str, object]
+) -> None:
+    """Contract: readers skip any file they cannot parse -- and leave it alone, it is not ours to judge."""
+    lease = GpuLease(tmp_path, project="service_a")
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        bad_path = tmp_path / "bad.json"
+        bad_path.write_text(json.dumps({"project": "bad", "pid": sub.pid, **bad_field}))
+        (tmp_path / "service_c.json").write_text(json.dumps({"pid": sub.pid, "project": "service_c"}))
+
+        others = lease.live_others()
+
+        assert [o.project for o in others] == ["service_c"]
+        assert bad_path.exists()
     finally:
         sub.terminate()
         sub.wait()

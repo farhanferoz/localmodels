@@ -15,7 +15,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 class LeaseRecord(BaseModel):
@@ -38,36 +38,53 @@ class LeaseRecord(BaseModel):
     lane: str | None = None
 
 
-def _check_other_lease_file(path: Path) -> LeaseRecord | None:
-    """Parse an external lease file and check whether its holder process is alive."""
+def _read_lease_data(path: Path) -> dict[str, object] | None:
+    """The JSON object in a lease file, or None if the file is unreadable, not JSON, or not an object."""
     try:
-        content = path.read_text(encoding="utf-8")
-        data = json.loads(content)
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         # Unreadable or invalid JSON is left in place (contract: "skip any file they cannot parse")
         return None
+    return data if isinstance(data, dict) else None
 
-    if not isinstance(data, dict):
-        return None
-    pid_raw = data.get("pid")
-    if not isinstance(pid_raw, int):
-        return None
 
+def _holder_is_live(pid: object, path: Path) -> bool:
+    """Whether `pid` names a live process; a dead one deletes `path` as stale.
+
+    A pid that is not a positive integer the OS accepts is unparsable, so False and the file is
+    left in place: kill(0|-1, 0) would succeed and read as live forever, and it is not ours to judge.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
     try:
-        os.kill(pid_raw, 0)
+        os.kill(pid, 0)
+    except OverflowError:
+        return False
     except ProcessLookupError:
         # Dead PID is stale; delete the file (contract: "stale leases ... ignore it and delete it")
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
-        return None
+        return False
     except PermissionError:
         # Live process owned by another user
         pass
+    return True
+
+
+def _check_other_lease_file(path: Path) -> LeaseRecord | None:
+    """Parse an external lease file and check whether its holder process is alive."""
+    data = _read_lease_data(path)
+    if data is None or not _holder_is_live(data.get("pid"), path):
+        return None
 
     if not data.get("project"):
         data["project"] = path.stem
 
-    return LeaseRecord(**data)
+    try:
+        return LeaseRecord(**data)
+    except ValidationError:
+        # A field of the wrong type: unparsable, left in place (contract: "skip any file they cannot parse")
+        return None
 
 
 class GpuLease:
