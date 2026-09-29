@@ -29,7 +29,7 @@ from localmodels.launcher import (
 )
 from localmodels.lease import GpuLease
 from localmodels.params import ServingParams
-from localmodels.process import ServerSpec
+from localmodels.process import ApiKeyRequiredError, ServerSpec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -134,8 +134,9 @@ def _manager(
     wait_timeout_s: float | None = None,
     min_slot_tokens: int = 0,
     lease: GpuLease | None = None,
+    host: str = "127.0.0.1",
 ) -> LocalServerManager:
-    spec = ServerSpec(host="127.0.0.1", port=port, model_path=model_file)
+    spec = ServerSpec(host=host, port=port, model_path=model_file)
     return LocalServerManager(
         spec,
         params,
@@ -438,3 +439,102 @@ async def test_supervise_yields_when_another_lease_requests(tmp_path: Path) -> N
         assert result == SupervisorExit.YIELDED
         assert not lease.lease_path().exists()
         assert not (tmp_path / "pids" / "8190.pid").exists()
+
+
+async def test_adopted_gpu_server_writes_a_lease(tmp_path: Path) -> None:
+    """A manager that adopts a running GPU server owns the GPU claim, so it writes the lease."""
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease = GpuLease(tmp_path / "lease", project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8189, model_file=model_file,
+            params=_gpu_params(), lease=lease,
+        )
+        handle = await manager.start()
+        lease.remove()  # the previous owner of this server is gone, the server is not
+
+        adopted = await manager.start()
+        assert adopted.pid == handle.pid
+        assert lease.lease_path().exists()
+        await manager.stop()
+
+
+async def test_adopted_cpu_server_writes_no_lease(tmp_path: Path) -> None:
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease = GpuLease(tmp_path / "lease", project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8188, model_file=model_file,
+            params=_cpu_params(), lease=lease,
+        )
+        await manager.start()
+        adopted = await manager.start()
+        assert adopted.pid > 0
+        assert not lease.lease_path().exists()
+        await manager.stop()
+
+
+async def test_start_refused_for_a_missing_api_key_leaves_no_lease(tmp_path: Path) -> None:
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease = GpuLease(tmp_path / "lease", project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8187, model_file=model_file,
+            params=_gpu_params(), lease=lease, host="0.0.0.0",  # noqa: S104
+        )
+        with pytest.raises(ApiKeyRequiredError):
+            await manager.start()
+    assert not lease.lease_path().exists()
+
+
+async def test_start_that_cannot_spawn_leaves_no_lease(tmp_path: Path) -> None:
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease = GpuLease(tmp_path / "lease", project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=tmp_path / "no-such-llama-server", port=8186,
+            model_file=model_file, params=_gpu_params(), lease=lease,
+        )
+        with pytest.raises(OSError):  # noqa: PT011 -- FileNotFoundError from the spawn
+            await manager.start()
+    assert not lease.lease_path().exists()
+
+
+async def test_supervise_does_not_yield_a_cpu_server_to_a_gpu_request(tmp_path: Path) -> None:
+    """A server with no GPU layers holds nothing the other project needs, so it keeps serving."""
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease_dir = tmp_path / "lease"
+    lease = GpuLease(lease_dir, project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8185, model_file=model_file,
+            params=_cpu_params(), lease=lease,
+        )
+        handle = await manager.start()
+
+        stop_event = asyncio.Event()
+        sup_task = asyncio.create_task(supervise(manager, handle, poll_s=0.05, stop=stop_event))
+        await asyncio.sleep(0.1)
+        lease_dir.mkdir(parents=True, exist_ok=True)  # a CPU server wrote no lease, so no directory
+        (lease_dir / "service_c.json").write_text(
+            json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": int(time.time())})
+        )
+        await asyncio.sleep(0.4)
+        assert not sup_task.done()
+
+        stop_event.set()
+        assert await sup_task == SupervisorExit.STOPPED

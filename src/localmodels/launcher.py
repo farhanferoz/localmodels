@@ -239,6 +239,9 @@ class LocalServerManager:
                 raise LeaseWaitTimeoutError(msg)
             await asyncio.sleep(self.wait_poll_s)
 
+        self._write_lease()
+
+    def _write_lease(self) -> None:
         self.lease.write(
             LeaseRecord(
                 project=self.lease.project,
@@ -313,9 +316,13 @@ class LocalServerManager:
 
         adopted = await self._try_adopt(pidfile)
         if adopted is not None:
+            if self.params.n_gpu_layers != 0:
+                self._write_lease()
             return adopted
 
         self._check_port_free()
+        require_key_off_loopback(self.spec)
+        args = build_args(self.binary, self.spec, self.params, self.extra_flags)
 
         is_gpu = self.params.n_gpu_layers != 0
         lease_written = False
@@ -324,20 +331,16 @@ class LocalServerManager:
             lease_written = True
 
         log_path = self.pid_dir / f"{self.spec.port}.log"
-        require_key_off_loopback(self.spec)
-        args = build_args(self.binary, self.spec, self.params, self.extra_flags)
-
-        with _open_log(log_path) as log_file:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=log_file,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-
-        _write_pid(pidfile, proc.pid)
-
         try:
+            with _open_log(log_path) as log_file:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=log_file,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
+
+            _write_pid(pidfile, proc.pid)
             await self._poll_ready(proc, log_path, lease_written)
             await self._verify_props()
         except Exception:
@@ -444,7 +447,8 @@ async def supervise(
             if not _is_pid_alive(handle.pid):
                 return SupervisorExit.SERVER_EXITED
 
-            requested = manager.lease.requested_by_other()
+            # A server with no GPU layers holds nothing another project's GPU work needs.
+            requested = manager.params.n_gpu_layers != 0 and manager.lease.requested_by_other()
             if requested:
                 stopped = await manager.stop()
                 if not stopped and _is_pid_alive(handle.pid):

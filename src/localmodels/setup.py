@@ -149,8 +149,17 @@ class SetupReport(BaseModel):
 
     @property
     def ok(self) -> bool:
-        """Whether every step that ran (or was planned) is free of a FAILED result."""
-        return not any(r.status is StepStatus.FAILED for r in self.results)
+        """Whether no step FAILED and neither the hardware nor the backend step was refused.
+
+        A BLOCKED hardware or backend step (infeasible host, CPU-only build on an accelerator
+        host) means there is nothing usable to serve, so it fails the run; a BLOCKED bench only
+        says the measurement was skipped.
+        """
+        refusing = {SetupStepName.HARDWARE, SetupStepName.BACKEND}
+        return not any(
+            r.status is StepStatus.FAILED or (r.status is StepStatus.BLOCKED and r.step in refusing)
+            for r in self.results
+        )
 
 
 def refuse_cpu_only_build(*, backend: Backend, device: DeviceType, device_name: str) -> str | None:
@@ -431,6 +440,7 @@ def print_summary(report: SetupReport, stream: TextIO | None = None) -> None:
         print(f"  [{marker:<7}] {r.step.value:<12} {r.name:<22} {r.detail}", file=out)
     if report.dry_run:
         print("\n(dry run: no changes were made)", file=out)
-    elif not report.ok:
-        print("\nOne or more steps failed; see FAIL lines above.", file=out)
-    print("\nTo start serving this model, run: localmodels serve --config <toml>", file=out)
+    if not report.ok:
+        print("\nSetup did not complete; see the FAIL and BLOCKED lines above.", file=out)
+    else:
+        print("\nTo start serving this model, run: localmodels serve --config <toml>", file=out)
