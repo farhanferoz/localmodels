@@ -1,10 +1,11 @@
 """`localmodels serve`: run and supervise one configured llama-server instance.
 
-Restarts after a yield once the other project's lease clears, without duplicating any waiting
-logic: a YIELD only ever comes from `launcher.supervise` because another project's lease
-requested the GPU, and building a fresh `LocalServerManager` and calling `start()` again
-re-enters `_acquire_lease()`, whose `Contention.WAIT` already blocks until that lease clears.
-This loop's only job is to notice the YIELD and go again.
+Restarts after a yield once the other project's lease clears. A YIELD only ever comes from
+`launcher.supervise` because another project's lease requested the GPU, so the other side's
+lease is by definition live when the loop goes round again. `_acquire_lease()` cannot be left to
+wait for it: under `Contention.REFUSE` (which governs a start that meets a lease unannounced)
+it would raise. So this loop waits itself, polling `GpuLease.live_others()`, and only then
+builds a fresh `LocalServerManager` and calls `start()`.
 
 `manager_factory`/`supervise_fn` are injectable (construction by injection, this package's own
 rule) so the restart loop is testable without a real llama-server subprocess or GPU.
@@ -99,6 +100,16 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     )
 
 
+async def _wait_for_other_leases(lease: GpuLease, *, poll_s: float, stop: asyncio.Event) -> bool:
+    """Poll until no other live lease remains; False if `stop` was set while waiting."""
+    while lease.live_others():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=poll_s)
+        if stop.is_set():
+            return False
+    return True
+
+
 async def run_serve(
     config: ServeConfig,
     *,
@@ -110,11 +121,12 @@ async def run_serve(
     """Serve `config`'s model until stopped, restarting after each yield.
 
     Returns the final, non-YIELDED `SupervisorExit` (`STOPPED` or `SERVER_EXITED`) -- a YIELD
-    is never returned to the caller except when `stop` was already set by the time it happened,
-    so a caller asking this to stop is honoured even mid-yield rather than silently restarting
-    once more.
+    is never returned to the caller except when `stop` was set by the time it happened or while
+    waiting for the other project's lease to clear, so a caller asking this to stop is honoured
+    even mid-yield rather than silently restarting once more.
     """
     stop_event = stop if stop is not None else asyncio.Event()
+    lease = GpuLease(config.lease_dir, project=config.project)
     factory = manager_factory or _build_manager
     owns_http = http is None
     owned_http = http or httpx.AsyncClient()
@@ -124,6 +136,8 @@ async def run_serve(
             handle: ServerHandle = await manager.start()
             exit_reason = await supervise_fn(manager, handle, poll_s=config.poll_s, stop=stop_event)
             if exit_reason is not SupervisorExit.YIELDED or stop_event.is_set():
+                return exit_reason
+            if not await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop_event):
                 return exit_reason
     finally:
         if owns_http:
