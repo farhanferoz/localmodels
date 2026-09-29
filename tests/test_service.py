@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from localmodels.launcher import Contention, SupervisorExit
+from localmodels.launcher import Contention, LeaseConflictError, StartupYieldedError, SupervisorExit
 from localmodels.lease import GpuLease
 from localmodels.process import ServerHandle
 from localmodels.service import ServeConfig, load_serve_config, run_serve
@@ -118,8 +118,14 @@ async def test_run_serve_under_refuse_waits_for_the_other_lease_after_a_yield(tm
 
         def factory(_config, _http):
             manager = _manager(
-                tmp_path=tmp_path, http=http, bin_path=bin_path, port=8198, model_file=model_file,
-                params=_gpu_params(), contention=Contention.REFUSE, lease=lease,
+                tmp_path=tmp_path,
+                http=http,
+                bin_path=bin_path,
+                port=8198,
+                model_file=model_file,
+                params=_gpu_params(),
+                contention=Contention.REFUSE,
+                lease=lease,
             )
             real_start = manager.start
 
@@ -146,8 +152,12 @@ async def test_run_serve_under_refuse_waits_for_the_other_lease_after_a_yield(tm
             return outcome
 
         config = ServeConfig(
-            port=8198, model_path=model_file, project="localmodels-test", lease_dir=lease_dir,
-            contention=Contention.REFUSE, poll_s=0.05,
+            port=8198,
+            model_path=model_file,
+            project="localmodels-test",
+            lease_dir=lease_dir,
+            contention=Contention.REFUSE,
+            poll_s=0.05,
         )
         try:
             result = await run_serve(
@@ -244,3 +254,85 @@ def test_load_serve_config_wait_contention(tmp_path: Path) -> None:
     )
     config = load_serve_config(toml_path)
     assert config.contention is Contention.WAIT
+
+
+class _ScriptedStartManager:
+    """A manager whose `start()` raises each scripted error in turn, then succeeds."""
+
+    def __init__(self, errors: list[Exception], starts: list[float]) -> None:
+        self._errors = errors
+        self._starts = starts
+
+    async def start(self) -> ServerHandle:
+        self._starts.append(time.monotonic())
+        if self._errors:
+            raise self._errors.pop(0)
+        return _fake_handle()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        StartupYieldedError("GPU lease requested by service_c; yielding"),
+        LeaseConflictError("held by service_c"),
+    ],
+    ids=["yield-while-loading", "refused-at-start"],
+)
+async def test_run_serve_waits_instead_of_exiting_when_a_start_meets_the_other_lease(
+    tmp_path: Path, error: Exception
+) -> None:
+    """G12 C-1 (D47): a lease request while the model loads, or a REFUSE at a start, used to exit
+    the process -- and under systemd's `Restart=always` that is a 5-second restart loop. The
+    service now waits for the other lease to clear, then starts again, in the same process."""
+    other_path = tmp_path / "service_c.json"
+    other_path.write_text(json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": 1}))
+    asyncio.get_running_loop().call_later(_OTHER_LEASE_HELD_S, other_path.unlink)
+    starts: list[float] = []
+    errors = [error]
+
+    def factory(_config, _http):
+        return _ScriptedStartManager(errors, starts)
+
+    async def fake_supervise(_manager, _handle, *, poll_s, stop):
+        return SupervisorExit.STOPPED
+
+    config = ServeConfig(
+        port=8091,
+        model_path=Path("/m.gguf"),
+        project="test",
+        lease_dir=tmp_path,
+        contention=Contention.REFUSE,
+        poll_s=0.05,
+    )
+    result = await run_serve(
+        config, manager_factory=factory, supervise_fn=fake_supervise, stop=asyncio.Event()
+    )
+
+    assert result is SupervisorExit.STOPPED
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= _OTHER_LEASE_HELD_S  # the second start waited for the lease
+
+
+async def test_run_serve_returns_yielded_when_stopped_while_a_start_waits(tmp_path: Path) -> None:
+    (tmp_path / "service_c.json").write_text(
+        json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": 1})
+    )
+    starts: list[float] = []
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, stop.set)
+
+    def factory(_config, _http):
+        return _ScriptedStartManager([StartupYieldedError("yielding")], starts)
+
+    async def fake_supervise(_manager, _handle, *, poll_s, stop):  # pragma: no cover - never reached
+        return SupervisorExit.STOPPED
+
+    config = ServeConfig(
+        port=8091, model_path=Path("/m.gguf"), project="test", lease_dir=tmp_path, poll_s=0.05
+    )
+    result = await asyncio.wait_for(
+        run_serve(config, manager_factory=factory, supervise_fn=fake_supervise, stop=stop), timeout=5
+    )
+
+    assert result is SupervisorExit.YIELDED
+    assert len(starts) == 1

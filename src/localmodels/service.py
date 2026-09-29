@@ -24,7 +24,14 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .hardware import inspect_hardware
-from .launcher import Contention, LocalServerManager, SupervisorExit, supervise
+from .launcher import (
+    Contention,
+    LeaseConflictError,
+    LocalServerManager,
+    StartupYieldedError,
+    SupervisorExit,
+    supervise,
+)
 from .lease import GpuLease
 from .params import derive_serving_params
 from .process import ServerSpec, resolve_llama_server_bin
@@ -133,7 +140,17 @@ async def run_serve(
     try:
         while True:
             manager = factory(config, owned_http)
-            handle: ServerHandle = await manager.start()
+            try:
+                handle: ServerHandle = await manager.start()
+            except (StartupYieldedError, LeaseConflictError):
+                # Another project holds or asked for the GPU as this start ran: a service waits
+                # for its lease to clear rather than exiting into a restart loop (G12 C-1, D47).
+                # `Contention.REFUSE` still governs a one-shot start, which never reaches here.
+                if stop_event.is_set():
+                    return SupervisorExit.YIELDED
+                if not await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop_event):
+                    return SupervisorExit.YIELDED
+                continue
             exit_reason = await supervise_fn(manager, handle, poll_s=config.poll_s, stop=stop_event)
             if exit_reason is not SupervisorExit.YIELDED or stop_event.is_set():
                 return exit_reason

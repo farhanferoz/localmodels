@@ -18,6 +18,7 @@ from .launcher import (
     PortHeldError,
     ReservedPortError,
     ServerStartError,
+    StartupYieldedError,
     SupervisorExit,
     supervise,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "ServerStartError",
     "ServerStatus",
     "ServingParams",
+    "StartupYieldedError",
     "SupervisorExit",
     "TierDecision",
     "build_args",

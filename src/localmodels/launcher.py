@@ -44,6 +44,7 @@ __all__ = [
     "PortHeldError",
     "ReservedPortError",
     "ServerStartError",
+    "StartupYieldedError",
     "SupervisorExit",
     "supervise",
 ]
@@ -84,6 +85,14 @@ class LeaseWaitTimeoutError(LocalModelsError):
 
 class ServerStartError(LocalModelsError):
     """Raised when the server process fails to start, become healthy, or match its spec."""
+
+
+class StartupYieldedError(ServerStartError):
+    """Raised when another project requests the GPU while the server is still loading.
+
+    The server has already been stopped and the lease released: this is a yield, not a failure,
+    so a long-running caller waits for the other lease to clear and starts again.
+    """
 
 
 def _read_pid_if_exists(pidfile: Path) -> int | None:
@@ -255,7 +264,7 @@ class LocalServerManager:
                 if other:
                     await self.stop()
                     msg = f"GPU lease requested by {other}; yielding"
-                    raise ServerStartError(msg)
+                    raise StartupYieldedError(msg)
 
             with contextlib.suppress(httpx.HTTPError, OSError):
                 resp = await self._http.get(f"http://{self.spec.host}:{self.spec.port}/health", timeout=1.0)
