@@ -34,6 +34,8 @@ from .process import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .params import ServingParams
 
 __all__ = [
@@ -165,6 +167,7 @@ class LocalServerManager:
         pid_dir: Path,
         binary: str | Path,
         extra_flags: tuple[str, ...] = (),
+        extra_env: Mapping[str, str] | None = None,
         stop_grace_s: float = 20.0,
         wait_poll_s: float = 2.0,
         wait_timeout_s: float | None = None,
@@ -180,6 +183,7 @@ class LocalServerManager:
         self.pid_dir = Path(pid_dir)
         self.binary = binary
         self.extra_flags = extra_flags
+        self.extra_env = extra_env
         self.stop_grace_s = stop_grace_s
         self.wait_poll_s = wait_poll_s
         self.wait_timeout_s = wait_timeout_s
@@ -338,6 +342,7 @@ class LocalServerManager:
                     stdout=log_file,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
+                    env=None if self.extra_env is None else {**os.environ, **self.extra_env},
                 )
 
             _write_pid(pidfile, proc.pid)

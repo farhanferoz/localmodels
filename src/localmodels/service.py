@@ -73,6 +73,7 @@ class ServeConfig(BaseModel):
     poll_s: float = _DEFAULT_POLL_S
     device_override: str | None = None
     extra_flags: tuple[str, ...] = ()
+    extra_env: dict[str, str] | None = None
     api_key_file: Path | None = None
 
 
@@ -104,6 +105,7 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
         pid_dir=config.pid_dir,
         binary=binary,
         extra_flags=config.extra_flags,
+        extra_env=config.extra_env,
     )
 
 

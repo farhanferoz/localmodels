@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 FAKE_SERVER_CODE = """#!__PYTHON__
+import os
 import sys
 import signal
 import time
@@ -42,6 +43,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 
 health_attempts = 0
+
+with open(sys.argv[0] + ".cuda", "w") as env_out:
+    env_out.write(repr(os.environ.get("CUDA_VISIBLE_DEVICES")))
 
 model_path = ""
 n_ctx = 8192
@@ -135,6 +139,7 @@ def _manager(
     min_slot_tokens: int = 0,
     lease: GpuLease | None = None,
     host: str = "127.0.0.1",
+    extra_env: dict[str, str] | None = None,
 ) -> LocalServerManager:
     spec = ServerSpec(host=host, port=port, model_path=model_file)
     return LocalServerManager(
@@ -151,6 +156,7 @@ def _manager(
         wait_poll_s=wait_poll_s,
         wait_timeout_s=wait_timeout_s,
         min_slot_tokens=min_slot_tokens,
+        extra_env=extra_env,
     )
 
 
@@ -175,6 +181,37 @@ def _cpu_params(**overrides: object) -> ServingParams:
     }
     base.update(overrides)
     return _gpu_params(**base)
+
+
+async def _child_cuda_env(tmp_path: Path, extra_env: dict[str, str] | None) -> str:
+    """Start the fake server and return the CUDA_VISIBLE_DEVICES repr it saw in its environment."""
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8198, model_file=model_file,
+            params=_cpu_params(), extra_env=extra_env,
+        )
+        await manager.start()
+        try:
+            return (bin_path.parent / "llama-server.cuda").read_text()
+        finally:
+            await manager.stop()
+
+
+async def test_extra_env_overrides_the_child_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert await _child_cuda_env(tmp_path, {"CUDA_VISIBLE_DEVICES": ""}) == "''"
+
+
+async def test_no_extra_env_child_inherits_the_parent_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert await _child_cuda_env(tmp_path, None) == "'0'"
 
 
 async def test_start_and_stop_fake_server(tmp_path: Path) -> None:
