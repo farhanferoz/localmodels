@@ -114,8 +114,16 @@ def test_live_others_ignores_own_lease(tmp_path: Path) -> None:
     assert lease.requested_by_other() is None
 
 
-def _service_c_bash_lease_json(*, pid: int, port: str = "", model_path: str = "", started_at: str = "",
-                                 job_id: str = "", lane: str = "", requested_at: str = "") -> str:
+def _service_c_bash_lease_json(
+    *,
+    pid: int,
+    port: str = "",
+    model_path: str = "",
+    started_at: str = "",
+    job_id: str = "",
+    lane: str = "",
+    requested_at: str = "",
+) -> str:
     """Reproduce `gpu_lease_write`'s own inline Python body (run_gpu_queue.sh:612-630) verbatim.
 
     Any arg passed as "" is OMITTED from the JSON — the same rule the bash function's Python body
@@ -179,6 +187,70 @@ def test_lease_written_by_service_c_bash_waiting_shape_parses(tmp_path: Path) ->
             _service_c_bash_lease_json(pid=sub.pid, job_id="job-7", lane="fast", requested_at="1700000123")
         )
         assert lease.requested_by_other() == "service_c"
+    finally:
+        sub.terminate()
+        sub.wait()
+
+
+def test_blockers_orders_waiters_by_request_time_then_name(tmp_path: Path) -> None:
+    """Holders always block; an earlier waiter blocks; a later waiter (or a tie lost on name) does not."""
+    lease = GpuLease(tmp_path, project="slurm")
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        (tmp_path / "service_a.json").write_text(json.dumps({"pid": sub.pid, "project": "service_a"}))
+        (tmp_path / "early.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "early", "requested_at": 100})
+        )
+        (tmp_path / "late.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "late", "requested_at": 300})
+        )
+        (tmp_path / "abc.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "abc", "requested_at": 200})
+        )
+        (tmp_path / "zzz.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "zzz", "requested_at": 200})
+        )
+
+        blocking, earlier_waiter = lease.blockers(200)
+
+        assert sorted(r.project for r in blocking) == ["abc", "early", "service_a"]
+        assert earlier_waiter
+    finally:
+        sub.terminate()
+        sub.wait()
+
+
+def test_blockers_holder_alone_blocks_without_an_earlier_waiter(tmp_path: Path) -> None:
+    lease = GpuLease(tmp_path, project="slurm")
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        (tmp_path / "service_c.json").write_text(json.dumps({"pid": sub.pid, "project": "service_c"}))
+        (tmp_path / "late.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "late", "requested_at": 900})
+        )
+
+        blocking, earlier_waiter = lease.blockers(500)
+
+        assert [r.project for r in blocking] == ["service_c"]
+        assert not earlier_waiter
+    finally:
+        sub.terminate()
+        sub.wait()
+
+
+def test_blockers_when_not_waiting_counts_every_live_lease(tmp_path: Path) -> None:
+    lease = GpuLease(tmp_path, project="slurm")
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        (tmp_path / "late.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "late", "requested_at": 900})
+        )
+        (tmp_path / "dead.json").write_text(json.dumps({"pid": 99999999, "project": "dead"}))
+
+        blocking, earlier_waiter = lease.blockers(None)
+
+        assert [r.project for r in blocking] == ["late"]
+        assert earlier_waiter
     finally:
         sub.terminate()
         sub.wait()

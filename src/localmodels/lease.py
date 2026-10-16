@@ -132,6 +132,27 @@ class GpuLease:
 
         return live
 
+    def blockers(self, requested_at: int | None) -> tuple[list[LeaseRecord], bool]:
+        """Other live leases this project must wait for, and whether any of them is itself only waiting.
+
+        Holders (no ``requested_at``) always block. Another waiter blocks only if it asked first, ties
+        broken by project name; later waiters wait for us. ``requested_at=None`` (not waiting) is
+        blocked by every other lease. A reader that treats every other lease as busy, as service_c's
+        queue does, would deadlock with a second waiter doing the same; this order cannot. The caller
+        withdraws its own request while an earlier waiter exists, so that waiter is not blocked by it.
+        Ported from service_b's GPU worker (``service_b/jobs/lease.py``, ``_blockers``).
+        """
+        mine = None if requested_at is None else (requested_at, self.project)
+        blocking: list[LeaseRecord] = []
+        earlier_waiter = False
+        for record in self.live_others():
+            if record.requested_at is None:
+                blocking.append(record)
+            elif mine is None or (record.requested_at, record.project) < mine:
+                blocking.append(record)
+                earlier_waiter = True
+        return blocking, earlier_waiter
+
     def requested_by_other(self) -> str | None:
         """Return the project name of the first live other lease requesting the GPU."""
         for record in self.live_others():
