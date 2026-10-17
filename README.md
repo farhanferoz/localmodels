@@ -43,6 +43,12 @@ different accelerator; only a model server's own process imports PyTorch.
   manager refuses another version with a plain message (rebuild that model's environment); `require_device`
   refuses, in plain words, a model the machine's hardware cannot run, before anything starts. A model file on a
   network filesystem (NFS, SMB) is reported, since every cold start then reads it at network speed.
+- `localmodels.serving.tune` — tuning a model: `run_tune` loads one fresh model server per candidate (a
+  precision plus load options), times the same inputs on each, and compares every candidate's outputs with
+  the first (the reference) through a quality check (`text_agreement`, `score_agreement`,
+  `embedding_cosine`). It chooses the fastest candidate that agrees and fits in memory. `save_record` keeps
+  the outcome per machine (`hardware_key`), `load_choice` reads it back, and `untuned_message` is the notice
+  for a machine with no record. A tune is GPU work: submit it through the scheduler.
 - `localmodels.pinned` — Hugging Face snapshots pinned to a commit with every file's SHA-256
   (`PinnedModel`, `PinnedFile`), fetched once (`fetch_snapshot`), hashed when pinned
   (`hash_snapshot`) and checked before use (`verify_files`); weights then load offline.

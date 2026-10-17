@@ -46,7 +46,9 @@ class ModelSizeClass(StrEnum):
 class Precision(StrEnum):
     """Numeric precision a model runs in; a member is added once measured on the hardware that runs it."""
 
+    FLOAT32 = "float32"
     BFLOAT16 = "bfloat16"
+    FLOAT16 = "float16"
 
 
 class PreflightVerdict(StrEnum):
