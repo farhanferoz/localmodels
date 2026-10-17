@@ -287,7 +287,7 @@ def test_network_access_is_refused_and_counted_while_local_sockets_still_work() 
         "import socket\n"
         "from localmodels.serving import block_network\n"
         "attempts = block_network()\n"
-        "for call in (lambda: socket.create_connection(('192.0.2.1', 80), timeout=1), "
+        "for call in (lambda: socket.socket().connect(('192.0.2.1', 80)), "
         "lambda: socket.getaddrinfo('example.com', 443)):\n"
         "    try:\n"
         "        call()\n"
