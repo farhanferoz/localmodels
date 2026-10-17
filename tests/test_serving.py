@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from localmodels.enums import DeviceTier, DeviceType
+from localmodels.hardware import HardwareReport
 from localmodels.lease import GpuLease, GpuLeaseClient
 from localmodels.serving import (
     ErrorMessage,
@@ -34,6 +36,7 @@ from localmodels.serving import (
     ShutdownMessage,
     decode,
     encode,
+    require_device,
     serve,
 )
 from tests.echo_server import EchoServer
@@ -227,3 +230,52 @@ def test_the_host_waits_its_turn_keeps_the_model_warm_unloads_when_idle_and_yiel
     finally:
         other.kill()
         other.wait()
+
+
+OLDER_SERVER = (  # answers a load without first saying which version it runs, as servers before 0.3.1 did
+    "import sys; sys.stdin.readline(); "
+    'print(\'{"op":"loaded","seconds":0,"torch_allocated_gib":0,"torch_reserved_gib":0}\', flush=True); '
+    "sys.stdin.readline()"
+)
+OTHER_SERVER = 'import sys; print(\'{"op":"ready","version":"0.0.1"}\', flush=True); sys.stdin.readline()'
+
+
+@pytest.mark.parametrize(
+    ("script", "says"),
+    [(OLDER_SERVER, "an older localmodels"), (OTHER_SERVER, "localmodels 0.0.1")],
+    ids=["older", "other-version"],
+)
+def test_a_server_on_another_localmodels_version_is_refused_with_a_plain_message(
+    script: str, says: str
+) -> None:
+    server = ModelServerProcess([sys.executable, "-c", script])
+    server.start()
+    with pytest.raises(ServingError) as refused:
+        server.load(LoadMessage(model_dir="/m", revision="r"), lambda: False, timeout_s=10)
+    assert refused.value.code == ServingErrorCode.NOT_IMPLEMENTED
+    assert says in refused.value.message
+    assert "install the same version" in refused.value.message
+    assert not server.alive
+
+
+def test_unsupported_hardware_is_refused_in_plain_words_before_anything_starts() -> None:
+    cpu = HardwareReport(
+        platform="linux", arch="x86_64", device=DeviceType.CPU, device_name="CPU", total_memory_gb=8.0,
+        tier=DeviceTier.SLOW_CPU,
+    )  # fmt: skip
+    assert require_device({DeviceType.CUDA, DeviceType.CPU}, cpu) is DeviceType.CPU
+    with pytest.raises(ServingError) as refused:
+        require_device({DeviceType.CUDA}, cpu)
+    assert refused.value.code == ServingErrorCode.NOT_IMPLEMENTED
+    assert refused.value.message == "This model needs an NVIDIA GPU; this machine has only a CPU (CPU)."
+
+
+def test_a_model_server_loads_neither_the_launcher_nor_its_http_client() -> None:
+    probe = (
+        "import sys, localmodels.serving as _; print({'httpx', 'localmodels.launcher'} & set(sys.modules))"
+    )
+    env = {**os.environ, **ECHO_ENV}
+    out = subprocess.run(  # noqa: S603 - this interpreter and a fixed probe
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
+    )
+    assert out.stdout.strip() == "set()"

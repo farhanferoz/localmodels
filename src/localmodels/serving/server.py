@@ -25,11 +25,13 @@ from localmodels.serving.protocol import (
     LoadedMessage,
     LoadMessage,
     ProgressMessage,
+    ReadyMessage,
     ResultMessage,
     ShutdownMessage,
     decode,
     encode,
 )
+from localmodels.version import package_version
 
 if TYPE_CHECKING:
     from typing import BinaryIO
@@ -100,8 +102,10 @@ def serve(server: ModelServer, stdin: BinaryIO, out: BinaryIO) -> None:
 
 
 def run(server: ModelServer) -> int:
-    """Serve ``server`` on this process's stdin and stdout; the exit code of a model-server entry point."""
-    serve(server, sys.stdin.buffer, reply_stream())
+    """Announce this process's localmodels version, then serve ``server`` on stdin/stdout; the exit code."""
+    out = reply_stream()
+    out.write(encode(ReadyMessage(version=package_version())))
+    serve(server, sys.stdin.buffer, out)
     return 0
 
 

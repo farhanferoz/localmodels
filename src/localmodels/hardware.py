@@ -296,3 +296,33 @@ def resolve_device(device_override: str | None = None) -> str:
         _parse_device(device_override)
         return device_override.lower()
     return inspect_hardware().device.value
+
+
+_MOUNTS = "/proc/mounts"
+_MOUNT_FIELDS = 3  # device, mount point, filesystem type (then options)
+_NETWORK_FILESYSTEMS = frozenset(
+    {"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse.sshfs", "ceph", "glusterfs"}
+)
+
+
+def network_filesystem(path: Path, mounts_path: str = _MOUNTS) -> str | None:
+    """The filesystem type when ``path`` is on a network filesystem (NFS, SMB, ...); None otherwise.
+
+    A model file read over the network loads at network speed on every cold start (measured on gpu-node-1 on
+    2026-10-17: about 0.05 GB/s from its NFS share, 1.1 GB/s from local disk), so callers warn about it.
+    """
+    try:
+        lines = Path(mounts_path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    target = Path(path).resolve()
+    best: Path | None = None
+    kind = None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < _MOUNT_FIELDS:
+            continue
+        mount = Path(fields[1].replace("\\040", " "))
+        if target.is_relative_to(mount) and (best is None or len(mount.parts) > len(best.parts)):
+            best, kind = mount, fields[2]
+    return kind if kind in _NETWORK_FILESYSTEMS else None

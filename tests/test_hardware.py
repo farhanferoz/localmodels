@@ -1,12 +1,13 @@
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 import localmodels.hardware as hw_mod
 from localmodels.enums import DeviceTier, DeviceType
-from localmodels.hardware import inspect_hardware, resolve_device
+from localmodels.hardware import inspect_hardware, network_filesystem, resolve_device
 
 
 def test_inspect_hardware_never_raises() -> None:
@@ -200,3 +201,16 @@ def test_cpu_gets_the_host_figure_and_mps_and_an_unread_gpu_are_unknown(monkeypa
 def test_available_memory_never_raises_on_this_host() -> None:
     hw_mod.available_memory("cuda")
     hw_mod.available_memory("cpu")
+
+
+def test_a_path_on_a_network_filesystem_is_recognised_by_its_closest_mount(tmp_path: Path) -> None:
+    mounts = tmp_path / "mounts"
+    mounts.write_text(
+        "/dev/nvme0n1p2 / ext4 rw 0 0\n"
+        "nas:/share /mnt/nas nfs4 rw 0 0\n"
+        "/dev/sdb1 /mnt/nas/cache ext4 rw 0 0\n"
+    )
+    assert network_filesystem(Path("/mnt/nas/models/m.gguf"), str(mounts)) == "nfs4"
+    assert network_filesystem(Path("/mnt/nas/cache/m.gguf"), str(mounts)) is None  # the closest mount decides
+    assert network_filesystem(Path("/home/user/m.gguf"), str(mounts)) is None
+    assert network_filesystem(Path("/home/user/m.gguf"), str(tmp_path / "absent")) is None

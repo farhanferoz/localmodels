@@ -10,6 +10,7 @@ Extracted from service_b, whose imaging models (MedGemma, NeuroVFM, Pillar-0) ru
 from __future__ import annotations
 
 from .client import DEFAULT_INFER_TIMEOUT_S, DEFAULT_LOAD_TIMEOUT_S, MODEL_SERVER_ENV, ModelServerProcess
+from .devices import DEVICE_NAMES, require_device
 from .errors import SERVER_ERROR_CODES, ServingCancelled, ServingError, ServingErrorCode
 from .host import ModelHost
 from .protocol import (
@@ -21,6 +22,7 @@ from .protocol import (
     Op,
     ProgressMessage,
     ProgressStage,
+    ReadyMessage,
     ResultMessage,
     ShutdownMessage,
     decode,
@@ -32,6 +34,7 @@ from .server import ModelServer, ProgressEmitter, block_network, open_load, repl
 __all__ = [
     "DEFAULT_INFER_TIMEOUT_S",
     "DEFAULT_LOAD_TIMEOUT_S",
+    "DEVICE_NAMES",
     "MODEL_SERVER_ENV",
     "SERVER_ERROR_CODES",
     "ErrorMessage",
@@ -47,6 +50,7 @@ __all__ = [
     "ProgressEmitter",
     "ProgressMessage",
     "ProgressStage",
+    "ReadyMessage",
     "ResultMessage",
     "ServingCancelled",
     "ServingError",
@@ -57,6 +61,7 @@ __all__ = [
     "encode",
     "open_load",
     "reply_stream",
+    "require_device",
     "run",
     "serve",
 ]

@@ -39,7 +39,10 @@ different accelerator; only a model server's own process imports PyTorch.
   loop (`run`, `block_network`, `open_load`); `LazyRegistry` imports a model's implementation only
   when asked for, so each environment needs only its own model's libraries; `ModelHost` keeps one
   server warm on a shared GPU, holding the lease only while a model is loaded, unloading after an
-  idle time and at once when another project waits.
+  idle time and at once when another project waits. A server announces its localmodels version first and the
+  manager refuses another version with a plain message (rebuild that model's environment); `require_device`
+  refuses, in plain words, a model the machine's hardware cannot run, before anything starts. A model file on a
+  network filesystem (NFS, SMB) is reported, since every cold start then reads it at network speed.
 - `localmodels.pinned` — Hugging Face snapshots pinned to a commit with every file's SHA-256
   (`PinnedModel`, `PinnedFile`), fetched once (`fetch_snapshot`), hashed when pinned
   (`hash_snapshot`) and checked before use (`verify_files`); weights then load offline.
@@ -105,7 +108,8 @@ restarting after a yield once the other project's lease clears. `deploy/localmod
 systemd user-unit template.
 
 `localmodels lease ...` gives the shared GPU-lease protocol's operations as a command with
-documented exit codes (`0` ok, `2` another project's lease is live, `3` `wait` timed out), so a
+documented exit codes (`0` ok, `2` another project's lease is live, `3` `wait` timed out; the lease directory
+is `~/.local/state/gpu-lease` unless `GPU_LEASE_DIR` says otherwise), so a
 caller that cannot import this package (e.g. a bash queue) can still speak the protocol. After
 `begin-wait`, `wait` takes its turn in request order (`GpuLeaseClient`); without a waiting lease of
 its own it waits for every other live lease, as before.

@@ -23,8 +23,9 @@ from .atomic import write_text_atomically
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-#: The shared lease directory every project on a host uses unless told otherwise.
-DEFAULT_LEASE_DIR = Path("~/.local/state/gpu-lease").expanduser()
+#: The shared lease directory every project on a host uses unless told otherwise; ``GPU_LEASE_DIR``
+#: overrides it (slurm's tools on gpu-node-1 read the same variable).
+DEFAULT_LEASE_DIR = Path(os.environ.get("GPU_LEASE_DIR", "~/.local/state/gpu-lease")).expanduser()
 
 
 class LeaseRecord(BaseModel):

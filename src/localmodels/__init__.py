@@ -4,9 +4,15 @@ Extracted from service_a and service_c (service_a DECISIONS D31), then service_b
 the managing side, so any caller can depend on it without pulling in a CUDA build meant for a
 different accelerator. Text models run as llama.cpp's ``llama-server`` (never on port 8080); any
 other local model runs in its own process through ``localmodels.serving``.
+
+The llama-server launcher's names load on first use, so a process that only needs another part (a model server
+importing ``localmodels.serving``) does not import the launcher and its HTTP client.
 """
 
 from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 from .catalogue import LicencePolicy, ModelCategory, ModelSpec, licence_allowed, select
 from .enums import DeviceTier, DeviceType, ModelSizeClass, Precision, PreflightVerdict, QuantLevel
@@ -17,18 +23,6 @@ from .hardware import (
     host_available_bytes,
     inspect_hardware,
     resolve_device,
-)
-from .launcher import (
-    Contention,
-    LeaseConflictError,
-    LeaseWaitTimeoutError,
-    LocalServerManager,
-    PortHeldError,
-    ReservedPortError,
-    ServerStartError,
-    StartupYieldedError,
-    SupervisorExit,
-    supervise,
 )
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .params import ServingParams, TierDecision, classify_tier, derive_serving_params
@@ -44,6 +38,20 @@ from .process import (
     resolve_llama_server_bin,
 )
 from .pull import check_updates, model_status, pull_model, search_hub
+
+if TYPE_CHECKING:
+    from .launcher import (
+        Contention,
+        LeaseConflictError,
+        LeaseWaitTimeoutError,
+        LocalServerManager,
+        PortHeldError,
+        ReservedPortError,
+        ServerStartError,
+        StartupYieldedError,
+        SupervisorExit,
+        supervise,
+    )
 
 __all__ = [
     "DEFAULT_LEASE_DIR",
@@ -101,3 +109,13 @@ __all__ = [
     "supervise",
     "verify_files",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Import one of the launcher's names on first use (every other public name is imported above)."""
+    if name not in __all__:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+    value = getattr(import_module(".launcher", __name__), name)
+    globals()[name] = value
+    return value

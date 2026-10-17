@@ -59,6 +59,8 @@ ignore = [
 # (code standard: "construction by injection, never a global") — the arg count is the cost of
 # not reaching for a Settings singleton, not a design smell to hide behind a config object.
 "src/localmodels/launcher.py" = ["PLR0913"]
+# The command line's job is to print: its output is the interface, not a leftover debug print.
+"src/localmodels/cli.py" = ["T201"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["localmodels"]

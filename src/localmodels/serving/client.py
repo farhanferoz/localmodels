@@ -8,15 +8,18 @@ deadline, so a stuck model never blocks the caller: cancelling or timing out kil
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import selectors
 import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, TypeVar
 
 from pydantic import ValidationError
 
+from localmodels.hardware import network_filesystem
 from localmodels.serving.errors import ServingCancelled, ServingError, ServingErrorCode
 from localmodels.serving.protocol import (
     ErrorMessage,
@@ -25,11 +28,13 @@ from localmodels.serving.protocol import (
     LoadMessage,
     Message,
     ProgressMessage,
+    ReadyMessage,
     ResultMessage,
     ShutdownMessage,
     decode,
     encode,
 )
+from localmodels.version import package_version
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -48,6 +53,8 @@ MODEL_SERVER_ENV: Final = {
 
 R = TypeVar("R", bound=Message)
 
+log = logging.getLogger(__name__)
+
 
 class ModelServerProcess:
     """One model-server child process; ``identity`` says which model (and version) it serves."""
@@ -59,6 +66,7 @@ class ModelServerProcess:
         self.argv = list(argv)
         self.env = {**os.environ, **MODEL_SERVER_ENV, **(env or {})}
         self.identity = identity
+        self.server_version: str | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._selector: selectors.BaseSelector | None = None
         self._buffer = b""
@@ -87,6 +95,7 @@ class ModelServerProcess:
         self._selector = selectors.DefaultSelector()
         self._selector.register(self._proc.stdout, selectors.EVENT_READ)
         self._buffer = b""
+        self.server_version = None
 
     def load(
         self,
@@ -98,8 +107,16 @@ class ModelServerProcess:
 
         Raises:
             ServingCancelled: ``cancel_check()`` turned true (the process has been stopped).
-            ServingError: the server failed, timed out or exited.
+            ServingError: the server failed, timed out or exited; ``not_implemented`` when it runs another
+                localmodels version than this process.
         """
+        if (kind := network_filesystem(Path(request.model_dir))) is not None:
+            log.warning(
+                "model %s is on a network filesystem (%s): every cold load reads it at network speed; "
+                "keep model files on a local disk",
+                request.model_dir,
+                kind,
+            )
         self._send(request)
         return self._await(LoadedMessage, cancel_check, timeout_s, lambda _progress: None)
 
@@ -148,6 +165,11 @@ class ModelServerProcess:
             msg = self._next_message(min(POLL_S, max(deadline - time.monotonic(), 0.0)))
             if msg is None:
                 continue
+            if isinstance(msg, ReadyMessage):
+                self._check_version(msg.version)
+                continue
+            if self.server_version is None:
+                self._mismatch("an older localmodels (it did not say which version)")
             if isinstance(msg, ErrorMessage):
                 raise ServingError(msg.code, msg.message)
             if isinstance(msg, ProgressMessage):
@@ -156,6 +178,19 @@ class ModelServerProcess:
                 return msg
             else:
                 raise ServingError(ServingErrorCode.INTERNAL, "Unexpected message from the model server.")
+
+    def _check_version(self, version: str) -> None:
+        self.server_version = version
+        if version != package_version():
+            self._mismatch(f"localmodels {version}")
+
+    def _mismatch(self, server: str) -> None:
+        self._terminate()
+        msg = (
+            f"The model server runs {server} and this process runs localmodels {package_version()}: "
+            "install the same version in the model's environment."
+        )
+        raise ServingError(ServingErrorCode.NOT_IMPLEMENTED, msg)
 
     def _next_message(self, wait_s: float) -> Message | None:
         """The next complete line from the server, or None if none arrived within ``wait_s``."""

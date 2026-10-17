@@ -18,7 +18,6 @@ import json
 import os
 import time
 from enum import StrEnum
-from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,6 +33,7 @@ from .lease import DEFAULT_LEASE_DIR, GpuLease, LeaseRecord
 from .preflight import PreflightResult, preflight
 from .process import resolve_llama_server_bin
 from .pull import model_status
+from .version import package_version
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -387,7 +387,7 @@ def run_setup(
 def _serialise_report(report: SetupReport) -> dict[str, object]:
     return {
         "recorded_at": int(time.time()),
-        "localmodels_version": version("localmodels"),
+        "localmodels_version": package_version(),
         "hardware": report.preflight.report.model_dump(mode="json") if report.preflight else None,
         "preflight_verdict": report.preflight.verdict.value if report.preflight else None,
         "chosen_model": report.chosen_model,

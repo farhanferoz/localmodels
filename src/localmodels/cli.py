@@ -43,14 +43,6 @@ EXIT_ERROR = 1
 EXIT_LEASE_CONFLICT = 2
 EXIT_LEASE_TIMEOUT = 3
 
-# Indirected through a module-level name (matching preflight.py's own `out = stream or
-# sys.stderr` idiom) rather than writing `print(..., file=sys.stderr)` directly: ruff's T201
-# only flags a literal `sys.stdout`/`sys.stderr` attribute access as the destination, not an
-# opaque reference to it -- this stays real stdout/stderr, just not spelled in a way that
-# reads as a leftover debug print.
-_STDOUT = sys.stdout
-_STDERR = sys.stderr
-
 
 def _lease_from_args(args: argparse.Namespace) -> GpuLease:
     return GpuLease(Path(args.lease_dir), project=args.project)
@@ -70,7 +62,7 @@ def cmd_lease_status(args: argparse.Namespace) -> int:
     if args.json_out:
         Path(args.json_out).write_text(text)
     else:
-        print(text, file=_STDOUT)
+        print(text)
     return EXIT_OK
 
 
@@ -80,7 +72,7 @@ def cmd_lease_acquire(args: argparse.Namespace) -> int:
     others = lease.live_others()
     if others:
         holders = ", ".join(o.project for o in others)
-        print(f"GPU lease held by: {holders}", file=_STDERR)
+        print(f"GPU lease held by: {holders}", file=sys.stderr)
         return EXIT_LEASE_CONFLICT
     lease.write(
         LeaseRecord(
@@ -106,7 +98,7 @@ def cmd_lease_wait(args: argparse.Namespace) -> int:
     deadline = time.time() + args.timeout if args.timeout is not None else None
     if client.wait_turn(args.poll, lambda: deadline is not None and time.time() > deadline):
         return EXIT_OK
-    print(f"timed out after {args.timeout}s waiting for the GPU lease", file=_STDERR)
+    print(f"timed out after {args.timeout}s waiting for the GPU lease", file=sys.stderr)
     return EXIT_LEASE_TIMEOUT
 
 
@@ -168,7 +160,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         device_override=args.device,
         binary=Path(args.llama_server_bin) if args.llama_server_bin else None,
     )
-    print_summary(report, stream=_STDOUT)
+    print_summary(report, stream=sys.stdout)
     if not args.dry_run:
         record_setup(report, state_path=Path(args.state_path))
     return EXIT_OK if report.ok else EXIT_ERROR

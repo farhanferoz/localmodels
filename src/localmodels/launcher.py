@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
 import socket
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, BinaryIO
 
 import httpx
 
+from .hardware import network_filesystem
 from .lease import GpuLease, GpuLeaseClient, LeaseRecord
 from .process import (
     LocalModelsError,
@@ -52,6 +54,8 @@ __all__ = [
 ]
 
 _HTTP_OK = 200
+
+log = logging.getLogger(__name__)
 
 
 class Contention(StrEnum):
@@ -332,6 +336,13 @@ class LocalServerManager:
 
         self._check_port_free()
         require_key_off_loopback(self.spec)
+        if (kind := network_filesystem(self.spec.model_path)) is not None:
+            log.warning(
+                "model %s is on a network filesystem (%s): every cold start reads it at network speed; "
+                "keep model files on a local disk",
+                self.spec.model_path,
+                kind,
+            )
         args = build_args(self.binary, self.spec, self.params, self.extra_flags)
 
         is_gpu = self.params.n_gpu_layers != 0

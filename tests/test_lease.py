@@ -14,14 +14,11 @@ import os
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from localmodels.lease import GpuLease, GpuLeaseClient, LeaseRecord
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_lease_write_atomic_and_remove(tmp_path: Path) -> None:
@@ -298,3 +295,13 @@ def test_an_admitted_client_holds_the_gpu_until_it_releases(tmp_path: Path) -> N
     assert [r.project for r in client.holding()] == ["service_b"]
     client.release()
     assert (lease.read_own(), client.holding()) == (None, [])
+
+
+def test_gpu_lease_dir_overrides_the_default_lease_directory(tmp_path: Path) -> None:
+    probe = "from localmodels.lease import DEFAULT_LEASE_DIR; print(DEFAULT_LEASE_DIR)"
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = {**os.environ, "GPU_LEASE_DIR": str(tmp_path), "PYTHONPATH": src}
+    out = subprocess.run(  # noqa: S603 - this interpreter and a fixed probe
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
+    )
+    assert out.stdout.strip() == str(tmp_path)

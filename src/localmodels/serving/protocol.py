@@ -1,9 +1,9 @@
 """Wire protocol between a model process manager and its model server: one JSON object per line.
 
 One pydantic model per ``op``. The manager (``client.ModelServerProcess``) sends ``load``, ``infer`` and
-``shutdown``; the server (``server.serve``) answers ``loaded``, ``progress``, ``result`` or ``error``. Every
-environment that runs a server must pin the same ``localmodels`` revision as its manager: unknown fields are
-refused, so a mismatch fails loudly rather than silently.
+``shutdown``; the server announces itself with ``ready`` (its localmodels version) and answers ``loaded``,
+``progress``, ``result`` or ``error``. The manager refuses a server whose version differs from its own, so an
+environment left on an older localmodels fails with a plain message, not a malformed-message error.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ NEWLINE = b"\n"
 class Op(StrEnum):
     """Discriminator of every protocol message."""
 
+    READY = "ready"
     LOAD = "load"
     LOADED = "loaded"
     INFER = "infer"
@@ -40,6 +41,13 @@ class ProgressStage(StrEnum):
 
 class _Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ReadyMessage(_Message):
+    """Server -> manager, first line on start: the localmodels version the server runs (checked)."""
+
+    op: Literal[Op.READY] = Op.READY
+    version: str
 
 
 class LoadMessage(_Message):
@@ -114,7 +122,8 @@ class ShutdownMessage(_Message):
 
 
 Message = Annotated[
-    LoadMessage
+    ReadyMessage
+    | LoadMessage
     | LoadedMessage
     | InferMessage
     | ProgressMessage

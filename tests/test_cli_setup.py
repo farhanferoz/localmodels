@@ -7,7 +7,6 @@ its flags and calls `run_setup`/`record_setup` correctly -- `run_setup` itself i
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 
@@ -147,16 +146,14 @@ def test_cmd_setup_loads_a_custom_catalogue(monkeypatch, tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("blocked_step", [SetupStepName.BACKEND, SetupStepName.HARDWARE])
-def test_setup_exits_nonzero_when_backend_refused(monkeypatch, blocked_step: SetupStepName) -> None:
+def test_setup_exits_nonzero_when_backend_refused(monkeypatch, capsys, blocked_step: SetupStepName) -> None:
     """A refused CPU-only build (or infeasible hardware) is a failed setup, not a summary to skim."""
     report = SetupReport(
         dry_run=False,
         results=[StepResult(step=blocked_step, name="x", status=StepStatus.BLOCKED, detail="rebuild it")],
     )
-    out = io.StringIO()
-    monkeypatch.setattr(cli_mod, "_STDOUT", out)
     monkeypatch.setattr(cli_mod, "run_setup", lambda **_k: report)
     monkeypatch.setattr(cli_mod, "record_setup", lambda *_a, **_k: None)
 
     assert main(["setup", "--yes"]) == EXIT_ERROR
-    assert "start serving" not in out.getvalue()
+    assert "start serving" not in capsys.readouterr().out
