@@ -1,6 +1,6 @@
 [project]
 name = "localmodels"
-version = "0.3.1"
+version = "0.3.2"
 description = "Hardware-aware local model serving, GPU-lease coordination and model catalogue, torch-free"
 requires-python = ">=3.12,<3.14"
 license = "MIT"
