@@ -1,13 +1,15 @@
 # localmodels
 
-Hardware-aware local LLM serving, GPU-lease coordination and a model catalogue shape, extracted
-from [service_a](https://github.com/farhanferoz/service_a) and
-[service_c](https://github.com/farhanferoz/service_c) so both projects — and anything else
-that serves a local `llama-server` — share one implementation instead of two.
+Hardware-aware local model serving, GPU-lease coordination and a model catalogue shape, extracted
+from [service_a](https://github.com/farhanferoz/service_a),
+[service_c](https://github.com/farhanferoz/service_c) and service_b so every project that runs
+local models — a `llama-server` text model, or a PyTorch model of any kind in its own process —
+shares one implementation.
 
-**Torch-free.** Hardware is measured through NVML, `nvidia-smi` and `sysconf`/`sysctl`, never
-through `torch.cuda`. A caller can depend on this package without pulling in a CUDA build meant
-for a different accelerator.
+**Torch-free on the managing side.** Hardware is measured through NVML, `nvidia-smi` and
+`sysconf`/`sysctl`, never through `torch.cuda`, and the serving manager only starts processes and
+exchanges JSON. A caller can depend on this package without pulling in a CUDA build meant for a
+different accelerator; only a model server's own process imports PyTorch.
 
 ## What it does
 
@@ -28,7 +30,21 @@ for a different accelerator.
   shared directory, written atomically, so two projects sharing one GPU on a host can see who
   holds it and ask each other to yield. The file format is a contract shared with service_c's
   bash queue (`scripts/run_gpu_queue.sh`), which writes and reads it without depending on this
-  package.
+  package. `GpuLeaseClient` is the waiting side: it publishes its request, takes its turn in
+  request order (holders and earlier waiters block, later waiters do not, so two waiters can never
+  wait for each other), holds the lease while working and releases it.
+- `localmodels.serving` — any local model in its own process and Python environment:
+  `ModelServerProcess` starts a model server (one JSON message per line on its stdin/stdout,
+  `protocol`), with deadlines and cancellation that kill its process group; `server` is the child's
+  loop (`run`, `block_network`, `open_load`); `LazyRegistry` imports a model's implementation only
+  when asked for, so each environment needs only its own model's libraries; `ModelHost` keeps one
+  server warm on a shared GPU, holding the lease only while a model is loaded, unloading after an
+  idle time and at once when another project waits.
+- `localmodels.pinned` — Hugging Face snapshots pinned to a commit with every file's SHA-256
+  (`PinnedModel`, `PinnedFile`), fetched once (`fetch_snapshot`), hashed when pinned
+  (`hash_snapshot`) and checked before use (`verify_files`); weights then load offline.
+- `localmodels.atomic` — writes a reader never sees half-done: a file (`write_text_atomically`) or a
+  whole directory (`replace_dir_atomically`).
 - `localmodels.process` / `localmodels.launcher` — resolves the `llama-server` binary, builds its
   argv, and starts/stops/supervises one server instance per `LocalServerManager`. `Contention`
   lets a caller choose to refuse when another project holds the GPU, or wait for it.
@@ -90,7 +106,9 @@ systemd user-unit template.
 
 `localmodels lease ...` gives the shared GPU-lease protocol's operations as a command with
 documented exit codes (`0` ok, `2` another project's lease is live, `3` `wait` timed out), so a
-caller that cannot import this package (e.g. a bash queue) can still speak the protocol.
+caller that cannot import this package (e.g. a bash queue) can still speak the protocol. After
+`begin-wait`, `wait` takes its turn in request order (`GpuLeaseClient`); without a waiting lease of
+its own it waits for every other live lease, as before.
 
 ## Development
 

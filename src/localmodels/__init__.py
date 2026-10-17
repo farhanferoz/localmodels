@@ -1,14 +1,15 @@
-"""localmodels: hardware-aware local LLM serving, GPU-lease coordination and model catalogue.
+"""localmodels: hardware-aware local model serving, GPU-lease coordination and model catalogue.
 
-Extracted from service_a and service_c (service_a DECISIONS D31): torch-free, so any caller
-can depend on it without pulling in a CUDA build meant for a different accelerator. Local model
-servers are always llama.cpp's ``llama-server``; this package never starts anything on port 8080.
+Extracted from service_a and service_c (service_a DECISIONS D31), then service_b: torch-free on
+the managing side, so any caller can depend on it without pulling in a CUDA build meant for a
+different accelerator. Text models run as llama.cpp's ``llama-server`` (never on port 8080); any
+other local model runs in its own process through ``localmodels.serving``.
 """
 
 from __future__ import annotations
 
 from .catalogue import LicencePolicy, ModelCategory, ModelSpec, licence_allowed, select
-from .enums import DeviceTier, DeviceType, ModelSizeClass, PreflightVerdict, QuantLevel
+from .enums import DeviceTier, DeviceType, ModelSizeClass, Precision, PreflightVerdict, QuantLevel
 from .hardware import (
     AvailableMemory,
     HardwareReport,
@@ -29,8 +30,9 @@ from .launcher import (
     SupervisorExit,
     supervise,
 )
-from .lease import GpuLease, LeaseRecord
+from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .params import ServingParams, TierDecision, classify_tier, derive_serving_params
+from .pinned import PinnedFile, PinnedModel, fetch_snapshot, hash_snapshot, verify_files
 from .preflight import PreflightResult, preflight, print_preflight
 from .process import (
     BinaryNotFoundError,
@@ -44,12 +46,14 @@ from .process import (
 from .pull import check_updates, model_status, pull_model, search_hub
 
 __all__ = [
+    "DEFAULT_LEASE_DIR",
     "AvailableMemory",
     "BinaryNotFoundError",
     "Contention",
     "DeviceTier",
     "DeviceType",
     "GpuLease",
+    "GpuLeaseClient",
     "HardwareReport",
     "LeaseConflictError",
     "LeaseRecord",
@@ -60,7 +64,10 @@ __all__ = [
     "ModelCategory",
     "ModelSizeClass",
     "ModelSpec",
+    "PinnedFile",
+    "PinnedModel",
     "PortHeldError",
+    "Precision",
     "PreflightResult",
     "PreflightVerdict",
     "QuantLevel",
@@ -78,6 +85,8 @@ __all__ = [
     "check_updates",
     "classify_tier",
     "derive_serving_params",
+    "fetch_snapshot",
+    "hash_snapshot",
     "host_available_bytes",
     "inspect_hardware",
     "licence_allowed",
@@ -90,4 +99,5 @@ __all__ = [
     "search_hub",
     "select",
     "supervise",
+    "verify_files",
 ]

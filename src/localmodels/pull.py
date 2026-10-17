@@ -8,11 +8,23 @@ reads the local disk.
 from __future__ import annotations
 
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .pinned import repo_dir
+
 if TYPE_CHECKING:
     from .catalogue import ModelSpec
+
+
+class UpdateState(StrEnum):
+    """The ``status`` of a ``check_updates`` entry; a str, so callers reading the dicts are unchanged."""
+
+    UPDATE_AVAILABLE = "update_available"
+    UP_TO_DATE = "up_to_date"
+    NOT_CACHED = "not_cached"
+    CHECK_FAILED = "check_failed"
 
 
 def _default_hf_home() -> Path:
@@ -20,7 +32,7 @@ def _default_hf_home() -> Path:
 
 
 def _repo_to_cache_dir(repo_id: str, hf_home: Path) -> Path:
-    return hf_home / "hub" / ("models--" + repo_id.replace("/", "--"))
+    return repo_dir(repo_id, hf_home / "hub")
 
 
 def _dir_size_mb(path: Path) -> float:
@@ -117,9 +129,9 @@ def check_updates(
                             update_available = True
                 elif status.get("local_sha") and remote_sha:
                     update_available = not remote_sha.startswith(status["local_sha"])
-                state = "update_available" if update_available else "up_to_date"
+                state = UpdateState.UPDATE_AVAILABLE if update_available else UpdateState.UP_TO_DATE
             else:
-                state = "not_cached"
+                state = UpdateState.NOT_CACHED
             results.append(
                 {
                     "alias": spec.alias,
@@ -136,7 +148,7 @@ def check_updates(
                     "alias": spec.alias,
                     "repo_id": spec.repo_id,
                     "cached": status["cached"],
-                    "status": "check_failed",
+                    "status": UpdateState.CHECK_FAILED,
                     "error": str(exc)[:120],
                 }
             )

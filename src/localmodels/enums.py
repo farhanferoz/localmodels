@@ -43,6 +43,12 @@ class ModelSizeClass(StrEnum):
     REMOTE_RECOMMENDED = "remote_recommended"
 
 
+class Precision(StrEnum):
+    """Numeric precision a model runs in; a member is added once measured on the hardware that runs it."""
+
+    BFLOAT16 = "bfloat16"
+
+
 class PreflightVerdict(StrEnum):
     """Answer to "can this machine run local models at all?" — never a bare pass/fail.
 

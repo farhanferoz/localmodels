@@ -1,7 +1,7 @@
 [project]
 name = "localmodels"
 version = "0.2.5"
-description = "Hardware-aware local LLM serving, GPU-lease coordination and model catalogue, torch-free"
+description = "Hardware-aware local model serving, GPU-lease coordination and model catalogue, torch-free"
 requires-python = ">=3.12,<3.14"
 license = "MIT"
 dependencies = [
@@ -77,5 +77,5 @@ mypy_path = "src"
 namespace_packages = true
 
 [[tool.mypy.overrides]]
-module = ["pynvml.*", "huggingface_hub.*"]
+module = ["pynvml.*", "huggingface_hub.*", "torch", "torch.*"]
 ignore_missing_imports = true
