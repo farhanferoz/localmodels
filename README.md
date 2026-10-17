@@ -13,6 +13,11 @@ for a different accelerator.
 
 - `localmodels.hardware` — measures the host's device type and memory (never keyed on a card
   name) and reports it as a `HardwareReport`.
+- `localmodels.hardware.available_memory(device)` — how much a new allocation on a device can get now. On a GPU
+  that shares the host's RAM (such as a DGX Spark's GB10) it is the host's `MemAvailable`, by NVIDIA's guidance, because
+  the driver's own free count (`cudaMemGetInfo`, `torch.cuda.mem_get_info`, nvidia-smi) leaves out the page cache and
+  after a large file read reports far less than an allocation can get. Decide whether something fits from this, never
+  from the driver's count.
 - `localmodels.params` — derives `llama-server` serving parameters (`n_gpu_layers`, `n_ctx`,
   `n_parallel`, recommended quantisation and size class) as a pure function of measured hardware,
   and classifies a serving tier with an operator-facing warning/recommendation.

@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -100,3 +101,102 @@ def test_resolve_device_with_override_preserves_index() -> None:
 
 def test_resolve_device_without_override_probes_real_hardware() -> None:
     assert resolve_device() in ("cuda", "mps", "cpu")
+
+
+# --- available_memory: what an allocation can get, not the driver's free count
+_MEMINFO = """MemTotal:       127600748 kB
+MemFree:         22680460 kB
+MemAvailable:   113377280 kB
+HugePages_Total:       0
+HugePages_Free:        0
+Hugepagesize:       2048 kB
+"""
+
+
+def _meminfo(tmp_path, text: str = _MEMINFO) -> str:
+    path = tmp_path / "meminfo"
+    path.write_text(text)
+    return str(path)
+
+
+def test_host_available_bytes_is_memavailable_not_memfree(tmp_path) -> None:
+    assert hw_mod.host_available_bytes(_meminfo(tmp_path)) == 113377280 * 1024
+
+
+def test_host_available_bytes_with_huge_pages_is_the_free_huge_pages(tmp_path) -> None:
+    text = _MEMINFO.replace("HugePages_Total:       0", "HugePages_Total:     100").replace(
+        "HugePages_Free:        0", "HugePages_Free:       40"
+    )
+    assert hw_mod.host_available_bytes(_meminfo(tmp_path, text)) == 40 * 2048 * 1024
+
+
+def test_host_available_bytes_unreadable_is_none(tmp_path) -> None:
+    assert hw_mod.host_available_bytes(str(tmp_path / "absent")) is None
+
+
+def test_unified_gpu_by_smi_gets_the_host_figure(monkeypatch, tmp_path) -> None:
+    _fake_cuda(monkeypatch, "[N/A]\n")  # the GB10: nvidia-smi has no free figure of its own
+    got = hw_mod.available_memory("cuda", _meminfo(tmp_path))
+    assert got is not None
+    assert got.unified
+    assert got.bytes == 113377280 * 1024
+    assert "MemAvailable" in got.source
+
+
+def test_unified_gpu_by_nvml_not_supported_gets_the_host_figure(monkeypatch, tmp_path) -> None:
+    class NotSupportedError(Exception):
+        pass
+
+    def raise_not_supported(_handle):
+        raise NotSupportedError
+
+    nvml = types.SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        NVMLError_NotSupported=NotSupportedError,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetMemoryInfo=raise_not_supported,
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setattr(hw_mod.shutil, "which", lambda _: None)
+    got = hw_mod.available_memory("cuda:0", _meminfo(tmp_path))
+    assert got is not None
+    assert got.unified
+    assert got.bytes == 113377280 * 1024
+
+
+def test_discrete_gpu_gets_its_own_free_memory(monkeypatch, tmp_path) -> None:
+    _fake_cuda(monkeypatch, "20000\n")
+    got = hw_mod.available_memory("cuda:1", _meminfo(tmp_path))
+    assert got is not None
+    assert not got.unified
+    assert got.bytes == 20000 * 1024**2
+
+
+def test_discrete_gpu_by_nvml_gets_its_own_free_memory(monkeypatch, tmp_path) -> None:
+    nvml = types.SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetMemoryInfo=lambda _h: types.SimpleNamespace(free=7 * 1024**3),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    got = hw_mod.available_memory("cuda", _meminfo(tmp_path))
+    assert got is not None
+    assert not got.unified
+    assert got.bytes == 7 * 1024**3
+
+
+def test_cpu_gets_the_host_figure_and_mps_and_an_unread_gpu_are_unknown(monkeypatch, tmp_path) -> None:
+    got = hw_mod.available_memory("cpu", _meminfo(tmp_path))
+    assert got is not None
+    assert not got.unified
+    assert got.bytes == 113377280 * 1024
+    assert hw_mod.available_memory("mps", _meminfo(tmp_path)) is None
+    _fake_cuda(monkeypatch, "", run_raises=True)
+    assert hw_mod.available_memory("cuda", _meminfo(tmp_path)) is None
+
+
+def test_available_memory_never_raises_on_this_host() -> None:
+    hw_mod.available_memory("cuda")
+    hw_mod.available_memory("cpu")
