@@ -259,6 +259,15 @@ def test_a_server_on_another_localmodels_version_is_refused_with_a_plain_message
     assert not server.alive
 
 
+def test_a_missing_server_program_is_a_serving_error_in_plain_words(tmp_path: Path) -> None:
+    server = ModelServerProcess([str(tmp_path / "no-such-python")])
+    with pytest.raises(ServingError) as refused:
+        server.start()
+    assert refused.value.code == ServingErrorCode.INTERNAL
+    assert refused.value.message.startswith(f"The model server could not start: {tmp_path}/no-such-python: ")
+    assert not server.alive
+
+
 def test_unsupported_hardware_is_refused_in_plain_words_before_anything_starts() -> None:
     cpu = HardwareReport(
         platform="linux", arch="x86_64", device=DeviceType.CPU, device_name="CPU", total_memory_gb=8.0,

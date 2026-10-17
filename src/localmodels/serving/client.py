@@ -86,10 +86,21 @@ class ModelServerProcess:
         return None if self._proc is None else self._proc.pid
 
     def start(self) -> None:
-        """Start the child in a new session, its stdout read without blocking."""
-        self._proc = subprocess.Popen(  # noqa: S603 - argv list from the caller, no shell
-            self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env, start_new_session=True
-        )
+        """Start the child in a new session, its stdout read without blocking.
+
+        Raises:
+            ServingError: ``internal``; the server program could not be run (missing, not executable).
+        """
+        try:
+            self._proc = subprocess.Popen(  # noqa: S603 - argv list from the caller, no shell
+                self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env, start_new_session=True
+            )
+        except OSError as exc:
+            raise ServingError(
+                ServingErrorCode.INTERNAL,
+                f"The model server could not start: {self.argv[0]}: {exc.strerror}. "
+                "Check the server command.",
+            ) from exc
         assert self._proc.stdout is not None  # noqa: S101 - narrowing for mypy
         os.set_blocking(self._proc.stdout.fileno(), False)
         self._selector = selectors.DefaultSelector()
