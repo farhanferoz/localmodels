@@ -1,5 +1,12 @@
 name: ci
-on: [push, pull_request]
+# Runs on the ci-gate branch, on pull requests and by hand only: the account's free Actions minutes are shared by
+# every private repository (owner, 2026-10-17). Push a batch of work to ci-gate, then move main to it on success.
+on:
+  push:
+    branches: [ci-gate]
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+  workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-latest
