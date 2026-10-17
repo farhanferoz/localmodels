@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import signal
 import socket
 import time
@@ -20,8 +21,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
-from .hardware import network_filesystem
+from .hardware import available_memory, network_filesystem
 from .lease import GpuLease, GpuLeaseClient, LeaseRecord
 from .process import (
     LocalModelsError,
@@ -36,7 +38,7 @@ from .process import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from .params import ServingParams
 
@@ -45,6 +47,7 @@ __all__ = [
     "LeaseConflictError",
     "LeaseWaitTimeoutError",
     "LocalServerManager",
+    "MemoryGuards",
     "PortHeldError",
     "ReservedPortError",
     "ServerStartError",
@@ -54,6 +57,13 @@ __all__ = [
 ]
 
 _HTTP_OK = 200
+_GIB = 1024**3
+_MIB_PER_GIB = 1024
+# llama-fit-params prints this only at verbosity 4 (measured by service_c, 2026-10-07).
+_PROJECTION_RE = re.compile(r"projected to use (\d+) MiB of device memory")
+_FIT_PARAMS_TIMEOUT_S = 600.0
+# The score is set by a shell that then execs the server (same PID): preexec_fn is not thread-safe.
+_OOM_WRAPPER = 'echo {score} > /proc/self/oom_score_adj && exec "$0" "$@"'
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +73,33 @@ class Contention(StrEnum):
 
     REFUSE = "refuse"
     WAIT = "wait"
+
+
+class MemoryGuards(BaseModel):
+    """Memory protection for a server on a host whose GPU shares its RAM; every guard is off unless set.
+
+    ``kill_below_gib``: SIGKILL the server at once when available memory falls below it, polled every
+    ``load_poll_s`` while it loads and every ``watch_poll_s`` while it runs. ``host_reserve_gib``: before the
+    load, ``llama-fit-params``' projection plus this must fit in available memory (no projection counts as
+    not fitting); after the load, the server is stopped if it left less than this available.
+    ``server_oom_score_adj``: the server's OOM score, so the kernel's killer picks it first.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kill_below_gib: float | None = Field(default=None, gt=0)
+    host_reserve_gib: float | None = Field(default=None, gt=0)
+    server_oom_score_adj: int | None = Field(default=None, ge=-1000, le=1000)
+    #: Default: ``llama-fit-params`` beside the server binary.
+    fit_params_binary: Path | None = None
+    load_poll_s: float = Field(default=1.0, gt=0)
+    watch_poll_s: float = Field(default=5.0, gt=0)
+
+
+def _available_gib(on_gpu: bool) -> float | None:
+    """Available memory in GiB for a GPU or CPU server (``available_memory``); None when unreadable."""
+    reading = available_memory("cuda" if on_gpu else "cpu")
+    return None if reading is None else reading.bytes / _GIB
 
 
 class SupervisorExit(StrEnum):
@@ -176,6 +213,8 @@ class LocalServerManager:
         wait_poll_s: float = 2.0,
         wait_timeout_s: float | None = None,
         min_slot_tokens: int = 0,
+        guards: MemoryGuards | None = None,
+        available_gib: Callable[[bool], float | None] = _available_gib,
     ) -> None:
         self.spec = spec
         self.params = params
@@ -192,9 +231,100 @@ class LocalServerManager:
         self.wait_poll_s = wait_poll_s
         self.wait_timeout_s = wait_timeout_s
         self.min_slot_tokens = min_slot_tokens
+        self.guards = guards or MemoryGuards()
+        self._available_gib = available_gib
+        self._watchdog: asyncio.Task[None] | None = None
+        self._ready = False
+        #: Why the watchdog killed the last server it started, in plain words; None if it did not.
+        self.killed_reason: str | None = None
 
     def _pidfile(self) -> Path:
         return self.pid_dir / f"{self.spec.port}.pid"
+
+    def _free_gib(self) -> float | None:
+        return self._available_gib(self.params.n_gpu_layers != 0)
+
+    async def _projected_gib(self) -> float:
+        """llama.cpp's projection of the server's memory (weights, context, compute); raises if none."""
+        fit = self.guards.fit_params_binary or Path(self.binary).with_name("llama-fit-params")
+        cmd = [
+            str(fit),
+            "-m",
+            str(self.spec.model_path),
+            "-c",
+            str(self.params.n_ctx),
+            "-np",
+            str(self.params.n_parallel),
+            "-lv",
+            "4",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_FIT_PARAMS_TIMEOUT_S)
+        except (OSError, TimeoutError) as exc:
+            msg = f"llama-fit-params could not run ({exc}); not loading a model it has not projected"
+            raise ServerStartError(msg) from exc
+        match = _PROJECTION_RE.search(out.decode(errors="replace"))
+        if match is None:
+            msg = (
+                f"llama-fit-params printed no projection for {self.spec.model_path.name} "
+                f"(exit {proc.returncode}); not loading a model it has not projected"
+            )
+            raise ServerStartError(msg)
+        return int(match.group(1)) / _MIB_PER_GIB
+
+    async def _check_fits(self) -> None:
+        """Refuse to load when the projection plus the host reserve exceeds available memory."""
+        reserve = self.guards.host_reserve_gib
+        if reserve is None:
+            return
+        need = await self._projected_gib() + reserve
+        free = self._free_gib()
+        if free is None:
+            msg = "available memory cannot be read, so the model's fit cannot be checked; not loading it"
+            raise ServerStartError(msg)
+        if need > free:
+            msg = (
+                f"{self.spec.model_path.name} needs {need:.1f} GiB (llama.cpp's projection plus a "
+                f"{reserve:g} GiB host reserve) but {free:.1f} GiB is available; not loading it"
+            )
+            raise ServerStartError(msg)
+
+    async def _check_left_over(self) -> None:
+        """After the load: stop the server if it left less than the host reserve available."""
+        reserve = self.guards.host_reserve_gib
+        free = self._free_gib()
+        if reserve is None or free is None or free >= reserve:
+            return
+        await self.stop()
+        msg = (
+            f"the loaded server left {free:.1f} GiB available, under the {reserve:g} GiB reserve; stopped it"
+        )
+        raise ServerStartError(msg)
+
+    async def _watch_memory(self, pid: int, floor: float) -> None:
+        """SIGKILL the server's process group the moment available memory falls below ``floor``."""
+        while _is_pid_alive(pid):
+            await asyncio.sleep(self.guards.watch_poll_s if self._ready else self.guards.load_poll_s)
+            free = self._free_gib()
+            if free is not None and free < floor:
+                self.killed_reason = (
+                    f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
+                )
+                log.error("killing llama-server PID %d: %s", pid, self.killed_reason)
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGKILL)
+                return
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
 
     async def _try_adopt(self, pidfile: Path) -> ServerHandle | None:
         pid = _read_pid_if_exists(pidfile)
@@ -273,6 +403,9 @@ class LocalServerManager:
         while time.time() < deadline:
             if proc.returncode is not None:
                 await self.stop()
+                if self.killed_reason is not None:
+                    msg = f"llama-server was killed while loading: {self.killed_reason}"
+                    raise ServerStartError(msg)
                 msg = f"llama-server exited prematurely with code {proc.returncode}; see {log_path}"
                 raise ServerStartError(msg)
 
@@ -344,6 +477,9 @@ class LocalServerManager:
                 kind,
             )
         args = build_args(self.binary, self.spec, self.params, self.extra_flags)
+        if self.guards.server_oom_score_adj is not None:
+            args = ["sh", "-c", _OOM_WRAPPER.format(score=self.guards.server_oom_score_adj), *args]
+        await self._check_fits()
 
         is_gpu = self.params.n_gpu_layers != 0
         lease_written = False
@@ -363,9 +499,15 @@ class LocalServerManager:
                 )
 
             _write_pid(pidfile, proc.pid)
+            self._ready, self.killed_reason = False, None
+            if self.guards.kill_below_gib is not None:
+                self._watchdog = asyncio.create_task(self._watch_memory(proc.pid, self.guards.kill_below_gib))
             await self._poll_ready(proc, log_path, lease_written)
             await self._verify_props()
+            await self._check_left_over()
+            self._ready = True
         except Exception:
+            self._cancel_watchdog()
             if lease_written:
                 self.lease.remove()
             raise
@@ -405,6 +547,7 @@ class LocalServerManager:
             msg = f"port {self.spec.port} is reserved; this manager never stops a server on it"
             raise ReservedPortError(msg)
 
+        self._cancel_watchdog()
         pidfile = self._pidfile()
         pid = _read_pid_if_exists(pidfile)
         if pid is None:

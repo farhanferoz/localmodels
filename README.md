@@ -57,6 +57,9 @@ different accelerator; only a model server's own process imports PyTorch.
 - `localmodels.process` / `localmodels.launcher` — resolves the `llama-server` binary, builds its
   argv, and starts/stops/supervises one server instance per `LocalServerManager`. `Contention`
   lets a caller choose to refuse when another project holds the GPU, or wait for it.
+  `MemoryGuards` (all off unless passed) adds a kill floor on available memory, a host reserve checked
+  against `llama-fit-params`' projection before the load and the memory left after it, and the server's
+  `oom_score_adj`.
 - `localmodels.catalogue` / `localmodels.pull` — the shared shape of a model catalogue entry
   (`ModelSpec`), a `LicencePolicy` gate a caller applies to its own catalogue, and download/status
   helpers over the Hugging Face Hub. Catalogue *entries* are each caller's own data; this package
