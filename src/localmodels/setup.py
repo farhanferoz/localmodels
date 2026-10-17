@@ -16,20 +16,21 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from enum import StrEnum
+from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from .atomic import write_text_atomically
 from .backend import Backend, detect_backend
 from .bench import BenchError, BenchResult, run_bench
 from .catalogue import LicencePolicy, ModelCategory, ModelSpec
 from .download import NoCatalogueMatchError, choose_model, download_model
 from .enums import DeviceType, ModelSizeClass, PreflightVerdict
-from .lease import GpuLease, LeaseRecord
+from .lease import DEFAULT_LEASE_DIR, GpuLease, LeaseRecord
 from .preflight import PreflightResult, preflight
 from .process import resolve_llama_server_bin
 from .pull import model_status
@@ -40,10 +41,7 @@ if TYPE_CHECKING:
 
 DEFAULT_MODELS_DIR = Path("~/.local/share/localmodels/models").expanduser()
 DEFAULT_STATE_PATH = Path("~/.local/state/localmodels/setup.json").expanduser()
-DEFAULT_LEASE_DIR = Path("~/.local/state/gpu-lease").expanduser()
 DEFAULT_PROJECT = "localmodels-setup"
-
-__version__ = "0.2.0"
 
 
 class Role(StrEnum):
@@ -389,7 +387,7 @@ def run_setup(
 def _serialise_report(report: SetupReport) -> dict[str, object]:
     return {
         "recorded_at": int(time.time()),
-        "localmodels_version": __version__,
+        "localmodels_version": version("localmodels"),
         "hardware": report.preflight.report.model_dump(mode="json") if report.preflight else None,
         "preflight_verdict": report.preflight.verdict.value if report.preflight else None,
         "chosen_model": report.chosen_model,
@@ -400,17 +398,8 @@ def _serialise_report(report: SetupReport) -> dict[str, object]:
 
 
 def record_setup(report: SetupReport, *, state_path: Path = DEFAULT_STATE_PATH) -> None:
-    """Persist ``report`` to ``state_path`` atomically.
-
-    Temp file + rename, `GpuLease.write`'s own pattern -- never leaves a half-written state
-    file behind.
-    """
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _serialise_report(report)
-    fd, tmp = tempfile.mkstemp(dir=state_path.parent, prefix="setup.", suffix=".json.tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-    Path(tmp).replace(state_path)
+    """Persist ``report`` to ``state_path`` atomically: never a half-written state file."""
+    write_text_atomically(state_path, json.dumps(_serialise_report(report), indent=2))
 
 
 _STATUS_MARKER: dict[StepStatus, str] = {

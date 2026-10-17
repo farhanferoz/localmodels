@@ -13,11 +13,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING
 
 import pytest
 
-from localmodels.lease import GpuLease, LeaseRecord
+from localmodels.lease import GpuLease, GpuLeaseClient, LeaseRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -254,3 +255,46 @@ def test_blockers_when_not_waiting_counts_every_live_lease(tmp_path: Path) -> No
     finally:
         sub.terminate()
         sub.wait()
+
+
+@pytest.mark.parametrize(("offset_s", "blocks"), [(-100, True), (100, False)], ids=["earlier", "later"])
+def test_the_client_waits_only_for_an_earlier_waiter_and_steps_aside_for_it(
+    tmp_path: Path, offset_s: int, blocks: bool
+) -> None:
+    """Moved from service_b's GPU worker tests with the client."""
+    client = GpuLeaseClient(GpuLease(tmp_path, project="service_b"))
+    client.begin_wait("job-a")
+    asked = client.lease.read_own()
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        (tmp_path / "other.json").write_text(
+            json.dumps({"pid": sub.pid, "project": "other", "requested_at": int(time.time()) + offset_s})
+        )
+        assert [r.project for r in client.step()] == (["other"] if blocks else [])
+        # while an earlier waiter is queued our request is withdrawn, so a reader that treats every lease as
+        # busy is not blocked by us
+        assert client.lease.lease_path().exists() is not blocks
+        assert client.wait_turn(0.01, should_stop=lambda: True) is not blocks
+        assert client.lease.read_own() == asked  # giving up restores the request with its original time
+    finally:
+        sub.terminate()
+        sub.wait()
+
+
+def test_an_admitted_client_holds_the_gpu_until_it_releases(tmp_path: Path) -> None:
+    lease = GpuLease(tmp_path, project="service_b")
+    client = GpuLeaseClient(lease, lane="interactive")
+    client.begin_wait("job-a")
+    client.admit(model_path="/models/m", job_id="job-b")
+    own = lease.read_own()
+    assert own is not None
+    assert (own.requested_at, own.model_path, own.job_id, own.lane) == (
+        None,
+        "/models/m",
+        "job-b",
+        "interactive",
+    )
+    assert own.started_at is not None
+    assert [r.project for r in client.holding()] == ["service_b"]
+    client.release()
+    assert (lease.read_own(), client.holding()) == (None, [])

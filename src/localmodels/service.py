@@ -32,7 +32,7 @@ from .launcher import (
     SupervisorExit,
     supervise,
 )
-from .lease import GpuLease
+from .lease import DEFAULT_LEASE_DIR, GpuLease
 from .params import derive_serving_params
 from .process import ServerSpec, resolve_llama_server_bin
 
@@ -44,7 +44,6 @@ if TYPE_CHECKING:
 # Matches the shared GPU-lease protocol doc (service_c/docs/2026-09-15-gpu-lease-protocol.md):
 # "Polls every 30 s" -- service_a's half of the contract this package now implements.
 _DEFAULT_POLL_S = 30.0
-_DEFAULT_LEASE_DIR = Path("~/.local/state/gpu-lease").expanduser()
 _DEFAULT_PID_DIR = Path("~/.local/state/localmodels/pids").expanduser()
 
 EXIT_OK = 0
@@ -64,7 +63,7 @@ class ServeConfig(BaseModel):
     port: int
     model_path: Path
     project: str
-    lease_dir: Path = _DEFAULT_LEASE_DIR
+    lease_dir: Path = DEFAULT_LEASE_DIR
     reserved_ports: frozenset[int] = Field(default_factory=frozenset)
     contention: Contention = Contention.REFUSE
     binary: Path | None = None

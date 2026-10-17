@@ -109,6 +109,15 @@ def test_lease_wait_times_out_while_another_lease_is_live(tmp_path: Path) -> Non
     assert code == EXIT_LEASE_TIMEOUT
 
 
+def test_lease_wait_after_begin_wait_is_not_blocked_by_a_later_waiter(tmp_path: Path) -> None:
+    lease_args = ["--project", "service_a", "--lease-dir", str(tmp_path)]
+    assert main(["lease", "begin-wait", *lease_args, "--pid", str(os.getpid())]) == EXIT_OK
+    later = GpuLease(tmp_path, project="service_c")
+    later.write(LeaseRecord(pid=os.getpid(), project="service_c", requested_at=int(time.time()) + 100))
+
+    assert main(["lease", "wait", *lease_args, "--timeout", "0.05", "--poll", "0.01"]) == EXIT_OK
+
+
 def test_lease_wait_succeeds_once_the_other_lease_clears(tmp_path: Path) -> None:
     """A lease whose pid is dead is stale and purged by `live_others()` -- `wait` should not
     need the holder to call `release` itself for a crashed holder to be seen as free."""

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, BinaryIO
 
 import httpx
 
-from .lease import GpuLease, LeaseRecord
+from .lease import GpuLease, GpuLeaseClient, LeaseRecord
 from .process import (
     LocalModelsError,
     ServerHandle,
@@ -228,21 +228,27 @@ class LocalServerManager:
             pass
 
     async def _acquire_lease(self) -> None:
-        """Write this instance's GPU lease, honouring ``Contention`` against other live leases."""
-        deadline = time.time() + self.wait_timeout_s if self.wait_timeout_s is not None else None
-        while True:
+        """Write this instance's GPU lease, honouring ``Contention`` against other live leases.
+
+        ``WAIT`` publishes the request first, so a server that yields to waiting projects yields to this one,
+        and takes its turn in request order (``GpuLeaseClient``): two waiters cannot wait for each other.
+        """
+        if self.contention is Contention.REFUSE:
             others = self.lease.live_others()
-            if not others:
-                break
-            if self.contention is Contention.REFUSE:
+            if others:
                 holders = ", ".join(o.project for o in others)
                 msg = f"cannot acquire GPU lease; currently held by: {holders}"
                 raise LeaseConflictError(msg)
-            if deadline is not None and time.time() > deadline:
-                msg = f"timed out waiting {self.wait_timeout_s}s for the GPU lease"
-                raise LeaseWaitTimeoutError(msg)
-            await asyncio.sleep(self.wait_poll_s)
-
+        else:
+            client = GpuLeaseClient(self.lease, port=self.spec.port)
+            client.begin_wait()
+            deadline = time.time() + self.wait_timeout_s if self.wait_timeout_s is not None else None
+            while client.step():
+                if deadline is not None and time.time() > deadline:
+                    client.release()
+                    msg = f"timed out waiting {self.wait_timeout_s}s for the GPU lease"
+                    raise LeaseWaitTimeoutError(msg)
+                await asyncio.sleep(self.wait_poll_s)
         self._write_lease()
 
     def _write_lease(self) -> None:

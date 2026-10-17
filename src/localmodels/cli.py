@@ -23,11 +23,8 @@ from typing import TYPE_CHECKING
 from pydantic import TypeAdapter
 
 from .catalogue import ModelSpec
-from .lease import GpuLease, LeaseRecord
+from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .service import _cmd_serve
-from .setup import (
-    DEFAULT_LEASE_DIR as SETUP_DEFAULT_LEASE_DIR,
-)
 from .setup import (
     DEFAULT_MODELS_DIR,
     DEFAULT_PROJECT,
@@ -46,8 +43,6 @@ EXIT_ERROR = 1
 EXIT_LEASE_CONFLICT = 2
 EXIT_LEASE_TIMEOUT = 3
 
-DEFAULT_LEASE_DIR = Path("~/.local/state/gpu-lease").expanduser()
-
 # Indirected through a module-level name (matching preflight.py's own `out = stream or
 # sys.stderr` idiom) rather than writing `print(..., file=sys.stderr)` directly: ruff's T201
 # only flags a literal `sys.stdout`/`sys.stderr` attribute access as the destination, not an
@@ -57,29 +52,6 @@ _STDOUT = sys.stdout
 _STDERR = sys.stderr
 
 
-def _read_own_lease(lease: GpuLease) -> LeaseRecord | None:
-    """Read this project's own lease record, tolerating a missing or unparsable file.
-
-    Mirrors ``lease.py``'s own ``_check_other_lease_file`` parsing rules (skip what cannot be
-    parsed) without reaching into that module's private function -- reading one's own lease
-    file never needs the staleness check that function also does, since a process reads its
-    own liveness trivially (it is running).
-    """
-    path = lease.lease_path()
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        return LeaseRecord(**data)
-    except (TypeError, ValueError):
-        return None
-
-
 def _lease_from_args(args: argparse.Namespace) -> GpuLease:
     return GpuLease(Path(args.lease_dir), project=args.project)
 
@@ -87,7 +59,7 @@ def _lease_from_args(args: argparse.Namespace) -> GpuLease:
 def cmd_lease_status(args: argparse.Namespace) -> int:
     """Report this project's own lease record plus every other live one."""
     lease = _lease_from_args(args)
-    mine = _read_own_lease(lease)
+    mine = lease.read_own()
     others = lease.live_others()
     report = {
         "project": lease.project,
@@ -123,15 +95,19 @@ def cmd_lease_acquire(args: argparse.Namespace) -> int:
 
 
 def cmd_lease_wait(args: argparse.Namespace) -> int:
-    """Poll until no other project's lease is live, or EXIT_LEASE_TIMEOUT after ``--timeout``."""
+    """Poll until it is this project's turn at the GPU, or EXIT_LEASE_TIMEOUT after ``--timeout``.
+
+    After `lease begin-wait`, the turn comes in request order (`GpuLeaseClient`): holders and earlier waiters
+    block, later waiters do not. Without a waiting lease of its own, every other live lease blocks.
+    """
     lease = _lease_from_args(args)
+    own = lease.read_own()
+    client = GpuLeaseClient.resuming(lease, own) if own is not None else GpuLeaseClient(lease)
     deadline = time.time() + args.timeout if args.timeout is not None else None
-    while lease.live_others():
-        if deadline is not None and time.time() > deadline:
-            print(f"timed out after {args.timeout}s waiting for the GPU lease", file=_STDERR)
-            return EXIT_LEASE_TIMEOUT
-        time.sleep(args.poll)
-    return EXIT_OK
+    if client.wait_turn(args.poll, lambda: deadline is not None and time.time() > deadline):
+        return EXIT_OK
+    print(f"timed out after {args.timeout}s waiting for the GPU lease", file=_STDERR)
+    return EXIT_LEASE_TIMEOUT
 
 
 def cmd_lease_begin_wait(args: argparse.Namespace) -> int:
@@ -270,7 +246,7 @@ def _build_setup_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     p.add_argument("--yes", action="store_true", help="proceed past the download/bench plan")
     p.add_argument("--dry-run", action="store_true", help="report the plan; make no changes")
     p.add_argument("--project", default=DEFAULT_PROJECT, help="this run's GPU lease project name")
-    p.add_argument("--lease-dir", default=str(SETUP_DEFAULT_LEASE_DIR))
+    p.add_argument("--lease-dir", default=str(DEFAULT_LEASE_DIR))
     p.add_argument("--state-path", default=str(DEFAULT_STATE_PATH))
     p.add_argument("--device", default=None, help="override the measured device (testing/manual use)")
     p.add_argument(

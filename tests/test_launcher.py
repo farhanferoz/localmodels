@@ -190,8 +190,13 @@ async def _child_cuda_env(tmp_path: Path, extra_env: dict[str, str] | None) -> s
     model_file.touch()
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8198, model_file=model_file,
-            params=_cpu_params(), extra_env=extra_env,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8198,
+            model_file=model_file,
+            params=_cpu_params(),
+            extra_env=extra_env,
         )
         await manager.start()
         try:
@@ -222,8 +227,13 @@ async def test_start_and_stop_fake_server(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8199, model_file=model_file,
-            params=_gpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8199,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
         )
         handle = await manager.start()
         assert handle.pid > 0
@@ -246,8 +256,13 @@ async def test_reserved_port_refuses_start_and_stop(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8080, model_file=model_file,
-            params=_gpu_params(), reserved_ports=frozenset({8080}),
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8080,
+            model_file=model_file,
+            params=_gpu_params(),
+            reserved_ports=frozenset({8080}),
         )
         with pytest.raises(ReservedPortError, match="reserved"):
             await manager.start()
@@ -269,8 +284,14 @@ async def test_contention_refuse_raises_when_another_lease_is_live(tmp_path: Pat
         lease = GpuLease(lease_dir, project="localmodels-test")
         async with httpx.AsyncClient() as http:
             manager = _manager(
-                tmp_path=tmp_path, http=http, bin_path=bin_path, port=8198, model_file=model_file,
-                params=_gpu_params(), contention=Contention.REFUSE, lease=lease,
+                tmp_path=tmp_path,
+                http=http,
+                bin_path=bin_path,
+                port=8198,
+                model_file=model_file,
+                params=_gpu_params(),
+                contention=Contention.REFUSE,
+                lease=lease,
             )
             with pytest.raises(LeaseConflictError, match="currently held by: other"):
                 await manager.start()
@@ -293,8 +314,15 @@ async def test_contention_wait_blocks_then_proceeds_once_the_other_lease_dies(tm
     lease = GpuLease(lease_dir, project="localmodels-test")
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8197, model_file=model_file,
-            params=_gpu_params(), contention=Contention.WAIT, wait_poll_s=0.05, lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8197,
+            model_file=model_file,
+            params=_gpu_params(),
+            contention=Contention.WAIT,
+            wait_poll_s=0.05,
+            lease=lease,
         )
         start = time.time()
         handle = await manager.start()
@@ -319,12 +347,20 @@ async def test_contention_wait_times_out(tmp_path: Path) -> None:
         lease = GpuLease(lease_dir, project="localmodels-test")
         async with httpx.AsyncClient() as http:
             manager = _manager(
-                tmp_path=tmp_path, http=http, bin_path=bin_path, port=8196, model_file=model_file,
-                params=_gpu_params(), contention=Contention.WAIT, wait_poll_s=0.05,
-                wait_timeout_s=0.2, lease=lease,
+                tmp_path=tmp_path,
+                http=http,
+                bin_path=bin_path,
+                port=8196,
+                model_file=model_file,
+                params=_gpu_params(),
+                contention=Contention.WAIT,
+                wait_poll_s=0.05,
+                wait_timeout_s=0.2,
+                lease=lease,
             )
             with pytest.raises(LeaseWaitTimeoutError, match="timed out waiting"):
                 await manager.start()
+            assert not lease.lease_path().exists()  # the timed-out request is withdrawn
     finally:
         sub.terminate()
         await sub.wait()
@@ -342,7 +378,11 @@ async def test_port_already_held_by_external_socket_refuses_start(tmp_path: Path
     try:
         async with httpx.AsyncClient() as http:
             manager = _manager(
-                tmp_path=tmp_path, http=http, bin_path=bin_path, port=8195, model_file=model_file,
+                tmp_path=tmp_path,
+                http=http,
+                bin_path=bin_path,
+                port=8195,
+                model_file=model_file,
                 params=_cpu_params(),
             )
             with pytest.raises(PortHeldError, match="held by a process this manager did not start"):
@@ -358,7 +398,11 @@ async def test_props_context_slot_mismatch_stops_server_and_refuses(tmp_path: Pa
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8194, model_file=model_file,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8194,
+            model_file=model_file,
             params=_cpu_params(n_ctx=4096),
             min_slot_tokens=8192,
         )
@@ -374,7 +418,11 @@ async def test_status_reporting(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8193, model_file=model_file,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8193,
+            model_file=model_file,
             params=_cpu_params(),
         )
         idle = await manager.status()
@@ -426,8 +474,13 @@ async def test_supervise_server_killed_exits_and_cleans_lease(tmp_path: Path) ->
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8191, model_file=model_file,
-            params=_gpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8191,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
         )
         handle = await manager.start()
         assert lease.lease_path().exists()
@@ -458,8 +511,13 @@ async def test_supervise_yields_when_another_lease_requests(tmp_path: Path) -> N
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8190, model_file=model_file,
-            params=_gpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8190,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
         )
         handle = await manager.start()
         assert lease.lease_path().exists()
@@ -487,8 +545,13 @@ async def test_adopted_gpu_server_writes_a_lease(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8189, model_file=model_file,
-            params=_gpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8189,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
         )
         handle = await manager.start()
         lease.remove()  # the previous owner of this server is gone, the server is not
@@ -507,8 +570,13 @@ async def test_adopted_cpu_server_writes_no_lease(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8188, model_file=model_file,
-            params=_cpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8188,
+            model_file=model_file,
+            params=_cpu_params(),
+            lease=lease,
         )
         await manager.start()
         adopted = await manager.start()
@@ -525,8 +593,14 @@ async def test_start_refused_for_a_missing_api_key_leaves_no_lease(tmp_path: Pat
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8187, model_file=model_file,
-            params=_gpu_params(), lease=lease, host="0.0.0.0",  # noqa: S104
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8187,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
+            host="0.0.0.0",  # noqa: S104
         )
         with pytest.raises(ApiKeyRequiredError):
             await manager.start()
@@ -540,8 +614,13 @@ async def test_start_that_cannot_spawn_leaves_no_lease(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=tmp_path / "no-such-llama-server", port=8186,
-            model_file=model_file, params=_gpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=tmp_path / "no-such-llama-server",
+            port=8186,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
         )
         with pytest.raises(OSError):  # noqa: PT011 -- FileNotFoundError from the spawn
             await manager.start()
@@ -558,8 +637,13 @@ async def test_supervise_does_not_yield_a_cpu_server_to_a_gpu_request(tmp_path: 
 
     async with httpx.AsyncClient() as http:
         manager = _manager(
-            tmp_path=tmp_path, http=http, bin_path=bin_path, port=8185, model_file=model_file,
-            params=_cpu_params(), lease=lease,
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8185,
+            model_file=model_file,
+            params=_cpu_params(),
+            lease=lease,
         )
         handle = await manager.start()
 
