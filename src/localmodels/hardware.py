@@ -14,11 +14,16 @@ import os
 import platform
 import shutil
 import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from .enums import DeviceTier, DeviceType
 from .params import classify_tier
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _GIB = 1024**3
 _FALLBACK_MEMORY_GB = 8.0  # declared when system RAM cannot be measured
@@ -45,28 +50,29 @@ def _parse_device(override: str) -> DeviceType:
         raise ValueError(msg) from exc
 
 
-def _cuda_memory_gb() -> tuple[str, float | None] | None:
-    try:
-        import pynvml  # noqa: PLC0415
+def _nvml_read[T](index: int, read: Callable[[Any, Any], T]) -> T:
+    """``read(pynvml, handle)`` for NVML device ``index``, between NVML's init and shutdown.
 
-        pynvml.nvmlInit()
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = pynvml.nvmlDeviceGetName(handle)
-            total = pynvml.nvmlDeviceGetMemoryInfo(handle).total
-            if total and total > 0:
-                return (name if isinstance(name, str) else name.decode(), total / _GIB)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:  # noqa: BLE001,S110 — probe failure is not an error, it means "no CUDA"
-        pass
+    Raises what NVML raises (ImportError without pynvml).
+    """
+    import pynvml  # noqa: PLC0415
+
+    pynvml.nvmlInit()
+    try:
+        return read(pynvml, pynvml.nvmlDeviceGetHandleByIndex(index))
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def _smi_query(fields: str, index: int = 0) -> list[str] | None:
+    """The comma-separated ``fields`` nvidia-smi reports for GPU ``index``; None when it fails."""
     smi = shutil.which("nvidia-smi")
     if smi is None:
         return None
     try:
         out = (
             subprocess.run(  # noqa: S603 — smi is a shutil.which() result, not a literal
-                [smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                [smi, "-i", str(index), f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -75,13 +81,28 @@ def _cuda_memory_gb() -> tuple[str, float | None] | None:
             .stdout.strip()
             .splitlines()[0]
         )
-        name, mib = (part.strip() for part in out.split(","))
-        if mib.isdigit() and int(mib) > 0:
-            return (name, int(mib) / 1024)
-        if mib == "[N/A]":  # unified-memory GPUs report [N/A]; caller uses system RAM
-            return (name, None)
-    except (subprocess.SubprocessError, ValueError, IndexError):
+    except (subprocess.SubprocessError, IndexError):
         return None
+    return [part.strip() for part in out.split(",")]
+
+
+def _cuda_memory_gb() -> tuple[str, float | None] | None:
+    try:
+        name, total = _nvml_read(
+            0, lambda nv, h: (nv.nvmlDeviceGetName(h), nv.nvmlDeviceGetMemoryInfo(h).total)
+        )
+        if total and total > 0:
+            return (name if isinstance(name, str) else name.decode(), total / _GIB)
+    except Exception:  # noqa: BLE001,S110 — probe failure is not an error, it means "no CUDA"
+        pass
+    parts = _smi_query("name,memory.total")
+    if parts is None or len(parts) != 2:  # noqa: PLR2004 — the two fields asked for
+        return None
+    name, mib = parts
+    if mib.isdigit() and int(mib) > 0:
+        return (name, int(mib) / 1024)
+    if mib == "[N/A]":  # unified-memory GPUs report [N/A]; caller uses system RAM
+        return (name, None)
     return None
 
 
@@ -170,6 +191,99 @@ def inspect_hardware(device_override: str | None = None) -> HardwareReport:
         tier=classify_tier(device, mem).tier,
         assumptions=assumptions,
     )
+
+
+_MEMINFO = "/proc/meminfo"
+_MEMINFO_FIELDS = frozenset({"MemAvailable", "HugePages_Total", "HugePages_Free", "Hugepagesize"})
+
+
+class AvailableMemory(BaseModel):
+    """What a new allocation on a device can get now (``available_memory``)."""
+
+    bytes: int
+    device: DeviceType
+    unified: bool  # the device's memory is the host's RAM
+    source: str  # where the figure comes from, in words, for a log line
+
+
+def host_available_bytes(meminfo_path: str = _MEMINFO) -> int | None:
+    """What the host can allocate without swapping; None where /proc/meminfo cannot be read (not Linux).
+
+    NVIDIA's rule for unified memory (DGX Spark User Guide, Known Issues, "Guidance for reporting memory
+    resources with unified memory architecture"): ``MemAvailable``, which is free memory plus the page cache
+    and other memory the kernel gives back on demand, or ``HugePages_Free`` x ``Hugepagesize`` when huge pages
+    are configured (``HugePages_Total`` above 0).
+    """
+    fields: dict[str, int] = {}
+    try:
+        with Path(meminfo_path).open(encoding="ascii") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in _MEMINFO_FIELDS:
+                    fields[key] = int(rest.split()[0])  # kB, except the two HugePages_ counts
+    except (OSError, ValueError, IndexError):
+        return None
+    if fields.get("HugePages_Total", 0) > 0 and {"HugePages_Free", "Hugepagesize"} <= fields.keys():
+        return fields["HugePages_Free"] * fields["Hugepagesize"] * 1024
+    return fields["MemAvailable"] * 1024 if "MemAvailable" in fields else None
+
+
+def _cuda_free_bytes(index: int) -> tuple[int | None, bool] | None:
+    """(free bytes, unified) of CUDA device ``index`` by NVML, then nvidia-smi; None when neither reads it.
+
+    Unified (the device's memory is the host's RAM, free bytes None) when NVML reports the memory as not
+    supported or nvidia-smi as ``[N/A]``: the GB10 of a DGX Spark does both.
+    """
+
+    def free(nv: Any, handle: Any) -> tuple[int | None, bool]:
+        try:
+            return nv.nvmlDeviceGetMemoryInfo(handle).free, False
+        except Exception as exc:
+            if isinstance(exc, getattr(nv, "NVMLError_NotSupported", ())):
+                return None, True
+            raise
+
+    try:
+        return _nvml_read(index, free)
+    except Exception:  # noqa: BLE001,S110 — probe failure is not an error, it means "try nvidia-smi"
+        pass
+    parts = _smi_query("memory.free", index)
+    if parts is None:
+        return None
+    if parts[0].isdigit():
+        return int(parts[0]) * 1024**2, False
+    if parts[0] == "[N/A]":
+        return None, True
+    return None
+
+
+def available_memory(device: str = "cuda", meminfo_path: str = _MEMINFO) -> AvailableMemory | None:
+    """How much a new allocation on ``device`` (``"cuda"``, ``"cuda:1"``, ``"cpu"``, ``"mps"``) can get now.
+
+    None when it cannot be measured, so a caller can tell "unknown" from a number. A GPU with its own
+    memory: that memory's free bytes. A GPU that shares the host's RAM (such as a DGX Spark's GB10):
+    ``host_available_bytes``, because the driver's own free count (``cudaMemGetInfo``,
+    ``torch.cuda.mem_get_info``, nvidia-smi) leaves out the page cache the kernel gives back on demand, so
+    after a large file read it reports far less than an allocation can get (NVIDIA, DGX Spark porting guide:
+    "the cudaMemGetInfo API does not account for memory that could potentially be reclaimed"; measured on a
+    GB10 on 2026-10-17: 55.9 GB by the driver, 108.1 GB available). Decide whether something fits from this,
+    never from the driver's count. The CPU: ``host_available_bytes``. Apple silicon (MPS): None, macOS has
+    no /proc/meminfo.
+    """
+    kind = _parse_device(device)
+    host = None if kind is DeviceType.MPS else host_available_bytes(meminfo_path)
+    unified, source = False, "the host's available memory (MemAvailable)"
+    if kind is DeviceType.CUDA:
+        _, _, index = device.partition(":")
+        free, unified = _cuda_free_bytes(int(index) if index else 0) or (None, False)
+        if not unified:
+            if free is None:
+                return None
+            return AvailableMemory(bytes=free, device=kind, unified=False, source="the GPU's own free memory")
+        source += ", as this GPU shares the host's RAM and the driver's free count leaves out the page cache"
+    if host is None:
+        return None
+    return AvailableMemory(bytes=host, device=kind, unified=unified, source=source)
 
 
 def resolve_device(device_override: str | None = None) -> str:

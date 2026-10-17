@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from .catalogue import LicencePolicy, ModelCategory, ModelSpec, licence_allowed, select
 from .enums import DeviceTier, DeviceType, ModelSizeClass, PreflightVerdict, QuantLevel
-from .hardware import HardwareReport, inspect_hardware, resolve_device
+from .hardware import (
+    AvailableMemory,
+    HardwareReport,
+    available_memory,
+    host_available_bytes,
+    inspect_hardware,
+    resolve_device,
+)
 from .launcher import (
     Contention,
     LeaseConflictError,
@@ -37,6 +44,7 @@ from .process import (
 from .pull import check_updates, model_status, pull_model, search_hub
 
 __all__ = [
+    "AvailableMemory",
     "BinaryNotFoundError",
     "Contention",
     "DeviceTier",
@@ -65,10 +73,12 @@ __all__ = [
     "StartupYieldedError",
     "SupervisorExit",
     "TierDecision",
+    "available_memory",
     "build_args",
     "check_updates",
     "classify_tier",
     "derive_serving_params",
+    "host_available_bytes",
     "inspect_hardware",
     "licence_allowed",
     "model_status",
