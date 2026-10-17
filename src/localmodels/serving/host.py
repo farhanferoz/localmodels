@@ -41,6 +41,11 @@ class ModelHost:
         self._last_use = clock()
 
     @property
+    def loaded(self) -> ModelServerProcess | None:
+        """The warm server process, if one is running."""
+        return self._server
+
+    @property
     def holding(self) -> bool:
         """Whether this host holds the GPU (a model is loaded or about to be)."""
         return self._holding

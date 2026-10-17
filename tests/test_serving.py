@@ -213,6 +213,7 @@ def test_the_host_waits_its_turn_keeps_the_model_warm_unloads_when_idle_and_yiel
         load = LoadMessage(model_dir="/m", revision="r1")
         warm = host.server(ECHO, ECHO_ARGV, ECHO_ENV, load, lambda: False)
         assert host.server(ECHO, ECHO_ARGV, ECHO_ENV, load, lambda: False) is warm
+        assert host.loaded is warm
         host.finished()
         now[0] = 299.0
         host.unload_if_idle()
@@ -279,3 +280,24 @@ def test_a_model_server_loads_neither_the_launcher_nor_its_http_client() -> None
         [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
     )
     assert out.stdout.strip() == "set()"
+
+
+def test_network_access_is_refused_and_counted_while_local_sockets_still_work() -> None:
+    probe = (
+        "import socket\n"
+        "from localmodels.serving import block_network\n"
+        "attempts = block_network()\n"
+        "for call in (lambda: socket.create_connection(('192.0.2.1', 80), timeout=1), "
+        "lambda: socket.getaddrinfo('example.com', 443)):\n"
+        "    try:\n"
+        "        call()\n"
+        "    except OSError as exc:\n"
+        "        assert 'blocked' in str(exc)\n"
+        "a, b = socket.socketpair(socket.AF_UNIX)\n"
+        "print(attempts)\n"
+    )
+    env = {**os.environ, **ECHO_ENV}
+    out = subprocess.run(  # noqa: S603 - this interpreter and a fixed probe
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
+    )
+    assert out.stdout.strip() == "['connect', 'lookup']"
