@@ -25,6 +25,7 @@ from pydantic import TypeAdapter
 from .catalogue import ModelSpec
 from .digest import register as register_digest
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
+from .llama_builds import register as register_llama
 from .rules import register as register_rules
 from .service import _cmd_serve
 from .setup import (
@@ -266,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_lease_parser(subparsers)
     register_digest(subparsers)
     register_rules(subparsers)
+    register_llama(subparsers)
     return parser
 
 
