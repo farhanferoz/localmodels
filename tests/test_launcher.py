@@ -244,18 +244,20 @@ async def test_start_and_stop_fake_server(tmp_path: Path) -> None:
             params=_gpu_params(),
             lease=lease,
         )
+        assert (await manager.status()).alive is False
+
         handle = await manager.start()
         assert handle.pid > 0
         assert (tmp_path / "pids" / "8199.pid").exists()
         assert lease.lease_path().exists()
-
-        adopted = await manager.start()
-        assert adopted.pid == handle.pid
+        status = await manager.status()
+        assert (status.port, status.pid, status.alive, status.healthy) == (8199, handle.pid, True, True)
 
         stopped = await manager.stop()
         assert stopped is True
         assert not (tmp_path / "pids" / "8199.pid").exists()
         assert not lease.lease_path().exists()
+        assert (await manager.status()).alive is False
 
 
 async def test_reserved_port_refuses_start_and_stop(tmp_path: Path) -> None:
@@ -444,35 +446,6 @@ async def test_unified_pool_needs_n_ctx_for_every_slot(tmp_path: Path) -> None:
         manager(32768)._check_slot_guarantee()
         manager(16384, kv_unified=False)._check_slot_guarantee()
         assert manager(32768).stamp().layout.kv_unified  # type: ignore[union-attr]
-
-
-async def test_status_reporting(tmp_path: Path) -> None:
-    bin_path = _make_fake_server(tmp_path)
-    model_file = tmp_path / "test.gguf"
-    model_file.touch()
-
-    async with httpx.AsyncClient() as http:
-        manager = _manager(
-            tmp_path=tmp_path,
-            http=http,
-            bin_path=bin_path,
-            port=8193,
-            model_file=model_file,
-            params=_cpu_params(),
-        )
-        idle = await manager.status()
-        assert idle.alive is False
-
-        handle = await manager.start()
-        status = await manager.status()
-        assert status.port == 8193
-        assert status.pid == handle.pid
-        assert status.alive is True
-        assert status.healthy is True
-
-        await manager.stop()
-        after = await manager.status()
-        assert after.alive is False
 
 
 async def test_status_probes_the_configured_host(tmp_path: Path) -> None:

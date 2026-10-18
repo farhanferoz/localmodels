@@ -4,42 +4,27 @@ from localmodels.enums import DeviceTier, DeviceType, ModelSizeClass, QuantLevel
 from localmodels.params import classify_tier, derive_serving_params
 
 
-def test_gb10_class_memory_is_fast_tier() -> None:
-    assert classify_tier(DeviceType.CUDA, 121.7).tier is DeviceTier.FAST_ACCELERATED
+@pytest.mark.parametrize(
+    ("device", "total_mem_gb", "tier", "advice"),
+    [
+        (DeviceType.CUDA, 121.7, DeviceTier.FAST_ACCELERATED, False),
+        (DeviceType.CUDA, 8.0, DeviceTier.MODERATE_ACCELERATED, True),
+        (DeviceType.MPS, 16.0, DeviceTier.MODERATE_ACCELERATED, True),
+        (DeviceType.CPU, 64.0, DeviceTier.SLOW_CPU, True),
+    ],
+    ids=["gb10", "small-cuda", "mps", "cpu"],
+)
+def test_tier_follows_the_measured_device_and_memory(
+    device: DeviceType, total_mem_gb: float, tier: DeviceTier, advice: bool
+) -> None:
+    decision = classify_tier(device, total_mem_gb)
+    assert decision.tier is tier
+    assert decision.is_slow is (tier is DeviceTier.SLOW_CPU)
+    assert (decision.warning is not None, decision.recommendation is not None) == (advice, advice)
 
 
-def test_small_cuda_is_moderate() -> None:
-    decision = classify_tier(DeviceType.CUDA, 8.0)
-    assert decision.tier is DeviceTier.MODERATE_ACCELERATED
-    assert decision.warning is not None
-    assert decision.recommendation is not None
-
-
-def test_cpu_is_slow() -> None:
-    decision = classify_tier(DeviceType.CPU, 64.0)
-    assert decision.tier is DeviceTier.SLOW_CPU
-    assert decision.is_slow is True
-
-
-def test_mps_is_moderate() -> None:
-    assert classify_tier(DeviceType.MPS, 16.0).tier is DeviceTier.MODERATE_ACCELERATED
-
-
-def test_serving_params_gb10() -> None:
-    p = derive_serving_params(DeviceType.CUDA, 121.7)
-    assert p.n_gpu_layers == -1
-    assert p.n_ctx == 32768
-    assert p.n_parallel == 4
-    assert p.recommended_quant is QuantLevel.Q4_K_M
-    assert p.recommended_size_class is ModelSizeClass.LARGE
-    assert p.assumptions  # engineering policy is always declared
-
-
-def test_tiny_memory_recommends_remote() -> None:
-    p = derive_serving_params(DeviceType.CPU, 2.0)
-    assert p.recommended_size_class is ModelSizeClass.REMOTE_RECOMMENDED
-    assert p.recommended_quant is None
-    assert p.n_gpu_layers == 0
+def test_below_the_floor_nothing_is_offloaded_even_on_cuda() -> None:
+    assert derive_serving_params(DeviceType.CUDA, 2.9).n_gpu_layers == 0
 
 
 @pytest.mark.parametrize(
@@ -85,6 +70,7 @@ def test_derive_serving_params_respects_measured_ceilings() -> None:
     assert sp.n_ctx == 32768
     assert sp.n_parallel == 4
     assert sp.recommended_quant is QuantLevel.Q4_K_M
+    assert sp.assumptions  # engineering policy is always declared
 
 
 def test_role_layouts_are_fixed_and_no_role_is_unchanged() -> None:

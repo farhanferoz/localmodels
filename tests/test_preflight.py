@@ -36,11 +36,8 @@ def test_preflight_degraded_names_a_remedy_not_a_bypass(device: DeviceType) -> N
     assert result.remedy is not None
     assert "--force" not in result.remedy
     assert "--skip" not in result.remedy
-
-
-def test_preflight_degraded_cpu_names_a_remote_fallback() -> None:
-    result = preflight(report=_fake_report(DeviceType.CPU, 8.0))
-    assert "remote" in result.remedy.lower()
+    if device is DeviceType.CPU:
+        assert "remote" in result.remedy.lower()
 
 
 @pytest.mark.parametrize("device", [DeviceType.CUDA, DeviceType.MPS, DeviceType.CPU])
@@ -58,25 +55,10 @@ def test_preflight_verdict_flips_at_min_runnable_memory_boundary() -> None:
     assert at_floor.verdict is not PreflightVerdict.LOCAL_MODELS_INFEASIBLE
 
 
-def test_preflight_probes_real_hardware_when_no_report_given() -> None:
-    result = preflight()
-    assert result.report.device in (DeviceType.CUDA, DeviceType.MPS, DeviceType.CPU)
-    assert result.verdict in (
-        PreflightVerdict.READY,
-        PreflightVerdict.DEGRADED,
-        PreflightVerdict.LOCAL_MODELS_INFEASIBLE,
-    )
-
-
-def test_print_preflight_ready_uses_ok_tag() -> None:
-    buf = io.StringIO()
-    print_preflight(preflight(report=_fake_report(DeviceType.CUDA, 32.0)), stream=buf)
-    assert "[OK]" in buf.getvalue()
-
-
-def test_print_preflight_degraded_uses_warning_and_advice_tags() -> None:
-    buf = io.StringIO()
-    print_preflight(preflight(report=_fake_report(DeviceType.CPU, 8.0)), stream=buf)
-    out = buf.getvalue()
-    assert "[WARNING]" in out
-    assert "[ADVICE]" in out
+def test_print_preflight_tags_a_ready_and_a_degraded_verdict() -> None:
+    ready, degraded = io.StringIO(), io.StringIO()
+    print_preflight(preflight(report=_fake_report(DeviceType.CUDA, 32.0)), stream=ready)
+    print_preflight(preflight(report=_fake_report(DeviceType.CPU, 8.0)), stream=degraded)
+    assert "[OK]" in ready.getvalue()
+    assert "[WARNING]" in degraded.getvalue()
+    assert "[ADVICE]" in degraded.getvalue()

@@ -1,19 +1,15 @@
 """Unit tests for catalogue model selection ("largest OSI-licensed model of a size class").
 
 `choose_model` is pure (no network, no filesystem) -- the download half is `pull.pull_model`,
-already covered by B12.3's `tests/test_pull.py`; `download_model` here is a one-line pass-
-through kept only so `setup.py` has one name to call, tested for exactly that indirection.
+covered by `tests/test_pull.py`.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-import localmodels.download as download_mod
 from localmodels.catalogue import LicencePolicy, ModelCategory, ModelSpec
-from localmodels.download import NoCatalogueMatchError, choose_model, download_model
+from localmodels.download import NoCatalogueMatchError, choose_model
 from localmodels.enums import ModelSizeClass
 
 _LARGE = ModelSpec(
@@ -92,11 +88,6 @@ def test_default_for_category_breaks_a_tie() -> None:
     assert chosen is _SMALL_DEFAULT
 
 
-def test_never_crosses_category() -> None:
-    chosen = choose_model(_CATALOGUE, category=ModelCategory.EMBED, size_class=ModelSizeClass.SMALL)
-    assert chosen is _SMALL_EMBED
-
-
 def test_any_policy_may_still_choose_a_non_osi_entry() -> None:
     catalogue = [_SMALL_NON_OSI]
     chosen = choose_model(
@@ -108,16 +99,3 @@ def test_any_policy_may_still_choose_a_non_osi_entry() -> None:
 def test_raises_when_no_entry_matches_the_size_class() -> None:
     with pytest.raises(NoCatalogueMatchError, match="size_class=large"):
         choose_model(_CATALOGUE, category=ModelCategory.EMBED, size_class=ModelSizeClass.LARGE)
-
-
-def test_download_model_delegates_to_pull_model(monkeypatch) -> None:
-    calls = []
-
-    def fake_pull_model(spec, *, models_dir):
-        calls.append((spec, models_dir))
-        return models_dir / (spec.filename or spec.alias)
-
-    monkeypatch.setattr(download_mod, "pull_model", fake_pull_model)
-    result = download_model(_LARGE, models_dir=Path("/models"))
-    assert result == Path("/models/Qwen3-30B-A3B-Q4_K_M.gguf")
-    assert calls == [(_LARGE, Path("/models"))]

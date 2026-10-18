@@ -46,8 +46,9 @@ def test_lease_write_atomic_and_remove(tmp_path: Path) -> None:
     assert not path.exists()
 
 
-def test_live_others_purges_dead_pid_and_ignores_garbage(tmp_path: Path) -> None:
+def test_live_others_purges_dead_pid_and_ignores_garbage_and_its_own_lease(tmp_path: Path) -> None:
     lease = GpuLease(tmp_path, project="service_a")
+    lease.write(LeaseRecord(pid=os.getpid(), project="service_a"))
 
     dead_path = tmp_path / "other_dead.json"
     dead_path.write_text(json.dumps({"pid": 99999999, "project": "dead_proj"}))
@@ -110,15 +111,6 @@ def test_type_malformed_lease_is_skipped_and_live_ones_still_reported(
     finally:
         sub.terminate()
         sub.wait()
-
-
-def test_live_others_ignores_own_lease(tmp_path: Path) -> None:
-    lease = GpuLease(tmp_path, project="service_a")
-    lease.write(LeaseRecord(pid=os.getpid(), project="service_a"))
-
-    others = lease.live_others()
-    assert others == []
-    assert lease.requested_by_other() is None
 
 
 def _service_c_bash_lease_json(
