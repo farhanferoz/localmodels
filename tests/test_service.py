@@ -17,9 +17,16 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
-from localmodels.launcher import Contention, LeaseConflictError, StartupYieldedError, SupervisorExit
-from localmodels.lease import GpuLease
+from localmodels.launcher import (
+    Contention,
+    LeaseConflictError,
+    MemoryGuards,
+    StartupYieldedError,
+    SupervisorExit,
+)
+from localmodels.lease import GpuLease, QuietRequest
 from localmodels.process import ServerHandle
 from localmodels.service import ServeConfig, load_serve_config, run_serve
 from tests.test_launcher import _gpu_params, _make_fake_server, _manager
@@ -336,3 +343,59 @@ async def test_run_serve_returns_yielded_when_stopped_while_a_start_waits(tmp_pa
 
     assert result is SupervisorExit.YIELDED
     assert len(starts) == 1
+
+
+def test_stay_up_restarts_only_when_memory_and_the_quiet_cards_allow(tmp_path: Path) -> None:
+    guards = MemoryGuards(kill_below_gib=10, server_oom_score_adj=500)
+    stay_up = {"contention": Contention.STAY_UP, "guards": guards}
+    with pytest.raises(ValidationError, match="resident_allowance_gib"):
+        ServeConfig(port=8091, model_path=Path("/m.gguf"), project="svc", **stay_up)
+    config = ServeConfig(
+        port=8091, model_path=Path("/m.gguf"), project="svc", lease_dir=tmp_path, poll_s=0.02,
+        resident_allowance_gib=20, **stay_up,
+    )  # fmt: skip
+    state = {"free": 25.0}  # below the floor plus the allowance (30 GiB)
+    quiet = tmp_path / "quiet" / "bench.json"
+    GpuLease(tmp_path, project="bench").write_quiet(
+        QuietRequest(pid=os.getpid(), project="bench", requested_at=1, reason="benchmark")
+    )
+    starts: list[tuple[float, bool]] = []
+    outcomes = iter([SupervisorExit.SERVER_EXITED, SupervisorExit.STOPPED])
+
+    class StayUpManager(_FakeManager):
+        killed_reason: str | None = "available memory fell below the floor"
+
+        async def start(self) -> ServerHandle:
+            starts.append((state["free"], quiet.exists()))
+            return await super().start()
+
+        def free_gib(self) -> float:
+            return state["free"]
+
+    async def fake_supervise(_manager, _handle, *, poll_s, stop):
+        return next(outcomes)
+
+    async def relax() -> None:
+        await asyncio.sleep(0.1)
+        state["free"] = 40.0  # enough memory, but the quiet card is still there
+        await asyncio.sleep(0.1)
+        assert len(starts) == 1
+        state["free"] = 25.0
+        quiet.unlink()  # the card is gone, but there is not enough memory yet
+        await asyncio.sleep(0.1)
+        assert len(starts) == 1
+        state["free"] = 40.0
+
+    async def main() -> SupervisorExit:
+        relaxing = asyncio.create_task(relax())
+        result = await run_serve(
+            config,
+            manager_factory=lambda _c, _h: StayUpManager(_fake_handle()),
+            supervise_fn=fake_supervise,
+            stop=asyncio.Event(),
+        )
+        await relaxing
+        return result
+
+    assert asyncio.run(main()) is SupervisorExit.STOPPED
+    assert starts == [(25.0, True), (40.0, False)]

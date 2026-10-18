@@ -14,6 +14,7 @@ row count.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,8 @@ from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from .lease import QuietCard
 
 _DEFAULT_TIMEOUT_S = 300.0
 
@@ -63,8 +66,12 @@ def run_bench(
     repetitions: int = 3,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
     extra_flags: tuple[str, ...] = (),
+    quiet_card: QuietCard | None = None,
 ) -> BenchResult:
-    """Run ``llama-bench -m model_path -p n_prompt -n n_gen -r repetitions -o json`` once."""
+    """Run ``llama-bench -m model_path -p n_prompt -n n_gen -r repetitions -o json`` once.
+
+    ``quiet_card``, when given, is held around the run so that stay-up services have unloaded first.
+    """
     cmd = [
         str(bench_bin),
         "-m",
@@ -80,9 +87,10 @@ def run_bench(
         *extra_flags,
     ]
     try:
-        proc = subprocess.run(  # noqa: S603 — bench_bin is caller-resolved, not user input
-            cmd, capture_output=True, text=True, timeout=timeout_s, check=False
-        )
+        with quiet_card if quiet_card is not None else contextlib.nullcontext():
+            proc = subprocess.run(  # noqa: S603 — bench_bin is caller-resolved, not user input
+                cmd, capture_output=True, text=True, timeout=timeout_s, check=False
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         msg = f"failed to run {' '.join(cmd)}: {exc}"
         raise BenchError(msg) from exc

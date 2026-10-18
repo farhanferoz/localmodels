@@ -21,17 +21,20 @@ from localmodels.launcher import (
     LeaseConflictError,
     LeaseWaitTimeoutError,
     LocalServerManager,
+    MemoryGuards,
     PortHeldError,
     ReservedPortError,
     ServerStartError,
+    StayUpConfigError,
     SupervisorExit,
     supervise,
 )
-from localmodels.lease import GpuLease
+from localmodels.lease import GpuLease, QuietRequest
 from localmodels.params import ServingParams
 from localmodels.process import ApiKeyRequiredError, ServerSpec
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 FAKE_SERVER_CODE = """#!__PYTHON__
@@ -140,6 +143,9 @@ def _manager(
     lease: GpuLease | None = None,
     host: str = "127.0.0.1",
     extra_env: dict[str, str] | None = None,
+    guards: MemoryGuards | None = None,
+    resident_allowance_gib: float | None = None,
+    available_gib: Callable[[bool], float | None] | None = None,
 ) -> LocalServerManager:
     spec = ServerSpec(host=host, port=port, model_path=model_file)
     return LocalServerManager(
@@ -157,6 +163,9 @@ def _manager(
         wait_timeout_s=wait_timeout_s,
         min_slot_tokens=min_slot_tokens,
         extra_env=extra_env,
+        guards=guards,
+        resident_allowance_gib=resident_allowance_gib,
+        **({} if available_gib is None else {"available_gib": available_gib}),
     )
 
 
@@ -685,3 +694,95 @@ async def test_supervise_does_not_yield_a_cpu_server_to_a_gpu_request(tmp_path: 
 
         stop_event.set()
         assert await sup_task == SupervisorExit.STOPPED
+
+
+_STAY_UP_GUARDS = MemoryGuards(kill_below_gib=10, server_oom_score_adj=500, watch_poll_s=0.05)
+
+
+def _resident(lease_dir: Path, project: str) -> dict[str, object]:
+    return json.loads((lease_dir / "resident" / f"{project}.json").read_text())
+
+
+async def test_stay_up_is_refused_without_its_guards(tmp_path: Path) -> None:
+    async with httpx.AsyncClient() as http:
+        common = {"tmp_path": tmp_path, "http": http, "bin_path": tmp_path / "bin" / "x", "port": 8189}
+        common |= {
+            "model_file": tmp_path / "m.gguf",
+            "params": _gpu_params(),
+            "contention": Contention.STAY_UP,
+        }
+        with pytest.raises(StayUpConfigError, match=r"kill_below_gib, .*server_oom_score_adj"):
+            _manager(**common, resident_allowance_gib=20)
+        with pytest.raises(StayUpConfigError, match="resident_allowance_gib"):
+            _manager(**common, guards=_STAY_UP_GUARDS)
+
+
+async def test_stay_up_ignores_ordinary_requests_and_yields_to_a_quiet_card(tmp_path: Path) -> None:
+    bin_path = _make_fake_server(tmp_path, min_health_attempts=1)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    lease_dir = tmp_path / "lease"
+    lease = GpuLease(lease_dir, project="localmodels-test")
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8189,
+            model_file=model_file,
+            params=_gpu_params(),
+            lease=lease,
+            contention=Contention.STAY_UP,
+            guards=_STAY_UP_GUARDS,
+            resident_allowance_gib=20,
+            available_gib=lambda _on_gpu: 100.0,
+        )
+        (lease_dir / "service_c.json").parent.mkdir(parents=True, exist_ok=True)
+        (lease_dir / "service_c.json").write_text(json.dumps({"pid": os.getpid(), "project": "service_c"}))
+        handle = await manager.start()  # another project holds the lease and it still starts
+        assert not lease.lease_path().exists()
+        assert _resident(lease_dir, "localmodels-test")["loaded"] is True
+
+        sup_task = asyncio.create_task(supervise(manager, handle, poll_s=0.05, stop=asyncio.Event()))
+        (lease_dir / "service_c.json").write_text(
+            json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": int(time.time())})
+        )
+        await asyncio.sleep(0.3)
+        assert not sup_task.done()  # an ordinary request is not a reason to unload
+
+        GpuLease(lease_dir, project="bench").write_quiet(
+            QuietRequest(pid=os.getpid(), project="bench", requested_at=int(time.time()), reason="benchmark")
+        )
+        assert await sup_task == SupervisorExit.YIELDED
+        assert _resident(lease_dir, "localmodels-test")["loaded"] is False  # still registered, not loaded
+
+
+async def test_stay_up_floor_kill_marks_the_resident_unloaded(tmp_path: Path) -> None:
+    bin_path = _make_fake_server(tmp_path, min_health_attempts=1)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    level = [100.0]
+
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path=tmp_path,
+            http=http,
+            bin_path=bin_path,
+            port=8188,
+            model_file=model_file,
+            params=_gpu_params(),
+            contention=Contention.STAY_UP,
+            guards=_STAY_UP_GUARDS,
+            resident_allowance_gib=20,
+            available_gib=lambda _on_gpu: level[0],
+        )
+        await manager.start()
+        assert _resident(tmp_path / "lease", "localmodels-test")["loaded"] is True
+        level[0] = 3.0
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if not _resident(tmp_path / "lease", "localmodels-test")["loaded"]:
+                break
+        assert _resident(tmp_path / "lease", "localmodels-test")["loaded"] is False
+        assert manager.killed_reason is not None

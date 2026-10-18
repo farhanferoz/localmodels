@@ -4,6 +4,9 @@ One ``LocalServerManager`` owns one ``(spec, params, lease)`` server instance. `
 lets a caller choose service_a's policy (``REFUSE``: never start while another project holds
 the GPU) or service_c's (``WAIT``: queue for it, as ``run_gpu_queue.sh`` does) without either
 project's launcher code living here — this package exposes the choice, not a default project.
+``STAY_UP`` is the opt-in third policy: the server stays loaded beside other work, registered in the lease
+directory's ``resident/`` folder instead of holding the lease, and unloads when memory runs short or a quiet
+card asks for the machine to itself (``lease.QuietCard``).
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from .hardware import available_memory, network_filesystem
-from .lease import GpuLease, GpuLeaseClient, LeaseRecord
+from .lease import GpuLease, GpuLeaseClient, LeaseRecord, ResidentRecord
 from .process import (
     LocalModelsError,
     ServerHandle,
@@ -53,7 +56,9 @@ __all__ = [
     "ReservedPortError",
     "ServerStartError",
     "StartupYieldedError",
+    "StayUpConfigError",
     "SupervisorExit",
+    "stay_up_problem",
     "supervise",
 ]
 
@@ -74,6 +79,7 @@ class Contention(StrEnum):
 
     REFUSE = "refuse"
     WAIT = "wait"
+    STAY_UP = "stay_up"
 
 
 class MemoryGuards(BaseModel):
@@ -97,6 +103,22 @@ class MemoryGuards(BaseModel):
     watch_poll_s: float = Field(default=5.0, gt=0)
 
 
+def stay_up_problem(guards: MemoryGuards, resident_allowance_gib: float | None) -> str | None:
+    """Why ``Contention.STAY_UP`` cannot be used with these settings, in plain words; None when it can."""
+    wanted = {
+        "MemoryGuards.kill_below_gib": guards.kill_below_gib,
+        "MemoryGuards.server_oom_score_adj": guards.server_oom_score_adj,
+        "resident_allowance_gib": resident_allowance_gib,
+    }
+    missing = [name for name, value in wanted.items() if value is None]
+    if not missing:
+        return None
+    return (
+        f"stay-up mode needs {', '.join(missing)}: it keeps a model loaded beside other work, so the kernel "
+        "must pick its server first and the watchdog must free the memory when it runs short"
+    )
+
+
 def _available_gib(on_gpu: bool) -> float | None:
     """Available memory in GiB for a GPU or CPU server (``available_memory``); None when unreadable."""
     reading = available_memory("cuda" if on_gpu else "cpu")
@@ -109,6 +131,10 @@ class SupervisorExit(StrEnum):
     STOPPED = "stopped"
     SERVER_EXITED = "server_exited"
     YIELDED = "yielded"
+
+
+class StayUpConfigError(LocalModelsError):
+    """Raised when ``Contention.STAY_UP`` is asked for without the guards that make it safe."""
 
 
 class ReservedPortError(LocalModelsError):
@@ -215,8 +241,14 @@ class LocalServerManager:
         wait_timeout_s: float | None = None,
         min_slot_tokens: int = 0,
         guards: MemoryGuards | None = None,
+        resident_allowance_gib: float | None = None,
         available_gib: Callable[[bool], float | None] = _available_gib,
     ) -> None:
+        self.guards = guards or MemoryGuards()
+        if contention is Contention.STAY_UP and (
+            problem := stay_up_problem(self.guards, resident_allowance_gib)
+        ):
+            raise StayUpConfigError(problem)
         self.spec = spec
         self.params = params
         self.lease = lease
@@ -232,12 +264,46 @@ class LocalServerManager:
         self.wait_poll_s = wait_poll_s
         self.wait_timeout_s = wait_timeout_s
         self.min_slot_tokens = min_slot_tokens
-        self.guards = guards or MemoryGuards()
+        self.resident_allowance_gib = resident_allowance_gib
         self._available_gib = available_gib
         self._watchdog: asyncio.Task[None] | None = None
         self._ready = False
         #: Why the watchdog killed the last server it started, in plain words; None if it did not.
         self.killed_reason: str | None = None
+
+    def _set_loaded(self, *, loaded: bool) -> None:
+        """Stay-up only: publish whether this manager's server is loaded, in the ``resident/`` record."""
+        if self.contention is Contention.STAY_UP:
+            assert self.resident_allowance_gib is not None  # noqa: S101 - narrowing for mypy; the constructor checked
+            self.lease.write_resident(
+                ResidentRecord(
+                    pid=os.getpid(),
+                    project=self.lease.project,
+                    port=self.spec.port,
+                    model_path=str(self.spec.model_path),
+                    allowance_gib=self.resident_allowance_gib,
+                    loaded=loaded,
+                    started_at=int(time.time()),
+                )
+            )
+
+    def release(self) -> None:
+        """Give up what this manager published: its lease, or in stay-up mode its loaded flag."""
+        if self.contention is Contention.STAY_UP:
+            self._set_loaded(loaded=False)
+        else:
+            self.lease.remove()
+
+    def yield_requested_by(self) -> str | None:
+        """The project this server should step aside for now, if any.
+
+        Stay-up mode yields to a live quiet request only; otherwise a GPU server yields to another project's
+        lease request (a server with no GPU layers holds nothing the other project's GPU work needs).
+        """
+        if self.contention is Contention.STAY_UP:
+            quiet = self.lease.quiet_requests()
+            return quiet[0].project if quiet else None
+        return self.lease.requested_by_other() if self.params.n_gpu_layers != 0 else None
 
     def _pidfile(self) -> Path:
         return self.pid_dir / f"{self.spec.port}.pid"
@@ -261,7 +327,8 @@ class LocalServerManager:
             host=fingerprint(),
         )
 
-    def _free_gib(self) -> float | None:
+    def free_gib(self) -> float | None:
+        """Available memory in GiB for this server's device; None when unreadable."""
         return self._available_gib(self.params.n_gpu_layers != 0)
 
     async def _projected_gib(self) -> float:
@@ -301,7 +368,7 @@ class LocalServerManager:
         if reserve is None:
             return
         need = await self._projected_gib() + reserve
-        free = self._free_gib()
+        free = self.free_gib()
         if free is None:
             msg = "available memory cannot be read, so the model's fit cannot be checked; not loading it"
             raise ServerStartError(msg)
@@ -315,7 +382,7 @@ class LocalServerManager:
     async def _check_left_over(self) -> None:
         """After the load: stop the server if it left less than the host reserve available."""
         reserve = self.guards.host_reserve_gib
-        free = self._free_gib()
+        free = self.free_gib()
         if reserve is None or free is None or free >= reserve:
             return
         await self.stop()
@@ -328,7 +395,7 @@ class LocalServerManager:
         """SIGKILL the server's process group the moment available memory falls below ``floor``."""
         while _is_pid_alive(pid):
             await asyncio.sleep(self.guards.watch_poll_s if self._ready else self.guards.load_poll_s)
-            free = self._free_gib()
+            free = self.free_gib()
             if free is not None and free < floor:
                 self.killed_reason = (
                     f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
@@ -339,6 +406,7 @@ class LocalServerManager:
                 except OSError:
                     with contextlib.suppress(OSError):
                         os.kill(pid, signal.SIGKILL)
+                self._set_loaded(loaded=False)
                 return
 
     def _cancel_watchdog(self) -> None:
@@ -416,9 +484,7 @@ class LocalServerManager:
             )
         )
 
-    async def _poll_ready(
-        self, proc: asyncio.subprocess.Process, log_path: Path, lease_written: bool
-    ) -> None:
+    async def _poll_ready(self, proc: asyncio.subprocess.Process, log_path: Path) -> None:
         deadline = time.time() + self.ready_timeout_s
         while time.time() < deadline:
             if proc.returncode is not None:
@@ -429,12 +495,10 @@ class LocalServerManager:
                 msg = f"llama-server exited prematurely with code {proc.returncode}; see {log_path}"
                 raise ServerStartError(msg)
 
-            if lease_written:
-                other = self.lease.requested_by_other()
-                if other:
-                    await self.stop()
-                    msg = f"GPU lease requested by {other}; yielding"
-                    raise StartupYieldedError(msg)
+            if other := self.yield_requested_by():
+                await self.stop()
+                msg = f"GPU lease requested by {other}; yielding"
+                raise StartupYieldedError(msg)
 
             with contextlib.suppress(httpx.HTTPError, OSError):
                 resp = await self._http.get(f"http://{self.spec.host}:{self.spec.port}/health", timeout=1.0)
@@ -482,6 +546,25 @@ class LocalServerManager:
             msg = f"server n_ctx {n_ctx} is smaller than required min_slot_tokens {self.min_slot_tokens}"
             raise ServerStartError(msg)
 
+    def _publish_adopted(self) -> None:
+        """An adopted server is loaded: say so in the stay-up record, or hold the lease if it uses the GPU."""
+        if self.contention is Contention.STAY_UP:
+            self._set_loaded(loaded=True)
+        elif self.params.n_gpu_layers != 0:
+            self._write_lease()
+
+    def _begin_stay_up(self) -> None:
+        """Publish ``loaded`` for a stay-up start, then yield at once if a quiet card is already waiting.
+
+        Publishing first and looking second: a card writes its request and then looks at the residents, so one
+        of the two sees the other and they cannot both go ahead.
+        """
+        self._set_loaded(loaded=True)
+        if other := self.yield_requested_by():
+            self._set_loaded(loaded=False)
+            msg = f"GPU lease requested by {other}; yielding"
+            raise StartupYieldedError(msg)
+
     async def start(self) -> ServerHandle:
         """Start this instance's llama-server process, or adopt an identical existing one."""
         if self.spec.port in self.reserved_ports:
@@ -494,8 +577,7 @@ class LocalServerManager:
 
         adopted = await self._try_adopt(pidfile)
         if adopted is not None:
-            if self.params.n_gpu_layers != 0:
-                self._write_lease()
+            self._publish_adopted()
             return adopted
 
         self._check_port_free()
@@ -512,11 +594,11 @@ class LocalServerManager:
             args = ["sh", "-c", _OOM_WRAPPER.format(score=self.guards.server_oom_score_adj), *args]
         await self._check_fits()
 
-        is_gpu = self.params.n_gpu_layers != 0
-        lease_written = False
-        if is_gpu:
+        publishes = self.contention is Contention.STAY_UP or self.params.n_gpu_layers != 0
+        if self.contention is Contention.STAY_UP:
+            self._begin_stay_up()
+        elif publishes:
             await self._acquire_lease()
-            lease_written = True
 
         log_path = self.pid_dir / f"{self.spec.port}.log"
         try:
@@ -533,14 +615,14 @@ class LocalServerManager:
             self._ready, self.killed_reason = False, None
             if self.guards.kill_below_gib is not None:
                 self._watchdog = asyncio.create_task(self._watch_memory(proc.pid, self.guards.kill_below_gib))
-            await self._poll_ready(proc, log_path, lease_written)
+            await self._poll_ready(proc, log_path)
             await self._verify_props()
             await self._check_left_over()
             self._ready = True
         except Exception:
             self._cancel_watchdog()
-            if lease_written:
-                self.lease.remove()
+            if publishes:
+                self.release()
             raise
 
         return ServerHandle(pid=proc.pid, port=self.spec.port, model_path=self.spec.model_path)
@@ -586,7 +668,7 @@ class LocalServerManager:
 
         if not _is_pid_alive(pid):
             _unlink_pid(pidfile)
-            self.lease.remove()
+            self.release()
             return False
 
         args = _process_args(pid)
@@ -597,7 +679,7 @@ class LocalServerManager:
             return False
 
         _unlink_pid(pidfile)
-        self.lease.remove()
+        self.release()
         return True
 
     async def status(self) -> ServerStatus:
@@ -643,9 +725,7 @@ async def supervise(
             if not _is_pid_alive(handle.pid):
                 return SupervisorExit.SERVER_EXITED
 
-            # A server with no GPU layers holds nothing another project's GPU work needs.
-            requested = manager.params.n_gpu_layers != 0 and manager.lease.requested_by_other()
-            if requested:
+            if manager.yield_requested_by():
                 stopped = await manager.stop()
                 if not stopped and _is_pid_alive(handle.pid):
                     msg = f"failed to stop server on port {manager.spec.port}"
@@ -659,4 +739,4 @@ async def supervise(
         return SupervisorExit.STOPPED
     finally:
         if not _is_pid_alive(handle.pid):
-            manager.lease.remove()
+            manager.release()

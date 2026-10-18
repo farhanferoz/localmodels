@@ -9,6 +9,7 @@ import pytest
 
 from localmodels.enums import DeviceTier, DeviceType, Precision
 from localmodels.hardware import HardwareReport
+from localmodels.lease import GpuLease, QuietCard
 from localmodels.serving import (
     InferMessage,
     LoadMessage,
@@ -131,3 +132,15 @@ def test_a_record_made_on_another_stack_warns_once_and_still_gives_its_choice(
     assert "cuda" not in message
     save_record(path, record.model_copy(update={"stack": None}))
     assert warnings_for({**stack, "driver": "590.2"}) == []
+
+
+def test_the_quiet_card_is_withdrawn_when_the_tune_fails(tmp_path: Path) -> None:
+    card = QuietCard(GpuLease(tmp_path, project="tuner"), reason="tune", timeout_s=1, poll_s=0.02)
+    request = tmp_path / "quiet" / "tuner.json"
+    with pytest.raises(TuneError, match="Reference candidate bad failed"):
+        run_tune(
+            argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=INPUTS, candidates=[BROKEN, FAST],
+            quality=text_agreement(0.9), quality_name="text 0.9", headroom_gib=0.0, hardware=CPU,
+            quiet_card=card,
+        )  # fmt: skip
+    assert not request.exists()
