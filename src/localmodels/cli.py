@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING
 from pydantic import TypeAdapter
 
 from .catalogue import ModelSpec
+from .digest import register as register_digest
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
+from .rules import register as register_rules
 from .service import _cmd_serve
 from .setup import (
     DEFAULT_MODELS_DIR,
@@ -262,9 +264,8 @@ def build_parser() -> argparse.ArgumentParser:
     _build_setup_parser(subparsers)
     _build_serve_parser(subparsers)
     _build_lease_parser(subparsers)
-    from . import rules  # noqa: PLC0415 - loaded only when the CLI runs
-
-    rules.register(subparsers)
+    register_digest(subparsers)
+    register_rules(subparsers)
     return parser
 
 

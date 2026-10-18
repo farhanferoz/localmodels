@@ -12,15 +12,15 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from .digest import DEFAULT_OUT_DIR as DEFAULT_DIGEST_DIR
+from .digest import LINE_RE
 from .enums import WorkloadKind
 
 if TYPE_CHECKING:
     import argparse
 
 RULES_FILE: Final = "rules.md"
-DEFAULT_DIGEST_DIR: Final = Path.home() / "cache" / "localmodels" / "digests"
 _SECTION = re.compile(r"^## (K\d+)\b", re.MULTILINE)
-_DIGEST_LINE = re.compile(r"^- \[([^\]]+)\] ")
 _DIGEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
 
@@ -51,8 +51,8 @@ def digest_lines(kind: WorkloadKind, digests_dir: Path = DEFAULT_DIGEST_DIR) -> 
     newest = notes[-1]
     lines = []
     for line in newest.read_text(encoding="utf-8").splitlines():
-        match = _DIGEST_LINE.match(line)
-        if match and kind.value in {k.strip() for k in match.group(1).split(",")}:
+        match = LINE_RE.match(line)
+        if match and kind.value in match.group("kinds").split(","):
             lines.append(line)
     return newest.stem, lines
 

@@ -123,6 +123,17 @@ caller that cannot import this package (e.g. a bash queue) can still speak the p
 `begin-wait`, `wait` takes its turn in request order (`GpuLeaseClient`); without a waiting lease of
 its own it waits for every other live lease, as before.
 
+## Monthly digest
+
+`localmodels digest run [--out DIR]` checks the 13 sources that can change a serving or training rule (llama.cpp
+commits and discussions, PyTorch and its libraries, vLLM/SGLang/TRT-LLM, NVIDIA's Spark pages, the NVIDIA forum,
+playbooks, Spark Arena, new models, and this host's driver, kernel and DGX OS) with fixed local checks and no
+language model. It writes `DIR/<date>.md` (default `DIR` is `~/cache/localmodels/digests`), the raw findings in
+`DIR/.raw/<date>.json`, and `DIR/.state.json` (what the next run compares with). A finding line reads
+`- [K1,K2] D1 llama.cpp: <finding> (<link>)`, tagged with the workload kinds the source touches. A source whose
+check fails is listed under "Failed sources" and never stops the run; the exit code is 1 only if every source failed.
+`deploy/localmodels-digest.timer` runs it on the 1st of each month at 07:00 (install steps in the `.service` file).
+
 ## Development
 
 ```
