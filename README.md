@@ -52,6 +52,16 @@ different accelerator; only a model server's own process imports PyTorch.
 - `localmodels.pinned` — Hugging Face snapshots pinned to a commit with every file's SHA-256
   (`PinnedModel`, `PinnedFile`), fetched once (`fetch_snapshot`), hashed when pinned
   (`hash_snapshot`) and checked before use (`verify_files`); weights then load offline.
+- `localmodels.pull.resolve_model_file(spec)` — one model file, pinned to `spec.revision`, served from the shared
+  Hugging Face cache (`HF_HUB_CACHE`, default `~/.cache/huggingface/hub`): one copy per repository and revision for every
+  project, never a copy on a network share. A download is hashed in full against `spec.sha256`; a cached file is checked
+  by its blob's name, so a server start never re-reads gigabytes. `pull_model` (a copy in a models folder) is unchanged.
+- `localmodels.stack` — what a result was made with, read without starting CUDA: `fingerprint()` (NVIDIA driver, CUDA
+  version the driver reports, kernel, DGX OS, localmodels version) and `llama_cpp_build(binary)` (the commit llama.cpp
+  embeds in `libllama-common.so`, read without running it). `LocalServerManager.stamp()` and `ModelHost.stamp()` return
+  a `ServerStamp` (engine, build, model file and hash, layout or load options, host) to store with each result. A tune
+  record carries the stack it was measured on, and `load_choice` warns when the driver, CUDA, kernel or DGX OS changed
+  since (the choice still applies).
 - `localmodels.atomic` — writes a reader never sees half-done: a file (`write_text_atomically`) or a
   whole directory (`replace_dir_atomically`).
 - `localmodels.process` / `localmodels.launcher` — resolves the `llama-server` binary, builds its
@@ -60,6 +70,21 @@ different accelerator; only a model server's own process imports PyTorch.
   `MemoryGuards` (all off unless passed) adds a kill floor on available memory, a host reserve checked
   against `llama-fit-params`' projection before the load and the memory left after it, and the server's
   `oom_score_adj`.
+- Layouts by role (opt-in): `derive_serving_params(device, total_mem_gb, role=ServingRole.INTERACTIVE)` (or `BULK`)
+  lays `llama-server` out as one shared pool (`-kvu`) with 4 (interactive) or 16 (bulk) slots and a fixed context
+  (`n_ctx_cap`, default 32,768), never derived from free memory (`localmodels rules show K1`, `K2`). Without a role
+  the parameters, and so the argv, are exactly as before. Under the shared pool `min_slot_tokens` is checked as
+  `n_ctx >= n_parallel * min_slot_tokens` before the start, since llama.cpp then reports the whole pool per slot.
+- Stay-up mode (opt-in, default off): `Contention.STAY_UP` for a `LocalServerManager` (and `localmodels serve`), or
+  `ModelHost(stay_up=StayUp(floor_gib, allowance_gib, oom_score_adj))` for a PyTorch model, keeps a model loaded while
+  another project or slurm holds the GPU, instead of stepping aside. It never takes the lease; it registers in the
+  lease directory's `resident/` folder (one file per service), which readers of the top-level lease files never open.
+  It unloads when available memory falls below its floor (the kill floor and the OOM score are required) and when a
+  quiet card is held, and loads again once memory is back to floor plus allowance and no card remains.
+  `lease.QuietCard` is that card: a measurement (`run_tune(quiet_card=...)`, `run_bench(quiet_card=...)`) writes a
+  request in `quiet/` and waits until every resident has unloaded. Records left by a dead process, or written before
+  the last boot, are ignored and deleted. `localmodels lease status` lists residents and quiet cards when there are
+  any.
 - `localmodels.catalogue` / `localmodels.pull` — the shared shape of a model catalogue entry
   (`ModelSpec`), a `LicencePolicy` gate a caller applies to its own catalogue, and download/status
   helpers over the Hugging Face Hub. Catalogue *entries* are each caller's own data; this package
@@ -92,6 +117,9 @@ localmodels setup [--role chat] [--models-dir DIR] [--catalogue FILE] [--yes]
                    [--llama-server-bin PATH] [--device OVERRIDE]
 localmodels serve --config <toml>
 localmodels lease {status,acquire,wait,begin-wait,admitted,release} --project NAME ...
+localmodels rules {show KIND,check}
+localmodels llama {build --commit SHA,list,switch COMMIT,prune}
+localmodels digest run
 ```
 
 `localmodels setup` inspects the host, picks the largest OSI-licensed catalogue model for the
@@ -122,6 +150,19 @@ is `~/.local/state/gpu-lease` unless `GPU_LEASE_DIR` says otherwise), so a
 caller that cannot import this package (e.g. a bash queue) can still speak the protocol. After
 `begin-wait`, `wait` takes its turn in request order (`GpuLeaseClient`); without a waiting lease of
 its own it waits for every other live lease, as before.
+
+## Rules and llama.cpp builds
+
+`localmodels rules show K2` prints the measured rule for one kind of workload (K1 interactive text generation to K10
+fine-tuning; `src/localmodels/rules.md`): the rule, its evidence, the stack it was measured on (a `stamp:` line) and
+a benchmark recipe, then the newest digest lines for that kind. `localmodels rules check` compares every stamp with
+this host and the current llama.cpp build and exits 1 when a stamped component changed, naming the rules to re-measure.
+
+`localmodels llama build --commit SHA` compiles one llama.cpp commit on the CPU into `~/cache/llama.cpp/builds/<commit>`
+(`LOCALMODELS_LLAMA_HOME` moves it), with the CMake options of the build in `~/dev/llama.cpp/build`. `llama list` shows
+the builds, which is `current` and which projects name each (`builds/users.toml`); `llama switch COMMIT` moves `current`
+only when that build's `comparison.json` (from the K1-K3 recipes against the current build) records a pass; `llama
+prune` deletes builds that are neither current nor named.
 
 ## Monthly digest
 
