@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from localmodels import stack
 from localmodels.cli import main
 from localmodels.enums import WorkloadKind
 from localmodels.rules import rules_text
@@ -37,3 +38,30 @@ def test_every_kind_has_a_section_and_an_unknown_kind_is_refused(capsys: pytest.
         main(["rules", "show", "K11"])
     assert exc.value.code != 0
     assert "K10" in capsys.readouterr().err
+
+
+STAMPED = """\
+## K1 interactive text generation
+- stamp: llama_cpp=ccc3646 driver=580.1 cuda=13.0 kernel=6.17 dgx_os=7.6.0 date=2026-10-18
+## K5 vision-language
+- stamp: torch=2.10.0 driver=580.1 cuda=13.0 kernel=6.17 dgx_os=7.6.0 date=2026-10-18
+"""
+HOST = {"driver": "580.1", "cuda": "13.0", "kernel": "6.17", "dgx_os": "7.6.0", "localmodels": "0.6.0"}
+
+
+def test_check_exits_1_only_when_a_stamped_component_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rules = tmp_path / "rules.md"
+    rules.write_text(STAMPED, encoding="utf-8")
+    host, build = dict(HOST), ["ccc3646"]
+    monkeypatch.setattr(stack, "fingerprint", lambda: host)
+    monkeypatch.setattr(stack, "llama_cpp_build", lambda _binary: build[0])
+    args = ["rules", "check", "--rules", str(rules), "--home", str(tmp_path)]
+    assert main(args) == 0
+    out = capsys.readouterr().out
+    assert "No stamp differs." in out
+    assert "torch stamps (K5): not checked here" in out
+    host["driver"], build[0] = "590.2", "abc1234"
+    assert main(args) == 1
+    assert "K1: llama_cpp: ccc3646 -> abc1234, driver: 580.1 -> 590.2\n" in capsys.readouterr().out
