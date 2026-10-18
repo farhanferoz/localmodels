@@ -116,6 +116,25 @@ def test_resolve_model_file_refuses_unpinned_and_nameless(
         resolve_model_file(_SNAPSHOT_SPEC.model_copy(update={"revision": _PINNED}), cache_dir=tmp_path)
 
 
+def test_resolve_model_file_serves_a_cached_file_without_fetching_and_checks_it_by_blob_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("localmodels.pull.fetch_snapshot", lambda *_a, **_k: pytest.fail("fetched"))
+    digest = hashlib.sha256(b"weights").hexdigest()
+    spec = _GGUF_SPEC.model_copy(update={"revision": _PINNED, "sha256": digest})
+    blob = tmp_path / "models--x" / "blobs" / digest
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"not the weights: a name match is not re-hashed")
+    link = snapshot_dir(spec.repo_id, _PINNED, tmp_path) / spec.filename
+    link.parent.mkdir(parents=True)
+    link.symlink_to(blob)
+    assert resolve_model_file(spec, cache_dir=tmp_path) == link
+    link.unlink()
+    link.write_bytes(b"other bytes")  # not a blob named by the hash: hashed in full, and refused
+    with pytest.raises(LocalModelsError, match="does not match"):
+        resolve_model_file(spec, cache_dir=tmp_path)
+
+
 def test_model_status_finds_a_file_in_the_hub_cache(tmp_path: Path) -> None:
     spec = _GGUF_SPEC.model_copy(update={"revision": _PINNED})
     target = snapshot_dir(spec.repo_id, _PINNED, tmp_path / "hub") / "Qwen3-30B-A3B-Q4_K_M.gguf"

@@ -117,10 +117,12 @@ def pull_model(spec: ModelSpec, *, models_dir: Path, filename: str | None = None
 
 
 def resolve_model_file(spec: ModelSpec, *, cache_dir: Path | None = None, token: str | None = None) -> Path:
-    """Fetch ``spec.filename`` at ``spec.revision`` into the Hub cache, verify it, and return its path.
+    """Return the path of ``spec.filename`` at ``spec.revision`` in the Hub cache, fetching it only if absent.
 
-    ``cache_dir`` defaults to ``HF_HUB_CACHE``, else ``~/.cache/huggingface/hub``. The file is checked
-    against ``spec.sha256`` when one is recorded.
+    ``cache_dir`` defaults to ``HF_HUB_CACHE``, else ``~/.cache/huggingface/hub``. A file already in the
+    cache is served with no network call. When ``spec.sha256`` is recorded, a fresh download is hashed in
+    full; a cached file is checked by its blob's name, which the Hub cache sets to a large (LFS) file's
+    SHA-256, and hashed in full only when the name differs, so a server start never re-reads gigabytes.
     """
     if not spec.filename:
         msg = f"{spec.alias}: no filename to resolve; only single-file entries come from the cache"
@@ -129,9 +131,17 @@ def resolve_model_file(spec: ModelSpec, *, cache_dir: Path | None = None, token:
         msg = f"{spec.alias}: no pinned revision; an unpinned model is not served"
         raise ModelFileError(msg)
     cache_dir = cache_dir or _default_hub_cache()
-    root = fetch_snapshot(spec.repo_id, spec.revision, cache_dir, patterns=[spec.filename], token=token)
+    root = snapshot_dir(spec.repo_id, spec.revision, cache_dir)
+    fetched = not (root / spec.filename).is_file()
+    if fetched:
+        root = fetch_snapshot(spec.repo_id, spec.revision, cache_dir, patterns=[spec.filename], token=token)
     path = root / spec.filename
-    if spec.sha256 and verify_files(root, [PinnedFile(path=spec.filename, sha256=spec.sha256)]):
+    checked_by_name = not fetched and path.resolve().name == spec.sha256
+    if (
+        spec.sha256
+        and not checked_by_name
+        and verify_files(root, [PinnedFile(path=spec.filename, sha256=spec.sha256)])
+    ):
         actual = sha256_file(path) if path.is_file() else "missing"
         msg = f"{spec.filename}: sha256 {actual} does not match the expected {spec.sha256}"
         raise ModelFileError(msg)
