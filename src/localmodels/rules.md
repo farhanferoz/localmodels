@@ -24,12 +24,13 @@ For every kind:
   defaults, mmap load, no speculative decoding by default.
 - Rule K1.layout (`ServingRole.INTERACTIVE`): shared pool (`-kvu`), 4 slots, a fixed context cap (32,768 unless the
   project sets one), `-ub` 512.
-- Evidence: Qwen3-30B-A3B writes 92.3-92.8 tokens/s for one request (MH), about 63 % of a ~146 tokens/s memory
-  bandwidth ceiling (E); vLLM with NVFP4 wrote 73 tokens/s and took 223-257 s to start against 18 s (MH).
+- Evidence: Qwen3-30B-A3B writes 90.4 tokens/s for one request in `llama-bench` on llama.cpp 5aeac37a3 (MH; 92.3-92.8
+  through a server on ccc3646, a different tool, while the 4B's one-request speed moved -1.1 % between the two builds,
+  within run-to-run spread, MH), about 62 % of a ~146 tokens/s memory bandwidth ceiling (E); vLLM with NVFP4 wrote 73 tokens/s and took 223-257 s to start against 18 s (MH).
 - Quality check after a change: greedy outputs on a fixed prompt set (text agreement at least 0.9) and
   `llama-perplexity --kl-divergence` against the previous build or format.
 - Stale when: the llama.cpp build, the driver or the model changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
+- stamp: llama_cpp=5aeac37a3 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `llama-bench -m <Qwen3.5-4B Q4_K_M> -p 512,2048 -n 128 -fa 1 -r 3 -o json` through
   `localmodels.bench.run_bench`, and llama-benchy against a K1-layout server at depth 0, 4096 and 8192 (prompt 2048,
   output 128, one request, 3 runs). Production tier: the same on Qwen3-30B-A3B.
@@ -45,10 +46,13 @@ For every kind:
   first token after 1.7 s instead of 12.1 s, same memory, on short prompts (a few hundred tokens in, 128 out) (MH).
   vLLM: a further +77 % at 16 at once, 0.79x for one request, 35 GiB held at memory fraction 0.30, greedy output not
   repeated across restarts (0 of 48 prompts identical) (MH). The slot layout itself changes greedy output (33 of 48
-  identical between the two llama.cpp layouts, MH): record it with results.
+  identical between the two llama.cpp layouts, MH): record it with results. The server figures are from ccc3646; on
+  5aeac37a3, Qwen3-30B-A3B in `llama-batched-bench` (256 in, 128 out) decodes 89 / 186 / 393 tokens/s at 1 / 4 / 16
+  at once, so 16 write 2.1x what 4 do (MH), and the two builds' batched decoding matched within noise (4B, 16 at once:
+  382 against 382-391 tokens/s, MH).
 - Quality check after a change: the project's own quality metric on its real data.
 - Stale when: llama.cpp or vLLM is upgraded, or the driver changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
+- stamp: llama_cpp=5aeac37a3 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 5 GPU-minutes): `llama-batched-bench -m <Qwen3.5-4B Q4_K_M> -fa 1 -npp 512 -ntg 32 -npl 1,4,16`,
   and llama-benchy at 1, 4 and 16 requests at once against a K2-layout server.
 
@@ -56,10 +60,14 @@ For every kind:
 
 - Rule K3.engine: llama.cpp or llama-cpp-python only, at a fixed slot layout; `logits_all=True` only where scoring,
   one handle per model, float32 batched log-softmax (gpu-job-settings section 3c).
-- Evidence: log-probabilities bit-identical across a restart at a fixed layout; vLLM's were not repeatable (MH).
+- Evidence: log-probabilities bit-identical across a restart at a fixed layout (ccc3646, through a server); on
+  5aeac37a3 a `llama-perplexity` repeat against its own saved base matched within the base file's 16-bit storage (KL
+  divergence within +/-5e-5, same top token 100 %, perplexity ratio 1.000000), as ccc3646 did against itself (MH);
+  vLLM's were not repeatable (MH). Scores differ across builds (5aeac37a3 against ccc3646: mean KL divergence 0.012,
+  same top token 98.7 %, MH), so scores compared across an upgrade are re-scored on one build.
 - Quality check after a change: KL divergence and same-top-token rate against the previous build.
 - Stale when: the llama.cpp build changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
+- stamp: llama_cpp=5aeac37a3 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `llama-perplexity` on one text file pinned by SHA-256, with `--kl-divergence-base`
   saved from the previous build; the pass threshold comes from two repeat runs.
 
