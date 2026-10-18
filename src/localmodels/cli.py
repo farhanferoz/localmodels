@@ -256,12 +256,15 @@ def _build_serve_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the `localmodels` argparse parser: `setup`, `serve`, `lease ...`."""
+    """Build the `localmodels` argparse parser: `setup`, `serve`, `lease ...`, `rules ...`."""
     parser = argparse.ArgumentParser(prog="localmodels")
     subparsers = parser.add_subparsers(dest="command")
     _build_setup_parser(subparsers)
     _build_serve_parser(subparsers)
     _build_lease_parser(subparsers)
+    from . import rules  # noqa: PLC0415 - loaded only when the CLI runs
+
+    rules.register(subparsers)
     return parser
 
 
