@@ -29,7 +29,7 @@ For every kind:
 - Quality check after a change: greedy outputs on a fixed prompt set (text agreement at least 0.9) and
   `llama-perplexity --kl-divergence` against the previous build or format.
 - Stale when: the llama.cpp build, the driver or the model changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `llama-bench -m <Qwen3.5-4B Q4_K_M> -p 512,2048 -n 128 -fa 1 -r 3 -o json` through
   `localmodels.bench.run_bench`, and llama-benchy against a K1-layout server at depth 0, 4096 and 8192 (prompt 2048,
   output 128, one request, 3 runs). Production tier: the same on Qwen3-30B-A3B.
@@ -48,7 +48,7 @@ For every kind:
   identical between the two llama.cpp layouts, MH): record it with results.
 - Quality check after a change: the project's own quality metric on its real data.
 - Stale when: llama.cpp or vLLM is upgraded, or the driver changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 5 GPU-minutes): `llama-batched-bench -m <Qwen3.5-4B Q4_K_M> -fa 1 -npp 512 -ntg 32 -npl 1,4,16`,
   and llama-benchy at 1, 4 and 16 requests at once against a K2-layout server.
 
@@ -59,7 +59,7 @@ For every kind:
 - Evidence: log-probabilities bit-identical across a restart at a fixed layout; vLLM's were not repeatable (MH).
 - Quality check after a change: KL divergence and same-top-token rate against the previous build.
 - Stale when: the llama.cpp build changes.
-- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: llama_cpp=ccc3646 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `llama-perplexity` on one text file pinned by SHA-256, with `--kl-divergence-base`
   saved from the previous build; the pass threshold comes from two repeat runs.
 
@@ -80,7 +80,7 @@ For every kind:
   compiled decoding (57-62 ms per token against a 31 ms floor, E), prompt reading (13.8-14.0 s for 15,388 tokens, MH).
 - Quality check after a change: text agreement with the reference precision's output.
 - Stale when: PyTorch, transformers or the driver changes, or the model revision changes.
-- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 6 GPU-minutes): `service_b tune --model medgemma-1-5-4b --study=<one small study>` through slurm.
 
 ## K6 image, 3D and text encoders, classifiers
@@ -91,7 +91,7 @@ For every kind:
   between runs on identical inputs (MH).
 - Quality check after a change: score agreement (Spearman at least 0.99, largest difference at most 0.05).
 - Stale when: PyTorch or the driver changes, or the model revision changes.
-- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `service_b tune --model <entry> --study=<one small study>` through slurm.
 
 ## K7 speech (text-to-speech, recognition, audio scoring)
@@ -109,7 +109,7 @@ For every kind:
 - Evidence: gpu-job-settings (MH).
 - Quality check after a change: loss after 200 steps against fp32, same seed.
 - Stale when: PyTorch or the driver changes.
-- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 4 GPU-minutes): `launch_bound_bench.py` and `crossover_sweep.py` from
   /home/user1/dev/workspace-sync/dgx/scripts/bench at batch 128 and 2048, fp32 with TF32 against bf16, compile off
   and on.
@@ -121,7 +121,7 @@ For every kind:
 - Evidence: gpu-job-settings and PERFORMANCE_TUNING.md (MH).
 - Quality check after a change: the validation metric against fp32.
 - Stale when: PyTorch or the driver changes.
-- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.2.3 date=2026-10-18
+- stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18
 - Recipe (about 5 GPU-minutes): `compile_at_scale.py` from the same folder, and a small MLP head on 10,000 cached
   1,024-dimensional features at batch 256 to 4,096.
 
