@@ -61,3 +61,18 @@ class PreflightVerdict(StrEnum):
     READY = "ready"
     DEGRADED = "degraded"
     LOCAL_MODELS_INFEASIBLE = "local_models_infeasible"
+
+
+class WorkloadKind(StrEnum):
+    """The kinds of model work the measured rules are organised by (``localmodels rules show``)."""
+
+    K1 = "K1"  # interactive text generation
+    K2 = "K2"  # bulk text generation
+    K3 = "K3"  # text scoring (per-token log-probabilities)
+    K4 = "K4"  # embeddings and reranking
+    K5 = "K5"  # vision-language
+    K6 = "K6"  # image, 3D and text encoders, classifiers
+    K7 = "K7"  # speech
+    K8 = "K8"  # training, small models from scratch
+    K9 = "K9"  # training, larger models and heads on frozen encoders
+    K10 = "K10"  # fine-tuning
