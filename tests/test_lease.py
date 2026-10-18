@@ -336,13 +336,22 @@ def test_stay_up_records_are_invisible_to_a_reader_of_the_top_level_files(tmp_pa
     assert [q.project for q in reader.quiet_requests()] == ["service_a"]
 
 
-def test_quiet_card_waits_for_loaded_residents_and_gives_up_on_a_stuck_one(tmp_path: Path) -> None:
+def test_quiet_card_waits_for_loaded_residents_and_gives_up_on_a_stuck_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     lease = GpuLease(tmp_path, project="bench")
     GpuLease(tmp_path, project="crashed").write_resident(_resident("crashed", pid=99999999))  # dead, loaded
     GpuLease(tmp_path, project="gone").write_quiet(
         QuietRequest(pid=99999999, project="gone", requested_at=1, reason="holder died")
     )
-    assert lease.quiet_requests() == []  # a dead holder's request is purged, so it cannot block residents
+    before_boot = GpuLease(tmp_path, project="rebooted").write_quiet(
+        QuietRequest(pid=os.getpid(), project="rebooted", requested_at=1, reason="host crashed")
+    )
+    os.utime(before_boot, (1, 1))
+    monkeypatch.setattr("localmodels.lease._boot_time", lambda: 1000.0)
+    # A dead holder's request is purged, and so is one written before this boot (its pid may now name another
+    # process), so neither can block residents.
+    assert lease.quiet_requests() == []
     sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
     try:
         stuck = GpuLease(tmp_path, project="stuck")
@@ -353,7 +362,7 @@ def test_quiet_card_waits_for_loaded_residents_and_gives_up_on_a_stuck_one(tmp_p
         ):
             pass
         assert "crashed" not in str(caught.value)  # a resident whose process died counts as gone
-        assert not (tmp_path / "quiet" / "bench.json").exists()
+        assert list((tmp_path / "quiet").glob("bench-*.json")) == []
 
         threading.Timer(
             0.2, lambda: stuck.write_resident(_resident("stuck", pid=sub.pid, loaded=False))
@@ -369,3 +378,19 @@ def test_quiet_card_waits_for_loaded_residents_and_gives_up_on_a_stuck_one(tmp_p
         sub.kill()
         sub.wait()
     assert lease.quiet_requests() == []
+
+
+def test_two_services_or_cards_of_one_project_keep_their_own_records(tmp_path: Path) -> None:
+    service_a = GpuLease(tmp_path, project="service_a")
+    service_a.write_resident(_resident("service_a").model_copy(update={"port": 8091}))
+    service_a.write_resident(_resident("service_a", loaded=False).model_copy(update={"port": 8092}))
+    service_a.remove_resident(8092)  # the embed service ends; chat's record stays
+    assert [(r.port, r.loaded) for r in service_a.residents()] == [(8091, True)]
+
+    service_a.remove_resident(8091)
+    bench = GpuLease(tmp_path, project="bench")
+    with QuietCard(bench, reason="outer", timeout_s=0.1, poll_s=0.01):
+        with QuietCard(bench, reason="inner", timeout_s=0.1, poll_s=0.01):
+            assert sorted(q.reason for q in bench.quiet_requests()) == ["inner", "outer"]
+        assert [q.reason for q in bench.quiet_requests()] == ["outer"]  # the inner card withdrew only its own
+    assert bench.quiet_requests() == []

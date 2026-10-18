@@ -10,6 +10,7 @@ module only owns the "build a fresh manager and go again after a YIELD" loop.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import time
@@ -23,6 +24,7 @@ from localmodels.launcher import (
     Contention,
     LeaseConflictError,
     MemoryGuards,
+    NotEnoughMemoryError,
     StartupYieldedError,
     SupervisorExit,
 )
@@ -355,8 +357,7 @@ def test_stay_up_restarts_only_when_memory_and_the_quiet_cards_allow(tmp_path: P
         resident_allowance_gib=20, **stay_up,
     )  # fmt: skip
     state = {"free": 25.0}  # below the floor plus the allowance (30 GiB)
-    quiet = tmp_path / "quiet" / "bench.json"
-    GpuLease(tmp_path, project="bench").write_quiet(
+    quiet = GpuLease(tmp_path, project="bench").write_quiet(
         QuietRequest(pid=os.getpid(), project="bench", requested_at=1, reason="benchmark")
     )
     starts: list[tuple[float, bool]] = []
@@ -399,3 +400,37 @@ def test_stay_up_restarts_only_when_memory_and_the_quiet_cards_allow(tmp_path: P
 
     assert asyncio.run(main()) is SupervisorExit.STOPPED
     assert starts == [(25.0, True), (40.0, False)]
+
+
+def test_stay_up_refused_for_memory_waits_and_retries_instead_of_exiting(tmp_path: Path) -> None:
+    guards = MemoryGuards(kill_below_gib=10, server_oom_score_adj=500, host_reserve_gib=8)
+    config = ServeConfig(
+        port=8091, model_path=Path("/m.gguf"), project="svc", lease_dir=tmp_path, poll_s=0.05,
+        contention=Contention.STAY_UP, guards=guards, resident_allowance_gib=20,
+    )  # fmt: skip
+    starts: list[float] = []
+
+    class RefusedTwiceThenFits(_FakeManager):
+        killed_reason: str | None = None
+
+        async def start(self) -> ServerHandle:
+            starts.append(time.monotonic())
+            if len(starts) < 3:  # floor + allowance (30 GiB) is there, the fit check's 25 + 8 GiB is not
+                raise NotEnoughMemoryError("m.gguf needs 33.0 GiB but 31.0 GiB is available; not loading it")
+            return await super().start()
+
+        def free_gib(self) -> float:
+            return 31.0
+
+    async def fake_supervise(_manager, _handle, *, poll_s, stop):
+        return SupervisorExit.STOPPED
+
+    serve = run_serve(
+        config,
+        manager_factory=lambda _c, _h: RefusedTwiceThenFits(_fake_handle()),
+        supervise_fn=fake_supervise,
+        stop=asyncio.Event(),
+    )
+    assert asyncio.run(asyncio.wait_for(serve, timeout=5)) is SupervisorExit.STOPPED
+    assert len(starts) == 3
+    assert min(b - a for a, b in itertools.pairwise(starts)) >= config.poll_s  # paced, never a tight loop

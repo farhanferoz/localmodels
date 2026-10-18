@@ -43,16 +43,14 @@ def _acquire(host: ModelHost, *, give_up_after_waits: int = 0) -> bool:
 
 
 def _resident_loaded(tmp_path: Path) -> bool | None:
-    path = tmp_path / "resident" / "service_b.json"
+    path = tmp_path / "resident" / "service_b-0.json"
     return json.loads(path.read_text())["loaded"] if path.exists() else None
 
 
-def _quiet_card(tmp_path: Path) -> GpuLease:
-    card = GpuLease(tmp_path, project="bench")
-    card.write_quiet(
+def _quiet_card(tmp_path: Path) -> Path:
+    return GpuLease(tmp_path, project="bench").write_quiet(
         QuietRequest(pid=os.getpid(), project="bench", requested_at=int(time.time()), reason="t")
     )
-    return card
 
 
 def test_without_stay_up_the_host_takes_the_lease_and_yields_to_an_ordinary_request(tmp_path: Path) -> None:
@@ -93,14 +91,14 @@ def test_a_quiet_card_and_a_low_memory_floor_each_unload_the_host(tmp_path: Path
     host = _host(tmp_path, lambda: memory[0])
     card = _quiet_card(tmp_path)
     assert _acquire(host, give_up_after_waits=1) is False  # the card is up: not loaded, and not loading
-    card.remove_quiet()
+    GpuLease.remove_quiet(card)
     assert _acquire(host)
     server = host.server(ECHO, ECHO_ARGV, ECHO_ENV, LOAD, lambda: False)
     card = _quiet_card(tmp_path)
     assert host.yield_if_requested() == "bench"
     assert (server.alive, host.holding, _resident_loaded(tmp_path)) == (False, False, False)
 
-    card.remove_quiet()
+    GpuLease.remove_quiet(card)
     assert _acquire(host)
     server = host.server(ECHO, ECHO_ARGV, ECHO_ENV, LOAD, lambda: False)
     memory[0] = 9.0
@@ -122,20 +120,19 @@ def test_a_stay_up_host_loads_again_only_when_no_quiet_card_remains_and_memory_h
     assert (host.holding, _resident_loaded(tmp_path)) == (False, None)
 
     # A card that arrives after the host published is seen by the look that follows, and the host backs off.
-    card.remove_quiet()
-    reads = [0]
+    GpuLease.remove_quiet(card)
+    late_cards: list[Path] = []
 
     def _free_then_a_card_arrives() -> float:
-        reads[0] += 1
-        if reads[0] == 1:
-            _quiet_card(tmp_path)
+        if not late_cards:
+            late_cards.append(_quiet_card(tmp_path))
         return 30.0
 
     host = _host(tmp_path, _free_then_a_card_arrives)
     assert _acquire(host) is False
     assert (host.holding, _resident_loaded(tmp_path)) == (False, False)
 
-    card.remove_quiet()
+    GpuLease.remove_quiet(late_cards[0])
     assert _acquire(host)
     assert (host.holding, _resident_loaded(tmp_path)) == (True, True)
     host.unload()

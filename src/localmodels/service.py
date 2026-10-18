@@ -33,6 +33,7 @@ from .launcher import (
     LeaseConflictError,
     LocalServerManager,
     MemoryGuards,
+    NotEnoughMemoryError,
     ServerStartError,
     StartupYieldedError,
     SupervisorExit,
@@ -128,12 +129,17 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     )
 
 
+async def _stopped_within(stop: asyncio.Event, seconds: float) -> bool:
+    """Wait up to ``seconds`` for ``stop``; whether it was set."""
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+    return stop.is_set()
+
+
 async def _wait_for_other_leases(lease: GpuLease, *, poll_s: float, stop: asyncio.Event) -> bool:
     """Poll until no other live lease remains; False if `stop` was set while waiting."""
     while lease.live_others():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=poll_s)
-        if stop.is_set():
+        if await _stopped_within(stop, poll_s):
             return False
     return True
 
@@ -149,17 +155,24 @@ async def _wait_for_room(
         free = manager.free_gib()
         if not lease.quiet_requests() and free is not None and free >= needed:
             return True
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=config.poll_s)
-        if stop.is_set():
+        if await _stopped_within(stop, config.poll_s):
             return False
 
 
 async def _wait_to_restart(
-    manager: LocalServerManager, config: ServeConfig, lease: GpuLease, *, stop: asyncio.Event
+    manager: LocalServerManager,
+    config: ServeConfig,
+    lease: GpuLease,
+    *,
+    stop: asyncio.Event,
+    refused_for_memory: bool = False,
 ) -> bool:
     """Wait for the condition that lets the server start again; False if `stop` was set while waiting."""
     if config.contention is Contention.STAY_UP:
+        # The fit check can refuse with floor + allowance available (it adds the host reserve to the
+        # projection): pause one poll first, so a refusal is retried at that pace, never in a tight loop.
+        if refused_for_memory and await _stopped_within(stop, config.poll_s):
+            return False
         return await _wait_for_room(manager, config, lease, stop=stop)
     return await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop)
 
@@ -167,10 +180,13 @@ async def _wait_to_restart(
 def _waits_before_restart(
     failure: ServerStartError | LeaseConflictError, manager: LocalServerManager, *, stay_up: bool
 ) -> bool:
-    """A yielded start, or a stay-up server killed below its floor, waits and restarts; the rest raise."""
+    """A yielded start, or a stay-up server killed below its floor or refused for memory, waits and restarts.
+
+    The rest raise.
+    """
     if isinstance(failure, StartupYieldedError | LeaseConflictError):
         return True
-    return stay_up and manager.killed_reason is not None
+    return stay_up and (isinstance(failure, NotEnoughMemoryError) or manager.killed_reason is not None)
 
 
 def _restarts_after(exit_reason: SupervisorExit, manager: LocalServerManager, *, stay_up: bool) -> bool:
@@ -214,7 +230,10 @@ async def run_serve(
                     raise
                 if stop_event.is_set():
                     return SupervisorExit.YIELDED
-                if not await _wait_to_restart(manager, config, lease, stop=stop_event):
+                refused = isinstance(exc, NotEnoughMemoryError)
+                if not await _wait_to_restart(
+                    manager, config, lease, stop=stop_event, refused_for_memory=refused
+                ):
                     return SupervisorExit.YIELDED
                 continue
             exit_reason = await supervise_fn(manager, handle, poll_s=config.poll_s, stop=stop_event)
@@ -224,7 +243,7 @@ async def run_serve(
                 return exit_reason
     finally:
         if stay_up:
-            lease.remove_resident()
+            lease.remove_resident(config.port)
         if owns_http:
             await owned_http.aclose()
 

@@ -8,6 +8,8 @@ which writes and reads it through inline ``python3 -c`` rather than importing th
 
 Stay-up mode (``Contention.STAY_UP``) keeps its records in two subfolders, ``resident/`` and ``quiet/``, which
 every reader of the top-level ``*.json`` files (this module's, service_c's, service_a's) never opens.
+One file per service (``resident/<project>-<port>.json``) and per quiet card
+(``quiet/<project>-<pid>-<token>.json``), so two of one project never overwrite each other's record.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -135,11 +138,38 @@ def _check_record_file[R: BaseModel](path: Path, model: type[R]) -> R | None:
         return None
 
 
+def _boot_time() -> float | None:
+    """When this boot began (``btime`` in /proc/stat); None where there is no such file."""
+    try:
+        lines = Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    return next((float(line.split()[1]) for line in lines if line.startswith("btime ")), None)
+
+
+def _written_before_boot(path: Path, booted_at: float | None) -> bool:
+    """Whether ``path`` was last written before this boot (then deleted: its pid may name another process).
+
+    Stay-up records are rewritten on every change, so an older one is always stale; slurm's lease keeper does
+    the same for the top-level leases at its start.
+    """
+    try:
+        stale = booted_at is not None and path.stat().st_mtime < booted_at
+    except OSError:
+        return False
+    if stale:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+    return stale
+
+
 def _live_records[R: BaseModel](directory: Path, model: type[R]) -> list[R]:
-    """The ``model`` records in ``directory`` whose holder is alive; a dead holder's file is purged."""
+    """The ``model`` records in ``directory`` whose holder is alive; a dead or pre-boot record is purged."""
     if not directory.exists():
         return []
-    records = (_check_record_file(path, model) for path in directory.glob("*.json"))
+    booted_at = _boot_time()
+    paths = [path for path in directory.glob("*.json") if not _written_before_boot(path, booted_at)]
+    records = (_check_record_file(path, model) for path in paths)
     return [record for record in records if record is not None]
 
 
@@ -194,28 +224,30 @@ class GpuLease:
 
         return live
 
-    def _stay_up_path(self, subdir: str) -> Path:
-        return self.directory / subdir / f"{self.project}.json"
+    def _resident_path(self, port: int) -> Path:
+        return self.directory / _RESIDENT_SUBDIR / f"{self.project}-{port}.json"
 
     def write_resident(self, record: ResidentRecord) -> Path:
-        """Write this project's ``resident/`` record atomically."""
-        return write_text_atomically(self._stay_up_path(_RESIDENT_SUBDIR), json.dumps(record.model_dump()))
+        """Write the ``resident/`` record of this project's service on ``record.port`` atomically."""
+        return write_text_atomically(self._resident_path(record.port), json.dumps(record.model_dump()))
 
-    def remove_resident(self) -> None:
-        """Remove this project's ``resident/`` record if present."""
-        self._stay_up_path(_RESIDENT_SUBDIR).unlink(missing_ok=True)
+    def remove_resident(self, port: int) -> None:
+        """Remove the ``resident/`` record of this project's service on ``port`` if present."""
+        self._resident_path(port).unlink(missing_ok=True)
 
     def residents(self) -> list[ResidentRecord]:
         """Every stay-up service registered by a live process, this project's own included."""
         return _live_records(self.directory / _RESIDENT_SUBDIR, ResidentRecord)
 
     def write_quiet(self, request: QuietRequest) -> Path:
-        """Write this project's ``quiet/`` request atomically."""
-        return write_text_atomically(self._stay_up_path(_QUIET_SUBDIR), json.dumps(request.model_dump()))
+        """Write a new ``quiet/`` request atomically, in a file of its own; its path withdraws it."""
+        name = f"{self.project}-{request.pid}-{secrets.token_hex(4)}.json"
+        return write_text_atomically(self.directory / _QUIET_SUBDIR / name, json.dumps(request.model_dump()))
 
-    def remove_quiet(self) -> None:
-        """Remove this project's ``quiet/`` request if present."""
-        self._stay_up_path(_QUIET_SUBDIR).unlink(missing_ok=True)
+    @staticmethod
+    def remove_quiet(path: Path) -> None:
+        """Withdraw the quiet request at ``path`` (as ``write_quiet`` returned it) if present."""
+        path.unlink(missing_ok=True)
 
     def quiet_requests(self) -> list[QuietRequest]:
         """Every quiet request whose holder is alive: a holder that died stops blocking the residents."""
@@ -366,6 +398,8 @@ class QuietCard:
     residents stay unloaded until none remains.
     """
 
+    _path: Path
+
     def __init__(
         self,
         lease: GpuLease,
@@ -393,14 +427,14 @@ class QuietCard:
         request = QuietRequest(
             pid=os.getpid(), project=self.lease.project, requested_at=int(time.time()), reason=self.reason
         )
-        self.lease.write_quiet(request)
+        self._path = self.lease.write_quiet(request)
         try:
             self._wait_for_residents()
         except BaseException:
-            self.lease.remove_quiet()
+            self.lease.remove_quiet(self._path)
             raise
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        """Withdraw the request, whether or not the measurement raised."""
-        self.lease.remove_quiet()
+        """Withdraw this card's request (only its own: a card nested in another keeps the outer one's)."""
+        self.lease.remove_quiet(self._path)

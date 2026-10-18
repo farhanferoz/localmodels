@@ -52,6 +52,7 @@ __all__ = [
     "LeaseWaitTimeoutError",
     "LocalServerManager",
     "MemoryGuards",
+    "NotEnoughMemoryError",
     "PortHeldError",
     "ReservedPortError",
     "ServerStartError",
@@ -155,6 +156,13 @@ class LeaseWaitTimeoutError(LocalModelsError):
 
 class ServerStartError(LocalModelsError):
     """Raised when the server process fails to start, become healthy, or match its spec."""
+
+
+class NotEnoughMemoryError(ServerStartError):
+    """Raised when available memory is too low to load the model, or too low once it has loaded.
+
+    A stay-up service waits and tries again (``service.run_serve``); any other caller sees a failed start.
+    """
 
 
 class StartupYieldedError(ServerStartError):
@@ -270,11 +278,13 @@ class LocalServerManager:
         self._ready = False
         #: Why the watchdog killed the last server it started, in plain words; None if it did not.
         self.killed_reason: str | None = None
+        self._registered_at: int | None = None  # stay-up: when the resident record was first written
 
     def _set_loaded(self, *, loaded: bool) -> None:
         """Stay-up only: publish whether this manager's server is loaded, in the ``resident/`` record."""
         if self.contention is Contention.STAY_UP:
             assert self.resident_allowance_gib is not None  # noqa: S101 - narrowing for mypy; the constructor checked
+            self._registered_at = self._registered_at or int(time.time())
             self.lease.write_resident(
                 ResidentRecord(
                     pid=os.getpid(),
@@ -283,7 +293,7 @@ class LocalServerManager:
                     model_path=str(self.spec.model_path),
                     allowance_gib=self.resident_allowance_gib,
                     loaded=loaded,
-                    started_at=int(time.time()),
+                    started_at=self._registered_at,
                 )
             )
 
@@ -377,7 +387,7 @@ class LocalServerManager:
                 f"{self.spec.model_path.name} needs {need:.1f} GiB (llama.cpp's projection plus a "
                 f"{reserve:g} GiB host reserve) but {free:.1f} GiB is available; not loading it"
             )
-            raise ServerStartError(msg)
+            raise NotEnoughMemoryError(msg)
 
     async def _check_left_over(self) -> None:
         """After the load: stop the server if it left less than the host reserve available."""
@@ -389,7 +399,7 @@ class LocalServerManager:
         msg = (
             f"the loaded server left {free:.1f} GiB available, under the {reserve:g} GiB reserve; stopped it"
         )
-        raise ServerStartError(msg)
+        raise NotEnoughMemoryError(msg)
 
     async def _watch_memory(self, pid: int, floor: float) -> None:
         """SIGKILL the server's process group the moment available memory falls below ``floor``."""
@@ -546,10 +556,16 @@ class LocalServerManager:
             msg = f"server n_ctx {n_ctx} is smaller than required min_slot_tokens {self.min_slot_tokens}"
             raise ServerStartError(msg)
 
-    def _publish_adopted(self) -> None:
-        """An adopted server is loaded: say so in the stay-up record, or hold the lease if it uses the GPU."""
+    def _publish_adopted(self, pid: int) -> None:
+        """An adopted server is loaded: say so in the stay-up record, or hold the lease if it uses the GPU.
+
+        A stay-up server is watched against its floor as if this manager had started it.
+        """
         if self.contention is Contention.STAY_UP:
             self._set_loaded(loaded=True)
+            assert self.guards.kill_below_gib is not None  # noqa: S101 - narrowing for mypy; the constructor checked
+            self._ready, self.killed_reason = True, None
+            self._watchdog = asyncio.create_task(self._watch_memory(pid, self.guards.kill_below_gib))
         elif self.params.n_gpu_layers != 0:
             self._write_lease()
 
@@ -577,7 +593,7 @@ class LocalServerManager:
 
         adopted = await self._try_adopt(pidfile)
         if adopted is not None:
-            self._publish_adopted()
+            self._publish_adopted(adopted.pid)
             return adopted
 
         self._check_port_free()

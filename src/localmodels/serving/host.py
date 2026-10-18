@@ -84,6 +84,7 @@ class ModelHost:
         self._stay_up = stay_up
         self._available_gib = available_gib
         self._model_path: str | None = None
+        self._registered_at: int | None = None  # stay-up: when the resident record was first written
         self._server: ModelServerProcess | None = None
         self._load: LoadMessage | None = None
         self._holding = False
@@ -166,6 +167,7 @@ class ModelHost:
         self._model_path = model_path or self._model_path
         if self._model_path is None:
             return
+        self._registered_at = self._registered_at or int(time.time())
         self.lease.lease.write_resident(
             ResidentRecord(
                 pid=os.getpid(),
@@ -174,7 +176,7 @@ class ModelHost:
                 model_path=self._model_path,
                 allowance_gib=self._stay_up.allowance_gib,
                 loaded=loaded,
-                started_at=int(time.time()),
+                started_at=self._registered_at,
             )
         )
 

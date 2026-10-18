@@ -700,7 +700,8 @@ _STAY_UP_GUARDS = MemoryGuards(kill_below_gib=10, server_oom_score_adj=500, watc
 
 
 def _resident(lease_dir: Path, project: str) -> dict[str, object]:
-    return json.loads((lease_dir / "resident" / f"{project}.json").read_text())
+    (path,) = (lease_dir / "resident").glob(f"{project}-*.json")
+    return json.loads(path.read_text())
 
 
 async def test_stay_up_is_refused_without_its_guards(tmp_path: Path) -> None:
@@ -759,25 +760,23 @@ async def test_stay_up_ignores_ordinary_requests_and_yields_to_a_quiet_card(tmp_
 
 
 async def test_stay_up_floor_kill_marks_the_resident_unloaded(tmp_path: Path) -> None:
+    """Also for a server adopted from a serve process that is gone: it is watched as if started here."""
     bin_path = _make_fake_server(tmp_path, min_health_attempts=1)
     model_file = tmp_path / "test.gguf"
     model_file.touch()
     level = [100.0]
 
     async with httpx.AsyncClient() as http:
-        manager = _manager(
-            tmp_path=tmp_path,
-            http=http,
-            bin_path=bin_path,
-            port=8188,
-            model_file=model_file,
-            params=_gpu_params(),
-            contention=Contention.STAY_UP,
-            guards=_STAY_UP_GUARDS,
-            resident_allowance_gib=20,
-            available_gib=lambda _on_gpu: level[0],
-        )
-        await manager.start()
+        common = {
+            "tmp_path": tmp_path, "http": http, "bin_path": bin_path, "port": 8188, "model_file": model_file,
+            "params": _gpu_params(), "contention": Contention.STAY_UP, "guards": _STAY_UP_GUARDS,
+            "resident_allowance_gib": 20, "available_gib": lambda _on_gpu: level[0],
+        }  # fmt: skip
+        first = _manager(**common)
+        handle = await first.start()
+        first._cancel_watchdog()  # the serve process that started it is gone; its server is not
+        manager = _manager(**common)
+        assert (await manager.start()).pid == handle.pid  # adopted
         assert _resident(tmp_path / "lease", "localmodels-test")["loaded"] is True
         level[0] = 3.0
         for _ in range(100):
