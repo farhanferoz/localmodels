@@ -9,6 +9,10 @@ builds a fresh `LocalServerManager` and calls `start()`.
 
 `manager_factory`/`supervise_fn` are injectable (construction by injection, this package's own
 rule) so the restart loop is testable without a real llama-server subprocess or GPU.
+
+Under ``Contention.STAY_UP`` the server stays up beside other projects' leases, so a yield (to a quiet card)
+or a floor kill is followed by a different wait: until no quiet request remains and available memory is at
+least the kill floor plus the service's allowance.
 """
 
 from __future__ import annotations
@@ -21,15 +25,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .hardware import inspect_hardware
 from .launcher import (
     Contention,
     LeaseConflictError,
     LocalServerManager,
+    MemoryGuards,
+    ServerStartError,
     StartupYieldedError,
     SupervisorExit,
+    stay_up_problem,
     supervise,
 )
 from .lease import DEFAULT_LEASE_DIR, GpuLease
@@ -74,6 +81,17 @@ class ServeConfig(BaseModel):
     extra_flags: tuple[str, ...] = ()
     extra_env: dict[str, str] | None = None
     api_key_file: Path | None = None
+    guards: MemoryGuards = Field(default_factory=MemoryGuards)
+    #: Memory a stay-up service holds all the time; required with ``Contention.STAY_UP``.
+    resident_allowance_gib: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _stay_up_needs_its_guards(self) -> ServeConfig:
+        if self.contention is Contention.STAY_UP and (
+            problem := stay_up_problem(self.guards, self.resident_allowance_gib)
+        ):
+            raise ValueError(problem)
+        return self
 
 
 def load_serve_config(path: Path) -> ServeConfig:
@@ -105,6 +123,8 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
         binary=binary,
         extra_flags=config.extra_flags,
         extra_env=config.extra_env,
+        guards=config.guards,
+        resident_allowance_gib=config.resident_allowance_gib,
     )
 
 
@@ -116,6 +136,47 @@ async def _wait_for_other_leases(lease: GpuLease, *, poll_s: float, stop: asynci
         if stop.is_set():
             return False
     return True
+
+
+async def _wait_for_room(
+    manager: LocalServerManager, config: ServeConfig, lease: GpuLease, *, stop: asyncio.Event
+) -> bool:
+    """Poll until no quiet request remains and memory is floor + allowance; False if `stop` is set."""
+    assert config.guards.kill_below_gib is not None  # noqa: S101 - narrowing for mypy; the config checked
+    assert config.resident_allowance_gib is not None  # noqa: S101 - narrowing for mypy; the config checked
+    needed = config.guards.kill_below_gib + config.resident_allowance_gib
+    while True:
+        free = manager.free_gib()
+        if not lease.quiet_requests() and free is not None and free >= needed:
+            return True
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=config.poll_s)
+        if stop.is_set():
+            return False
+
+
+async def _wait_to_restart(
+    manager: LocalServerManager, config: ServeConfig, lease: GpuLease, *, stop: asyncio.Event
+) -> bool:
+    """Wait for the condition that lets the server start again; False if `stop` was set while waiting."""
+    if config.contention is Contention.STAY_UP:
+        return await _wait_for_room(manager, config, lease, stop=stop)
+    return await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop)
+
+
+def _waits_before_restart(
+    failure: ServerStartError | LeaseConflictError, manager: LocalServerManager, *, stay_up: bool
+) -> bool:
+    """A yielded start, or a stay-up server killed below its floor, waits and restarts; the rest raise."""
+    if isinstance(failure, StartupYieldedError | LeaseConflictError):
+        return True
+    return stay_up and manager.killed_reason is not None
+
+
+def _restarts_after(exit_reason: SupervisorExit, manager: LocalServerManager, *, stay_up: bool) -> bool:
+    """A yield or a stay-up floor kill is followed by a wait and a restart; other exits end the service."""
+    floor_kill = stay_up and exit_reason is SupervisorExit.SERVER_EXITED and manager.killed_reason is not None
+    return exit_reason is SupervisorExit.YIELDED or floor_kill
 
 
 async def run_serve(
@@ -131,11 +192,13 @@ async def run_serve(
     Returns the final, non-YIELDED `SupervisorExit` (`STOPPED` or `SERVER_EXITED`) -- a YIELD
     is never returned to the caller except when `stop` was set by the time it happened or while
     waiting for the other project's lease to clear, so a caller asking this to stop is honoured
-    even mid-yield rather than silently restarting once more.
+    even mid-yield rather than silently restarting once more. Under `Contention.STAY_UP` a floor kill
+    restarts the same way, and the `resident/` record is removed when the service ends.
     """
     stop_event = stop if stop is not None else asyncio.Event()
     lease = GpuLease(config.lease_dir, project=config.project)
     factory = manager_factory or _build_manager
+    stay_up = config.contention is Contention.STAY_UP
     owns_http = http is None
     owned_http = http or httpx.AsyncClient()
     try:
@@ -143,21 +206,25 @@ async def run_serve(
             manager = factory(config, owned_http)
             try:
                 handle: ServerHandle = await manager.start()
-            except (StartupYieldedError, LeaseConflictError):
+            except (StartupYieldedError, LeaseConflictError, ServerStartError) as exc:
                 # Another project holds or asked for the GPU as this start ran: a service waits
                 # for its lease to clear rather than exiting into a restart loop (G12 C-1, D47).
                 # `Contention.REFUSE` still governs a one-shot start, which never reaches here.
+                if not _waits_before_restart(exc, manager, stay_up=stay_up):
+                    raise
                 if stop_event.is_set():
                     return SupervisorExit.YIELDED
-                if not await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop_event):
+                if not await _wait_to_restart(manager, config, lease, stop=stop_event):
                     return SupervisorExit.YIELDED
                 continue
             exit_reason = await supervise_fn(manager, handle, poll_s=config.poll_s, stop=stop_event)
-            if exit_reason is not SupervisorExit.YIELDED or stop_event.is_set():
+            if not _restarts_after(exit_reason, manager, stay_up=stay_up) or stop_event.is_set():
                 return exit_reason
-            if not await _wait_for_other_leases(lease, poll_s=config.poll_s, stop=stop_event):
+            if not await _wait_to_restart(manager, config, lease, stop=stop_event):
                 return exit_reason
     finally:
+        if stay_up:
+            lease.remove_resident()
         if owns_http:
             await owned_http.aclose()
 

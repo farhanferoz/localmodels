@@ -10,6 +10,7 @@ it through the scheduler like any other GPU job.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import json
 import logging
@@ -33,6 +34,8 @@ from localmodels.version import package_version
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
+
+    from localmodels.lease import QuietCard
 
 GIB: Final = 1024**3
 
@@ -247,46 +250,53 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     repeats: int = 1,
     cancel_check: Callable[[], bool] = lambda: False,
     hardware: HardwareReport | None = None,
+    quiet_card: QuietCard | None = None,
 ) -> TuneRecord:
     """Measure every candidate and choose the fastest that agrees with ``candidates[0]`` and fits in memory.
+
+    ``quiet_card``, when given, is held around the measurements so that stay-up services have unloaded
+    (``lease.QuietCard``); without it nothing changes.
 
     Raises:
         TuneError: the reference candidate failed, or no candidate is eligible.
         ServingCancelled: ``cancel_check()`` turned true.
+        QuietCardTimeoutError: ``quiet_card`` found a service still loaded after its timeout.
     """
     report = hardware or inspect_hardware()
     measurements: list[TuneMeasurement] = []
     reference_outputs: list[ResultMessage] = []
-    for position, candidate in enumerate(candidates):
-        free = available_memory(report.device.value)
-        try:
-            measurement, outputs = _measure(
-                candidate,
-                argv=argv,
-                env=env,
-                load=load,
-                inputs=inputs,
-                repeats=repeats,
-                cancel_check=cancel_check,
-            )
-        except ServingError as exc:
-            if position == 0:
-                msg = (
-                    f"Reference candidate {candidate.name} failed, so nothing can be compared: {exc.message}"
+    with quiet_card if quiet_card is not None else contextlib.nullcontext():
+        for position, candidate in enumerate(candidates):
+            free = available_memory(report.device.value)
+            try:
+                measurement, outputs = _measure(
+                    candidate,
+                    argv=argv,
+                    env=env,
+                    load=load,
+                    inputs=inputs,
+                    repeats=repeats,
+                    cancel_check=cancel_check,
                 )
-                raise TuneError(msg) from exc
-            measurements.append(TuneMeasurement(candidate=candidate, error=exc.message))
-            continue
-        assert measurement.peak_gib is not None  # noqa: S101 - narrowing for mypy
-        measurement.fits = free is None or measurement.peak_gib + headroom_gib <= free.bytes / GIB
-        if position == 0:
-            reference_outputs = outputs
-            measurement.agreement = Agreement(score=1.0, passed=True, detail="reference")
-        else:
-            measurement.agreement = quality(reference_outputs, outputs)
-        if free is None:
-            measurement.agreement.detail += " (free memory unknown, so it is taken to fit)"
-        measurements.append(measurement)
+            except ServingError as exc:
+                if position == 0:
+                    msg = (
+                        f"Reference candidate {candidate.name} failed, so nothing can be compared: "
+                        f"{exc.message}"
+                    )
+                    raise TuneError(msg) from exc
+                measurements.append(TuneMeasurement(candidate=candidate, error=exc.message))
+                continue
+            assert measurement.peak_gib is not None  # noqa: S101 - narrowing for mypy
+            measurement.fits = free is None or measurement.peak_gib + headroom_gib <= free.bytes / GIB
+            if position == 0:
+                reference_outputs = outputs
+                measurement.agreement = Agreement(score=1.0, passed=True, detail="reference")
+            else:
+                measurement.agreement = quality(reference_outputs, outputs)
+            if free is None:
+                measurement.agreement.detail += " (free memory unknown, so it is taken to fit)"
+            measurements.append(measurement)
     eligible = [
         m
         for m in measurements

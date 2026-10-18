@@ -5,6 +5,9 @@ The file format is the shared contract documented in service_c's
 one JSON file per project in a shared directory, written atomically (temp file, then rename),
 readable by any project that knows the contract — including service_c's ``run_gpu_queue.sh``,
 which writes and reads it through inline ``python3 -c`` rather than importing this package.
+
+Stay-up mode (``Contention.STAY_UP``) keeps its records in two subfolders, ``resident/`` and ``quiet/``, which
+every reader of the top-level ``*.json`` files (this module's, service_c's, service_a's) never opens.
 """
 
 from __future__ import annotations
@@ -14,11 +17,12 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .atomic import write_text_atomically
+from .process import LocalModelsError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +30,11 @@ if TYPE_CHECKING:
 #: The shared lease directory every project on a host uses unless told otherwise; ``GPU_LEASE_DIR``
 #: overrides it (slurm's tools on gpu-node-1 read the same variable).
 DEFAULT_LEASE_DIR = Path(os.environ.get("GPU_LEASE_DIR", "~/.local/state/gpu-lease")).expanduser()
+
+_RESIDENT_SUBDIR = "resident"
+_QUIET_SUBDIR = "quiet"
+_QUIET_TIMEOUT_S = 120.0
+_QUIET_POLL_S = 0.5
 
 
 class LeaseRecord(BaseModel):
@@ -46,6 +55,35 @@ class LeaseRecord(BaseModel):
     requested_at: int | None = None
     job_id: str | None = None
     lane: str | None = None
+
+
+class ResidentRecord(BaseModel):
+    """A stay-up service's ``resident/`` record: its memory allowance and whether its server is loaded."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pid: int
+    project: str
+    port: int
+    model_path: str
+    allowance_gib: float
+    loaded: bool
+    started_at: int
+
+
+class QuietRequest(BaseModel):
+    """A ``quiet/`` request that every stay-up service unload until it is withdrawn (a benchmark, a tune)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pid: int
+    project: str
+    requested_at: int
+    reason: str
+
+
+class QuietCardTimeoutError(LocalModelsError):
+    """Raised when residents are still loaded after a quiet card's timeout."""
 
 
 def _read_lease_data(path: Path) -> dict[str, object] | None:
@@ -81,8 +119,8 @@ def _holder_is_live(pid: object, path: Path) -> bool:
     return True
 
 
-def _check_other_lease_file(path: Path) -> LeaseRecord | None:
-    """Parse an external lease file and check whether its holder process is alive."""
+def _check_record_file[R: BaseModel](path: Path, model: type[R]) -> R | None:
+    """Parse a record file as ``model`` and check whether its holder process is alive."""
     data = _read_lease_data(path)
     if data is None or not _holder_is_live(data.get("pid"), path):
         return None
@@ -91,10 +129,18 @@ def _check_other_lease_file(path: Path) -> LeaseRecord | None:
         data["project"] = path.stem
 
     try:
-        return LeaseRecord(**data)
+        return model(**data)
     except ValidationError:
         # A field of the wrong type: unparsable, left in place (contract: "skip any file they cannot parse")
         return None
+
+
+def _live_records[R: BaseModel](directory: Path, model: type[R]) -> list[R]:
+    """The ``model`` records in ``directory`` whose holder is alive; a dead holder's file is purged."""
+    if not directory.exists():
+        return []
+    records = (_check_record_file(path, model) for path in directory.glob("*.json"))
+    return [record for record in records if record is not None]
 
 
 class GpuLease:
@@ -142,11 +188,38 @@ class GpuLease:
         for path in self.directory.glob("*.json"):
             if path.name == my_filename:
                 continue
-            record = _check_other_lease_file(path)
+            record = _check_record_file(path, LeaseRecord)
             if record is not None:
                 live.append(record)
 
         return live
+
+    def _stay_up_path(self, subdir: str) -> Path:
+        return self.directory / subdir / f"{self.project}.json"
+
+    def write_resident(self, record: ResidentRecord) -> Path:
+        """Write this project's ``resident/`` record atomically."""
+        return write_text_atomically(self._stay_up_path(_RESIDENT_SUBDIR), json.dumps(record.model_dump()))
+
+    def remove_resident(self) -> None:
+        """Remove this project's ``resident/`` record if present."""
+        self._stay_up_path(_RESIDENT_SUBDIR).unlink(missing_ok=True)
+
+    def residents(self) -> list[ResidentRecord]:
+        """Every stay-up service registered by a live process, this project's own included."""
+        return _live_records(self.directory / _RESIDENT_SUBDIR, ResidentRecord)
+
+    def write_quiet(self, request: QuietRequest) -> Path:
+        """Write this project's ``quiet/`` request atomically."""
+        return write_text_atomically(self._stay_up_path(_QUIET_SUBDIR), json.dumps(request.model_dump()))
+
+    def remove_quiet(self) -> None:
+        """Remove this project's ``quiet/`` request if present."""
+        self._stay_up_path(_QUIET_SUBDIR).unlink(missing_ok=True)
+
+    def quiet_requests(self) -> list[QuietRequest]:
+        """Every quiet request whose holder is alive: a holder that died stops blocking the residents."""
+        return _live_records(self.directory / _QUIET_SUBDIR, QuietRequest)
 
     def blockers(self, requested_at: int | None) -> tuple[list[LeaseRecord], bool]:
         """Other live leases this project must wait for, and whether any of them is itself only waiting.
@@ -283,3 +356,51 @@ class GpuLeaseClient:
         """Remove this project's lease and forget its request."""
         self._job_id = self._requested_at = self._admitted_at = None
         self.lease.remove()
+
+
+class QuietCard:
+    """While held, every stay-up service has unloaded its server, for a measurement they would disturb.
+
+    Entering writes the quiet request, then waits until each live resident shows ``loaded=false``; leaving
+    withdraws the request, also when the measurement raised. Other quiet cards do not block each other: the
+    residents stay unloaded until none remains.
+    """
+
+    def __init__(
+        self,
+        lease: GpuLease,
+        *,
+        reason: str,
+        timeout_s: float = _QUIET_TIMEOUT_S,
+        poll_s: float = _QUIET_POLL_S,
+    ) -> None:
+        self.lease = lease
+        self.reason = reason
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+
+    def _wait_for_residents(self) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        while loaded := [r for r in self.lease.residents() if r.loaded]:
+            if time.monotonic() >= deadline:
+                names = ", ".join(r.project for r in loaded)
+                msg = f"still loaded after {self.timeout_s:g}s, so not measuring: {names}"
+                raise QuietCardTimeoutError(msg)
+            time.sleep(self.poll_s)
+
+    def __enter__(self) -> Self:
+        """Ask the residents to unload and wait until they have."""
+        request = QuietRequest(
+            pid=os.getpid(), project=self.lease.project, requested_at=int(time.time()), reason=self.reason
+        )
+        self.lease.write_quiet(request)
+        try:
+            self._wait_for_residents()
+        except BaseException:
+            self.lease.remove_quiet()
+            raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Withdraw the request, whether or not the measurement raised."""
+        self.lease.remove_quiet()

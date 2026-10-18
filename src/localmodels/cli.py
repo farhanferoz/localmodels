@@ -52,7 +52,7 @@ def _lease_from_args(args: argparse.Namespace) -> GpuLease:
 
 
 def cmd_lease_status(args: argparse.Namespace) -> int:
-    """Report this project's own lease record plus every other live one."""
+    """Report this project's own lease record plus every other live one, then any stay-up records."""
     lease = _lease_from_args(args)
     mine = lease.read_own()
     others = lease.live_others()
@@ -61,6 +61,11 @@ def cmd_lease_status(args: argparse.Namespace) -> int:
         "mine": mine.model_dump(exclude_none=True) if mine else None,
         "others": [o.model_dump(exclude_none=True) for o in others],
     }
+    # Stay-up records only when there are some: the output of a host that does not use the mode is unchanged.
+    if residents := lease.residents():
+        report["residents"] = [r.model_dump() for r in residents]
+    if quiet := lease.quiet_requests():
+        report["quiet"] = [q.model_dump() for q in quiet]
     text = json.dumps(report, indent=2)
     if args.json_out:
         Path(args.json_out).write_text(text)

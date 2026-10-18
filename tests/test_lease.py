@@ -13,12 +13,21 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from localmodels.lease import GpuLease, GpuLeaseClient, LeaseRecord
+from localmodels.lease import (
+    GpuLease,
+    GpuLeaseClient,
+    LeaseRecord,
+    QuietCard,
+    QuietCardTimeoutError,
+    QuietRequest,
+    ResidentRecord,
+)
 
 
 def test_lease_write_atomic_and_remove(tmp_path: Path) -> None:
@@ -305,3 +314,58 @@ def test_gpu_lease_dir_overrides_the_default_lease_directory(tmp_path: Path) -> 
         [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
     )
     assert out.stdout.strip() == str(tmp_path)
+
+
+def _resident(project: str, *, pid: int | None = None, loaded: bool = True) -> ResidentRecord:
+    return ResidentRecord(
+        pid=pid or os.getpid(), project=project, port=8091, model_path="/m.gguf", allowance_gib=20,
+        loaded=loaded, started_at=1700000000,
+    )  # fmt: skip
+
+
+def test_stay_up_records_are_invisible_to_a_reader_of_the_top_level_files(tmp_path: Path) -> None:
+    service = GpuLease(tmp_path, project="service_a")
+    service.write_resident(_resident("service_a"))
+    service.write_quiet(QuietRequest(pid=os.getpid(), project="service_a", requested_at=1, reason="test"))
+
+    reader = GpuLease(tmp_path, project="service_c")
+    assert reader.live_others() == []
+    assert reader.requested_by_other() is None
+    assert list(tmp_path.glob("*.json")) == []  # what a top-level reader such as service_a's globs
+    assert [r.project for r in reader.residents()] == ["service_a"]
+    assert [q.project for q in reader.quiet_requests()] == ["service_a"]
+
+
+def test_quiet_card_waits_for_loaded_residents_and_gives_up_on_a_stuck_one(tmp_path: Path) -> None:
+    lease = GpuLease(tmp_path, project="bench")
+    GpuLease(tmp_path, project="crashed").write_resident(_resident("crashed", pid=99999999))  # dead, loaded
+    GpuLease(tmp_path, project="gone").write_quiet(
+        QuietRequest(pid=99999999, project="gone", requested_at=1, reason="holder died")
+    )
+    assert lease.quiet_requests() == []  # a dead holder's request is purged, so it cannot block residents
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        stuck = GpuLease(tmp_path, project="stuck")
+        stuck.write_resident(_resident("stuck", pid=sub.pid))
+        with (
+            pytest.raises(QuietCardTimeoutError, match="stuck") as caught,
+            QuietCard(lease, reason="t", timeout_s=0.2, poll_s=0.02),
+        ):
+            pass
+        assert "crashed" not in str(caught.value)  # a resident whose process died counts as gone
+        assert not (tmp_path / "quiet" / "bench.json").exists()
+
+        threading.Timer(
+            0.2, lambda: stuck.write_resident(_resident("stuck", pid=sub.pid, loaded=False))
+        ).start()
+        started = time.monotonic()
+        with (
+            QuietCard(lease, reason="t", timeout_s=5, poll_s=0.02),
+            QuietCard(GpuLease(tmp_path, project="tune"), reason="t", timeout_s=5, poll_s=0.02),
+        ):
+            assert 0.15 < time.monotonic() - started < 3  # waited for the unload
+            assert {q.project for q in lease.quiet_requests()} == {"bench", "tune"}  # two cards at once
+    finally:
+        sub.kill()
+        sub.wait()
+    assert lease.quiet_requests() == []
