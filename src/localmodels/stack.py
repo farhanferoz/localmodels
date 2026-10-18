@@ -62,6 +62,7 @@ class LlamaLayout(BaseModel):
 
     n_ctx: int
     n_parallel: int
+    kv_unified: bool = False
     extra_flags: tuple[str, ...] = ()
 
 

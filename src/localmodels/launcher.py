@@ -253,7 +253,10 @@ class LocalServerManager:
             model_path=str(self.spec.model_path),
             model_sha256=model_sha256,
             layout=LlamaLayout(
-                n_ctx=self.params.n_ctx, n_parallel=self.params.n_parallel, extra_flags=self.extra_flags
+                n_ctx=self.params.n_ctx,
+                n_parallel=self.params.n_parallel,
+                kv_unified=self.params.kv_unified,
+                extra_flags=self.extra_flags,
             ),
             host=fingerprint(),
         )
@@ -443,6 +446,16 @@ class LocalServerManager:
         msg = f"llama-server failed to become ready within {self.ready_timeout_s}s; see {log_path}"
         raise ServerStartError(msg)
 
+    def _check_slot_guarantee(self) -> None:
+        """Under ``-kvu`` /props reports the whole pool as every slot's context, so check the sizes here."""
+        need = self.params.n_parallel * self.min_slot_tokens
+        if self.params.kv_unified and self.min_slot_tokens > 0 and self.params.n_ctx < need:
+            msg = (
+                f"n_ctx {self.params.n_ctx} cannot give each of {self.params.n_parallel} slots "
+                f"min_slot_tokens {self.min_slot_tokens} (needs {need}); not starting the server"
+            )
+            raise ServerStartError(msg)
+
     async def _verify_props(self) -> None:
         if self.min_slot_tokens <= 0:
             return
@@ -474,6 +487,7 @@ class LocalServerManager:
         if self.spec.port in self.reserved_ports:
             msg = f"port {self.spec.port} is reserved; this manager never starts a server on it"
             raise ReservedPortError(msg)
+        self._check_slot_guarantee()
 
         _prepare_pid_dir(self.pid_dir)
         pidfile = self._pidfile()

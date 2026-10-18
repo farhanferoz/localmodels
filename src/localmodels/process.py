@@ -138,6 +138,7 @@ def build_args(
         str(params.n_ctx),
         "-np",
         str(params.n_parallel),
+        *(["-kvu"] if params.kv_unified else []),
         "--jinja",
         "--host",
         spec.host,

@@ -34,6 +34,13 @@ class QuantLevel(StrEnum):
     Q4_K_M = "Q4_K_M"
 
 
+class ServingRole(StrEnum):
+    """What a llama-server is laid out for (rules K1 and K2): one person waiting, or many requests."""
+
+    INTERACTIVE = "interactive"
+    BULK = "bulk"
+
+
 class ModelSizeClass(StrEnum):
     """Recommended model size bucket for the measured hardware, not a specific model."""
 
