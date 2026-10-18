@@ -122,9 +122,12 @@ def test_resolve_model_file_serves_a_cached_file_without_fetching_and_checks_it_
     monkeypatch.setattr("localmodels.pull.fetch_snapshot", lambda *_a, **_k: pytest.fail("fetched"))
     digest = hashlib.sha256(b"weights").hexdigest()
     spec = _GGUF_SPEC.model_copy(update={"revision": _PINNED, "sha256": digest})
+    store = tmp_path / "blobs" / "44" / "xet-hash"  # huggingface_hub 2.0's cache-wide store
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"not the weights: a name match is not re-hashed")
     blob = tmp_path / "models--x" / "blobs" / digest
     blob.parent.mkdir(parents=True)
-    blob.write_bytes(b"not the weights: a name match is not re-hashed")
+    blob.symlink_to(store)
     link = snapshot_dir(spec.repo_id, _PINNED, tmp_path) / spec.filename
     link.parent.mkdir(parents=True)
     link.symlink_to(blob)

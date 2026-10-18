@@ -116,6 +116,17 @@ def pull_model(spec: ModelSpec, *, models_dir: Path, filename: str | None = None
     return Path(snapshot_download(repo_id=spec.repo_id, revision=spec.revision))
 
 
+def _repo_blob_name(path: Path) -> str:
+    """The name of the repo blob a snapshot entry links to, or ``""`` when it is not a link.
+
+    One hop only: huggingface_hub 2.0 links that blob on to a cache-wide store named by another hash.
+    """
+    try:
+        return path.readlink().name
+    except OSError:
+        return ""
+
+
 def resolve_model_file(spec: ModelSpec, *, cache_dir: Path | None = None, token: str | None = None) -> Path:
     """Return the path of ``spec.filename`` at ``spec.revision`` in the Hub cache, fetching it only if absent.
 
@@ -136,7 +147,7 @@ def resolve_model_file(spec: ModelSpec, *, cache_dir: Path | None = None, token:
     if fetched:
         root = fetch_snapshot(spec.repo_id, spec.revision, cache_dir, patterns=[spec.filename], token=token)
     path = root / spec.filename
-    checked_by_name = not fetched and path.resolve().name == spec.sha256
+    checked_by_name = not fetched and _repo_blob_name(path) == spec.sha256
     if (
         spec.sha256
         and not checked_by_name
