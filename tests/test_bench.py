@@ -37,17 +37,12 @@ def _fake_run(monkeypatch, *, stdout: str = "", returncode: int = 0, raises: Exc
     return calls
 
 
-def test_run_bench_parses_prompt_and_decode_rows(monkeypatch) -> None:
-    _fake_run(monkeypatch, stdout=_TWO_ROW_JSON)
-    result = run_bench(Path("/fake/llama-bench"), Path("/fake/model.gguf"))
+def test_run_bench_passes_the_documented_flags_and_parses_prompt_and_decode_rows(monkeypatch) -> None:
+    calls = _fake_run(monkeypatch, stdout=_TWO_ROW_JSON)
+    result = run_bench(Path("/fake/llama-bench"), Path("/m.gguf"), n_prompt=512, n_gen=128, repetitions=3)
     assert result.prompt_tok_s == pytest.approx(2943.6)
     assert result.decode_tok_s == pytest.approx(92.12)
     assert len(result.raw_rows) == 2
-
-
-def test_run_bench_passes_the_documented_flags(monkeypatch) -> None:
-    calls = _fake_run(monkeypatch, stdout=_TWO_ROW_JSON)
-    run_bench(Path("/fake/llama-bench"), Path("/m.gguf"), n_prompt=512, n_gen=128, repetitions=3)
     cmd = calls[0]
     assert cmd[0] == "/fake/llama-bench"
     assert "-m" in cmd
@@ -58,26 +53,18 @@ def test_run_bench_passes_the_documented_flags(monkeypatch) -> None:
     assert cmd[cmd.index("-o") + 1] == "json"
 
 
-def test_run_bench_raises_on_nonzero_exit(monkeypatch) -> None:
-    _fake_run(monkeypatch, stdout="", returncode=1)
-    with pytest.raises(BenchError):
-        run_bench(Path("/fake/llama-bench"), Path("/m.gguf"))
-
-
-def test_run_bench_raises_on_unparseable_output(monkeypatch) -> None:
-    _fake_run(monkeypatch, stdout="not json")
-    with pytest.raises(BenchError):
-        run_bench(Path("/fake/llama-bench"), Path("/m.gguf"))
-
-
-def test_run_bench_raises_when_subprocess_cannot_start(monkeypatch) -> None:
-    _fake_run(monkeypatch, raises=OSError("no such file"))
-    with pytest.raises(BenchError):
-        run_bench(Path("/fake/llama-bench"), Path("/m.gguf"))
-
-
-def test_run_bench_raises_on_timeout(monkeypatch) -> None:
-    _fake_run(monkeypatch, raises=subprocess.TimeoutExpired(cmd="llama-bench", timeout=1))
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"returncode": 1},
+        {"stdout": "not json"},
+        {"raises": OSError("no such file")},
+        {"raises": subprocess.TimeoutExpired(cmd="llama-bench", timeout=1)},
+    ],
+    ids=["nonzero-exit", "unparseable", "cannot-start", "timeout"],
+)
+def test_run_bench_raises_a_bench_error_when_the_tool_fails(monkeypatch, failure: dict) -> None:
+    _fake_run(monkeypatch, **failure)
     with pytest.raises(BenchError):
         run_bench(Path("/fake/llama-bench"), Path("/m.gguf"))
 

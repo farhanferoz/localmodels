@@ -19,12 +19,13 @@ from localmodels.enums import ModelSizeClass
 from localmodels.setup import Role, SetupReport, SetupStepName, StepResult, StepStatus
 
 
-def _fake_report(*, ok: bool = True) -> SetupReport:
-    status = StepStatus.DONE if ok else StepStatus.FAILED
+def _fake_report() -> SetupReport:
     return SetupReport(
         dry_run=False,
         chosen_model="qwen3-30b-a3b",
-        results=[StepResult(step=SetupStepName.HARDWARE, name="preflight", status=status, detail="x")],
+        results=[
+            StepResult(step=SetupStepName.HARDWARE, name="preflight", status=StepStatus.DONE, detail="x")
+        ],
     )
 
 
@@ -64,6 +65,23 @@ def test_load_catalogue_parses_a_json_file(tmp_path: Path) -> None:
 
 
 def test_cmd_setup_forwards_args_to_run_setup(monkeypatch, tmp_path: Path) -> None:
+    catalogue_path = tmp_path / "catalogue.json"
+    catalogue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "alias": "custom",
+                    "category": "generator",
+                    "repo_id": "org/custom",
+                    "filename": "c.gguf",
+                    "description": "d",
+                    "licence": "mit",
+                    "osi_approved": True,
+                    "size_class": "small",
+                }
+            ]
+        )
+    )
     captured = {}
 
     def fake_run_setup(**kwargs):
@@ -88,10 +106,13 @@ def test_cmd_setup_forwards_args_to_run_setup(monkeypatch, tmp_path: Path) -> No
             str(tmp_path / "state.json"),
             "--llama-server-bin",
             "/opt/llama-server",
+            "--catalogue",
+            str(catalogue_path),
             "--yes",
         ]
     )
     assert code == EXIT_OK
+    assert captured["catalogue"][0].alias == "custom"
     assert captured["role"] is Role.CHAT
     assert captured["models_dir"] == tmp_path / "models"
     assert captured["lease"].project == "test-project"
@@ -111,46 +132,21 @@ def test_cmd_setup_dry_run_never_calls_record_setup(monkeypatch) -> None:
     assert record_calls == []
 
 
-def test_cmd_setup_returns_error_when_report_not_ok(monkeypatch) -> None:
-    monkeypatch.setattr(cli_mod, "run_setup", lambda **_k: _fake_report(ok=False))
-    monkeypatch.setattr(cli_mod, "record_setup", lambda *_a, **_k: None)
-
-    code = main(["setup", "--yes"])
-    assert code == EXIT_ERROR
-
-
-def test_cmd_setup_loads_a_custom_catalogue(monkeypatch, tmp_path: Path) -> None:
-    catalogue_path = tmp_path / "catalogue.json"
-    catalogue_path.write_text(
-        json.dumps(
-            [
-                {
-                    "alias": "custom",
-                    "category": "generator",
-                    "repo_id": "org/custom",
-                    "filename": "c.gguf",
-                    "description": "d",
-                    "licence": "mit",
-                    "osi_approved": True,
-                    "size_class": "small",
-                }
-            ]
-        )
-    )
-    captured = {}
-    monkeypatch.setattr(cli_mod, "run_setup", lambda **kwargs: captured.update(kwargs) or _fake_report())
-    monkeypatch.setattr(cli_mod, "record_setup", lambda *_a, **_k: None)
-
-    main(["setup", "--dry-run", "--catalogue", str(catalogue_path)])
-    assert captured["catalogue"][0].alias == "custom"
-
-
-@pytest.mark.parametrize("blocked_step", [SetupStepName.BACKEND, SetupStepName.HARDWARE])
-def test_setup_exits_nonzero_when_backend_refused(monkeypatch, capsys, blocked_step: SetupStepName) -> None:
+@pytest.mark.parametrize(
+    ("step", "status"),
+    [
+        (SetupStepName.BACKEND, StepStatus.BLOCKED),
+        (SetupStepName.HARDWARE, StepStatus.BLOCKED),
+        (SetupStepName.HARDWARE, StepStatus.FAILED),
+    ],
+)
+def test_setup_exits_nonzero_when_a_step_failed_or_the_backend_or_hardware_was_refused(
+    monkeypatch, capsys, step: SetupStepName, status: StepStatus
+) -> None:
     """A refused CPU-only build (or infeasible hardware) is a failed setup, not a summary to skim."""
     report = SetupReport(
         dry_run=False,
-        results=[StepResult(step=blocked_step, name="x", status=StepStatus.BLOCKED, detail="rebuild it")],
+        results=[StepResult(step=step, name="x", status=status, detail="rebuild it")],
     )
     monkeypatch.setattr(cli_mod, "run_setup", lambda **_k: report)
     monkeypatch.setattr(cli_mod, "record_setup", lambda *_a, **_k: None)

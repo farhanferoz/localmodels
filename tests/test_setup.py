@@ -126,29 +126,12 @@ def test_refuse_cpu_only_build_names_the_rebuild_flag(device: DeviceType, rebuil
     assert "re-run 'localmodels setup'" in detail
 
 
-def test_refuse_cpu_only_build_allows_cpu_backend_on_cpu_host() -> None:
+def test_refuse_cpu_only_build_allows_a_matching_backend() -> None:
     assert refuse_cpu_only_build(backend=Backend.CPU, device=DeviceType.CPU, device_name="x") is None
-
-
-def test_refuse_cpu_only_build_allows_matching_accelerator() -> None:
     assert refuse_cpu_only_build(backend=Backend.CUDA, device=DeviceType.CUDA, device_name="x") is None
 
 
-def test_run_setup_backend_step_blocked_on_cpu_only_build_with_accelerator_host(monkeypatch) -> None:
-    _fake_preflight_cuda_fast(monkeypatch)
-    monkeypatch.setattr(setup_mod, "resolve_llama_server_bin", lambda: Path("/fake/llama-server"))
-    monkeypatch.setattr(setup_mod, "detect_backend", lambda _b: Backend.CPU)
-
-    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=True)
-    backend_result = next(r for r in report.results if r.step is SetupStepName.BACKEND)
-    assert backend_result.status is StepStatus.BLOCKED
-    assert "-DGGML_CUDA=ON" in backend_result.detail
-    bench_result = next(r for r in report.results if r.step is SetupStepName.BENCH)
-    # dry_run always PLANs bench regardless of backend -- the refusal is asserted for a real run below.
-    assert bench_result.status is StepStatus.PLANNED
-
-
-def test_run_setup_bench_blocked_when_backend_refused_on_a_real_yes_run(monkeypatch) -> None:
+def test_run_setup_blocks_the_backend_on_a_cpu_only_build_and_the_bench_on_a_real_run(monkeypatch) -> None:
     def _fake_model_status(_spec, *, models_dir):
         return {"cached": True, "local_path": str(models_dir / "m.gguf")}
 
@@ -156,6 +139,14 @@ def test_run_setup_bench_blocked_when_backend_refused_on_a_real_yes_run(monkeypa
     monkeypatch.setattr(setup_mod, "resolve_llama_server_bin", lambda: Path("/fake/llama-server"))
     monkeypatch.setattr(setup_mod, "detect_backend", lambda _b: Backend.CPU)
     monkeypatch.setattr(setup_mod, "model_status", _fake_model_status)
+
+    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=True)
+    backend_result = next(r for r in report.results if r.step is SetupStepName.BACKEND)
+    assert backend_result.status is StepStatus.BLOCKED
+    assert "-DGGML_CUDA=ON" in backend_result.detail
+    bench_result = next(r for r in report.results if r.step is SetupStepName.BENCH)
+    # a dry run always plans the bench, whatever the backend says
+    assert bench_result.status is StepStatus.PLANNED
 
     report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=False, yes=True)
     bench_result = next(r for r in report.results if r.step is SetupStepName.BENCH)
@@ -166,43 +157,22 @@ def test_run_setup_bench_blocked_when_backend_refused_on_a_real_yes_run(monkeypa
 # --- dry-run / --yes gating: never acquires the lease, benches, downloads or starts anything ---
 
 
-def test_dry_run_never_downloads_or_benches(monkeypatch) -> None:
+@pytest.mark.parametrize(("dry_run", "yes"), [(True, True), (False, False)], ids=["dry-run", "without-yes"])
+def test_run_setup_only_plans_the_download_and_bench_without_yes_or_with_dry_run(
+    monkeypatch, dry_run: bool, yes: bool
+) -> None:
     _fake_preflight_cuda_fast(monkeypatch)
     monkeypatch.setattr(setup_mod, "resolve_llama_server_bin", lambda: Path("/fake/llama-server"))
     monkeypatch.setattr(setup_mod, "detect_backend", lambda _b: Backend.CUDA)
     monkeypatch.setattr(setup_mod, "download_model", _never_called)
     monkeypatch.setattr(setup_mod, "run_bench", _never_called)
 
-    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=True, yes=True)
+    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=dry_run, yes=yes)
     download_result = next(r for r in report.results if r.step is SetupStepName.DOWNLOAD)
     bench_result = next(r for r in report.results if r.step is SetupStepName.BENCH)
     assert download_result.status is StepStatus.PLANNED
     assert bench_result.status is StepStatus.PLANNED
     assert report.ok
-
-
-def test_without_yes_never_downloads_or_benches(monkeypatch) -> None:
-    _fake_preflight_cuda_fast(monkeypatch)
-    monkeypatch.setattr(setup_mod, "resolve_llama_server_bin", lambda: Path("/fake/llama-server"))
-    monkeypatch.setattr(setup_mod, "detect_backend", lambda _b: Backend.CUDA)
-    monkeypatch.setattr(setup_mod, "download_model", _never_called)
-    monkeypatch.setattr(setup_mod, "run_bench", _never_called)
-
-    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=False, yes=False)
-    download_result = next(r for r in report.results if r.step is SetupStepName.DOWNLOAD)
-    assert download_result.status is StepStatus.PLANNED
-
-
-def test_dry_run_never_writes_state(tmp_path: Path, monkeypatch) -> None:
-    _fake_preflight_cuda_fast(monkeypatch)
-    monkeypatch.setattr(setup_mod, "resolve_llama_server_bin", lambda: Path("/fake/llama-server"))
-    monkeypatch.setattr(setup_mod, "detect_backend", lambda _b: Backend.CUDA)
-
-    report = run_setup(catalogue=[_LARGE_GENERATOR], dry_run=True)
-    state_path = tmp_path / "setup.json"
-    if report.dry_run:
-        pass  # run_setup itself never writes state; the CLI decides whether to call record_setup
-    assert not state_path.exists()
 
 
 def test_infeasible_hardware_never_reaches_choose_model(monkeypatch) -> None:

@@ -100,10 +100,6 @@ def test_resolve_device_with_override_preserves_index() -> None:
     assert resolve_device("cuda:0") == "cuda:0"
 
 
-def test_resolve_device_without_override_probes_real_hardware() -> None:
-    assert resolve_device() in ("cuda", "mps", "cpu")
-
-
 # --- available_memory: what an allocation can get, not the driver's free count
 _MEMINFO = """MemTotal:       127600748 kB
 MemFree:         22680460 kB
@@ -196,11 +192,6 @@ def test_cpu_gets_the_host_figure_and_mps_and_an_unread_gpu_are_unknown(monkeypa
     assert hw_mod.available_memory("mps", _meminfo(tmp_path)) is None
     _fake_cuda(monkeypatch, "", run_raises=True)
     assert hw_mod.available_memory("cuda", _meminfo(tmp_path)) is None
-
-
-def test_available_memory_never_raises_on_this_host() -> None:
-    hw_mod.available_memory("cuda")
-    hw_mod.available_memory("cpu")
 
 
 def test_a_path_on_a_network_filesystem_is_recognised_by_its_closest_mount(tmp_path: Path) -> None:

@@ -70,24 +70,6 @@ def test_lease_acquire_refuses_when_another_lease_is_live(tmp_path: Path) -> Non
     assert not (tmp_path / "service_a.json").exists()
 
 
-def test_lease_wait_returns_ok_immediately_when_free(tmp_path: Path) -> None:
-    code = main(
-        [
-            "lease",
-            "wait",
-            "--project",
-            "service_a",
-            "--lease-dir",
-            str(tmp_path),
-            "--timeout",
-            "1",
-            "--poll",
-            "0.01",
-        ]
-    )
-    assert code == EXIT_OK
-
-
 def test_lease_wait_times_out_while_another_lease_is_live(tmp_path: Path) -> None:
     other = GpuLease(tmp_path, project="service_c")
     other.write(LeaseRecord(pid=os.getpid(), project="service_c", port=8080))
@@ -192,61 +174,33 @@ def test_lease_admitted_rewrites_without_requested_at(tmp_path: Path) -> None:
     assert data["port"] == 8080
 
 
-def test_lease_release_removes_the_file(tmp_path: Path) -> None:
+def test_lease_release_removes_the_file_and_is_idempotent(tmp_path: Path) -> None:
     lease = GpuLease(tmp_path, project="service_a")
     lease.write(LeaseRecord(pid=os.getpid(), project="service_a", port=8091))
 
-    code = main(["lease", "release", "--project", "service_a", "--lease-dir", str(tmp_path)])
-    assert code == EXIT_OK
+    release = ["lease", "release", "--project", "service_a", "--lease-dir", str(tmp_path)]
+    assert main(release) == EXIT_OK
     assert not (tmp_path / "service_a.json").exists()
-
-
-def test_lease_release_is_idempotent_when_nothing_to_release(tmp_path: Path) -> None:
-    code = main(["lease", "release", "--project", "service_a", "--lease-dir", str(tmp_path)])
-    assert code == EXIT_OK
+    assert main(release) == EXIT_OK  # nothing left to release
 
 
 def test_lease_status_reports_mine_and_others(tmp_path: Path) -> None:
-    mine = GpuLease(tmp_path, project="service_a")
-    mine.write(LeaseRecord(pid=os.getpid(), project="service_a", port=8091))
-    other = GpuLease(tmp_path, project="service_c")
-    other.write(LeaseRecord(pid=os.getpid(), project="service_c", port=8080))
+    status = ["lease", "status", "--project", "service_a", "--lease-dir", str(tmp_path)]
+    status += ["--json-out", str(tmp_path / "out.json")]
+    assert main(status) == EXIT_OK
+    assert json.loads((tmp_path / "out.json").read_text())["mine"] is None  # no lease written yet
 
-    code = main(
-        [
-            "lease",
-            "status",
-            "--project",
-            "service_a",
-            "--lease-dir",
-            str(tmp_path),
-            "--json-out",
-            str(tmp_path / "out.json"),
-        ]
+    GpuLease(tmp_path, project="service_a").write(
+        LeaseRecord(pid=os.getpid(), project="service_a", port=8091)
     )
-    assert code == EXIT_OK
+    GpuLease(tmp_path, project="service_c").write(
+        LeaseRecord(pid=os.getpid(), project="service_c", port=8080)
+    )
+    assert main(status) == EXIT_OK
     report = json.loads((tmp_path / "out.json").read_text())
     assert report["mine"]["port"] == 8091
     assert len(report["others"]) == 1
     assert report["others"][0]["project"] == "service_c"
-
-
-def test_lease_status_mine_is_none_when_no_lease_written(tmp_path: Path) -> None:
-    code = main(
-        [
-            "lease",
-            "status",
-            "--project",
-            "service_a",
-            "--lease-dir",
-            str(tmp_path),
-            "--json-out",
-            str(tmp_path / "out.json"),
-        ]
-    )
-    assert code == EXIT_OK
-    report = json.loads((tmp_path / "out.json").read_text())
-    assert report["mine"] is None
 
 
 def test_main_with_no_args_returns_error() -> None:

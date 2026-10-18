@@ -32,13 +32,11 @@ _SNAPSHOT_SPEC = ModelSpec(
 )
 
 
-def test_model_status_gguf_not_cached(tmp_path: Path) -> None:
+def test_model_status_gguf(tmp_path: Path) -> None:
     status = model_status(_GGUF_SPEC, models_dir=tmp_path)
     assert status["cached"] is False
     assert status["local_path"] is None
 
-
-def test_model_status_gguf_cached(tmp_path: Path) -> None:
     gguf = tmp_path / _GGUF_SPEC.filename
     gguf.write_bytes(b"x" * 1024)
     status = model_status(_GGUF_SPEC, models_dir=tmp_path)
@@ -47,8 +45,9 @@ def test_model_status_gguf_cached(tmp_path: Path) -> None:
     assert status["size_mb"] == round(1024 / (1024 * 1024), 1)
 
 
-def test_model_status_snapshot_cached_reads_sha(tmp_path: Path) -> None:
+def test_model_status_snapshot_reads_sha_once_cached(tmp_path: Path) -> None:
     hf_home = tmp_path / "hf"
+    assert model_status(_SNAPSHOT_SPEC, models_dir=tmp_path, hf_home=hf_home)["cached"] is False
     cache_dir = hf_home / "hub" / "models--BAAI--bge-large-en-v1.5"
     snapshots = cache_dir / "snapshots" / "abc123"
     snapshots.mkdir(parents=True)
@@ -60,11 +59,6 @@ def test_model_status_snapshot_cached_reads_sha(tmp_path: Path) -> None:
     status = model_status(_SNAPSHOT_SPEC, models_dir=tmp_path, hf_home=hf_home)
     assert status["cached"] is True
     assert status["local_sha"] == "abcdef01"
-
-
-def test_model_status_snapshot_not_cached(tmp_path: Path) -> None:
-    status = model_status(_SNAPSHOT_SPEC, models_dir=tmp_path, hf_home=tmp_path / "hf")
-    assert status["cached"] is False
 
 
 _PINNED = "a" * 40
