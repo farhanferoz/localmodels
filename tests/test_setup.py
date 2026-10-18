@@ -30,6 +30,14 @@ from localmodels.setup import (
     run_setup,
 )
 
+
+@pytest.fixture(autouse=True)
+def _empty_hub_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model in this machine's own Hub cache would read as cached and skip the download step."""
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+
+
 _LARGE_GENERATOR = ModelSpec(
     alias="qwen3-30b-a3b",
     category=ModelCategory.GENERATOR,
