@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from localmodels.enums import ModelSizeClass, QuantLevel
-from localmodels.params import ServingParams
+from localmodels.enums import DeviceType, ModelSizeClass, QuantLevel, ServingRole
+from localmodels.params import ServingParams, derive_serving_params
 from localmodels.process import BinaryNotFoundError, ServerSpec, build_args, resolve_llama_server_bin
 
 
@@ -75,3 +75,19 @@ def test_binary_chain_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     # 4. none exists -> BinaryNotFoundError
     with pytest.raises(BinaryNotFoundError, match="could not resolve llama-server"):
         resolve_llama_server_bin(explicit=tmp_path / "absent")
+
+
+def test_build_args_adds_kvu_only_for_a_role_and_keeps_extra_flags_last() -> None:
+    spec = ServerSpec(host="127.0.0.1", port=8091, model_path=Path("/models/qwen.gguf"))
+    plain = derive_serving_params(DeviceType.CUDA, 100.0)
+    assert build_args("/bin/llama-server", spec, plain) == [
+        "/bin/llama-server", "-m", "/models/qwen.gguf", "-ngl", "99", "-c", str(plain.n_ctx),
+        "-np", str(plain.n_parallel), "--jinja", "--host", "127.0.0.1", "--port", "8091",
+    ]  # fmt: skip
+
+    for role, slots in ((ServingRole.INTERACTIVE, "4"), (ServingRole.BULK, "16")):
+        params = derive_serving_params(DeviceType.CUDA, 100.0, role=role)
+        args = build_args("/bin/llama-server", spec, params, extra_flags=("--spec-type", "draft-mtp"))
+        assert args[args.index("-np") : args.index("-np") + 3] == ["-np", slots, "-kvu"]
+        assert "-ub" not in args
+        assert args[-2:] == ["--spec-type", "draft-mtp"]

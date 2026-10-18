@@ -1,6 +1,6 @@
 import pytest
 
-from localmodels.enums import DeviceTier, DeviceType, ModelSizeClass, QuantLevel
+from localmodels.enums import DeviceTier, DeviceType, ModelSizeClass, QuantLevel, ServingRole
 from localmodels.params import classify_tier, derive_serving_params
 
 
@@ -85,3 +85,16 @@ def test_derive_serving_params_respects_measured_ceilings() -> None:
     assert sp.n_ctx == 32768
     assert sp.n_parallel == 4
     assert sp.recommended_quant is QuantLevel.Q4_K_M
+
+
+def test_role_layouts_are_fixed_and_no_role_is_unchanged() -> None:
+    plain = derive_serving_params(DeviceType.CUDA, 100.0)
+    assert not plain.kv_unified
+    assert derive_serving_params(DeviceType.CUDA, 100.0, role=None) == plain
+
+    interactive = derive_serving_params(DeviceType.CUDA, 100.0, role=ServingRole.INTERACTIVE)
+    assert (interactive.kv_unified, interactive.n_parallel, interactive.n_ctx) == (True, 4, 32768)
+    assert any("K1.layout" in a and "interactive" in a for a in interactive.assumptions)
+    bulk = derive_serving_params(DeviceType.CUDA, 20.0, role=ServingRole.BULK, n_ctx_cap=65536)
+    assert (bulk.kv_unified, bulk.n_parallel, bulk.n_ctx) == (True, 16, 65536)
+    assert any("K2.layout" in a for a in bulk.assumptions)

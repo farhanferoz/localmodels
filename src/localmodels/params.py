@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from .enums import DeviceTier, DeviceType, ModelSizeClass, QuantLevel
+from .enums import DeviceTier, DeviceType, ModelSizeClass, QuantLevel, ServingRole
 
 MIN_RUNNABLE_MEMORY_GB = 3.0
 _FAST_VRAM_GB = 16.0
@@ -23,6 +23,9 @@ _MIN_N_CTX = 2048
 _MAX_N_CTX = 32768
 _MIN_N_PARALLEL = 1
 _MAX_N_PARALLEL = 4
+_ROLE_N_CTX = 32768
+_ROLE_N_PARALLEL = {ServingRole.INTERACTIVE: 4, ServingRole.BULK: 16}
+_ROLE_RULE = {ServingRole.INTERACTIVE: "K1.layout", ServingRole.BULK: "K2.layout"}
 
 
 class TierDecision(BaseModel):
@@ -42,6 +45,7 @@ class ServingParams(BaseModel):
     n_parallel: int
     recommended_quant: QuantLevel | None
     recommended_size_class: ModelSizeClass
+    kv_unified: bool = False
     assumptions: list[str] = Field(default_factory=list)
 
 
@@ -70,8 +74,32 @@ def _clamp(value: float, lo: int, hi: int) -> int:
     return min(max(round(value), lo), hi)
 
 
-def derive_serving_params(device: DeviceType, total_mem_gb: float) -> ServingParams:
-    """Derive llama-server serving parameters as a pure function of measured hardware."""
+def derive_serving_params(
+    device: DeviceType,
+    total_mem_gb: float,
+    *,
+    role: ServingRole | None = None,
+    n_ctx_cap: int | None = None,
+) -> ServingParams:
+    """Derive llama-server serving parameters as a pure function of measured hardware.
+
+    With a ``role`` the layout is the role's fixed one (rules K1.layout, K2.layout): a shared pool
+    (``kv_unified``), the role's slot count and ``n_ctx_cap`` (default 32,768) as the pool, never
+    derived from free memory. Without one the result is the memory-scaled layout.
+    """
+    params = _derive_scaled(device, total_mem_gb)
+    if role is None:
+        return params
+    n_ctx = n_ctx_cap or _ROLE_N_CTX
+    n_parallel = _ROLE_N_PARALLEL[role]
+    params.assumptions.append(
+        f"{role.value} role: shared pool (kv_unified), {n_parallel} slots, n_ctx {n_ctx} fixed "
+        f"({_ROLE_RULE[role]}) (ASSUMPTION)."
+    )
+    return params.model_copy(update={"kv_unified": True, "n_ctx": n_ctx, "n_parallel": n_parallel})
+
+
+def _derive_scaled(device: DeviceType, total_mem_gb: float) -> ServingParams:
     assumptions: list[str] = []
     if total_mem_gb < MIN_RUNNABLE_MEMORY_GB:
         assumptions.append(

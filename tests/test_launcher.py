@@ -411,6 +411,32 @@ async def test_props_context_slot_mismatch_stops_server_and_refuses(tmp_path: Pa
         assert not (tmp_path / "pids" / "8194.pid").exists()
 
 
+async def test_unified_pool_needs_n_ctx_for_every_slot(tmp_path: Path) -> None:
+    bin_path = _make_fake_server(tmp_path)
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+
+    async with httpx.AsyncClient() as http:
+
+        def manager(n_ctx: int, *, kv_unified: bool = True) -> LocalServerManager:
+            return _manager(
+                tmp_path=tmp_path,
+                http=http,
+                bin_path=bin_path,
+                port=8195,
+                model_file=model_file,
+                params=_gpu_params(n_ctx=n_ctx, n_parallel=4, kv_unified=kv_unified),
+                min_slot_tokens=8192,
+            )
+
+        with pytest.raises(ServerStartError, match=r"n_ctx 16384.*4 slots.*min_slot_tokens 8192"):
+            await manager(16384).start()
+        assert not (tmp_path / "pids" / "8195.pid").exists()
+        manager(32768)._check_slot_guarantee()
+        manager(16384, kv_unified=False)._check_slot_guarantee()
+        assert manager(32768).stamp().layout.kv_unified  # type: ignore[union-attr]
+
+
 async def test_status_reporting(tmp_path: Path) -> None:
     bin_path = _make_fake_server(tmp_path)
     model_file = tmp_path / "test.gguf"
