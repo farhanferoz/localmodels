@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -103,3 +104,30 @@ def test_saving_a_record_replaces_its_own_hardware_and_keeps_the_others(tmp_path
     assert load_choice(path, CPU) == FAST
     assert load_choice(path, OTHER) == SLOW
     assert load_choice(tmp_path / "missing.json", CPU) is None
+
+
+def test_a_record_made_on_another_stack_warns_once_and_still_gives_its_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stack = {"driver": "580.1", "cuda": "13.0", "kernel": "6.17", "dgx_os": "7.6.0", "localmodels": "0.5.0"}
+    monkeypatch.setattr("localmodels.serving.tune.fingerprint", lambda: stack)
+    path = tmp_path / "model.json"
+    record = tune(SLOW, FAST)
+    assert record.stack == stack
+    save_record(path, record)
+
+    def warnings_for(current: dict[str, str]) -> list[str]:
+        monkeypatch.setattr("localmodels.serving.tune.fingerprint", lambda: current)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="localmodels.serving.tune"):
+            assert load_choice(path, CPU) == FAST
+        return [r.getMessage() for r in caplog.records]
+
+    assert warnings_for(stack) == []
+    assert warnings_for({**stack, "localmodels": "0.6.0"}) == []  # this package's version is not a stale part
+    (message,) = warnings_for({**stack, "driver": "590.2", "kernel": "6.18"})
+    assert "driver: 580.1 -> 590.2" in message
+    assert "kernel: 6.17 -> 6.18" in message
+    assert "cuda" not in message
+    save_record(path, record.model_copy(update={"stack": None}))
+    assert warnings_for({**stack, "driver": "590.2"}) == []
