@@ -1,0 +1,14 @@
+# systemd --user unit: one run of the monthly digest (see localmodels-digest.timer).
+#
+# Install (the timer starts this unit, so only the timer is enabled):
+#   cp deploy/localmodels-digest.service deploy/localmodels-digest.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now localmodels-digest.timer
+# Output: ~/cache/localmodels/digests/<date>.md, .raw/<date>.json and .state.json.
+[Unit]
+Description=localmodels monthly digest
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/dev/localmodels/.venv/bin/localmodels digest run

@@ -1,0 +1,44 @@
+[
+ {
+  "sha": "5aeac37a35b44fde4bdffaec9159f2fcb253b622",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/5aeac37a35b44fde4bdffaec9159f2fcb253b622",
+  "commit": {
+   "message": "ggml-cuda: fattn do not check oob if k_VKQ_max = (k_VKQ_max - nbatch_fa) (#30572)"
+  }
+ },
+ {
+  "sha": "9d1878a4354e743529fbe09e7350a957f5e39e9a",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/9d1878a4354e743529fbe09e7350a957f5e39e9a",
+  "commit": {
+   "message": "ggml-cuda: HIP: use __builtin_amdgcn_perm for q1_0 unpacking (#29927)"
+  }
+ },
+ {
+  "sha": "2744e48d1e88d7416224e92bf58d4ffedda4a205",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/2744e48d1e88d7416224e92bf58d4ffedda4a205",
+  "commit": {
+   "message": "CUDA: faster MMVQ for low-bit types (#30517)\n\n* CUDA: faster MMVQ for low-bit types\n\n* ggml-cuda: hip: small nwarps GCN fix on Q3_K(ncols=2,3), Q6_K(ncols=4)\n\n---------\n\nCo-authored-by: thelittlefirem"
+  }
+ },
+ {
+  "sha": "9d1e03616efb7520514d65552c7376296ef9208f",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/9d1e03616efb7520514d65552c7376296ef9208f",
+  "commit": {
+   "message": "cuda : fix -Wtautological-compare in fattn vec dispatch (#30519)\n\nSigned-off-by: Adrien Gallou\u00ebt <angt@huggingface.co>"
+  }
+ },
+ {
+  "sha": "f2f667b02dc76d675395ae3b14546c8108d26387",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/f2f667b02dc76d675395ae3b14546c8108d26387",
+  "commit": {
+   "message": "cuda : add grouped experts top-k fusion (#29181)\n\n* fuse grouped experts\n\n* add tests\n\n* hip fix\n\n* add to graph_optimize\n\n* apply suggestion from am17an\n\n* hip fix\n\n* fix hip fix\n\n* fix fix fix\n\n* ga"
+  }
+ },
+ {
+  "sha": "623c16393c7d53a37df8bb69c6ea8ed6e5171f62",
+  "html_url": "https://github.com/ggml-org/llama.cpp/commit/623c16393c7d53a37df8bb69c6ea8ed6e5171f62",
+  "commit": {
+   "message": "CUDA: HIP: rms_norm: add variants that load float4 at a time and store x in registers (#29720)\n\n* CUDA: HIP: rms_norm: load float4 at a time and store x in registers\n\n* Add template paramter comments\n"
+  }
+ }
+]

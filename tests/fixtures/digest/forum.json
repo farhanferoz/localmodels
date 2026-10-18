@@ -1,0 +1,60 @@
+{
+ "topic_list": {
+  "topics": [
+   {
+    "id": 386121,
+    "slug": "deepseek-v4-1-flash-1017-tensorfold-vllm-recipe",
+    "title": "DeepSeek-V4.1-Flash-1017 TensorFold + VLLM Recipe",
+    "created_at": "2026-10-17T19:41:39.327Z"
+   },
+   {
+    "id": 365572,
+    "slug": "i-am-extremely-disappointed-with-the-current-state-of-dgx-spark",
+    "title": "I am EXTREMely disappointed with the current state of DGX Spark",
+    "created_at": "2026-04-03T19:18:56.030Z"
+   },
+   {
+    "id": 386098,
+    "slug": "deepseek-v4-1-flash-1710",
+    "title": "DeepSeek V4.1 Flash 1710",
+    "created_at": "2026-10-17T09:29:36.145Z"
+   },
+   {
+    "id": 382628,
+    "slug": "so-for-dual-spark-what-is-the-choice-now-glm5-3-flash-or-deepseek-v4-flash",
+    "title": "So for Dual Spark what is the Choice now: GLM5.3 Flash or Deepseek v4 Flash",
+    "created_at": "2026-09-07T20:23:46.684Z"
+   },
+   {
+    "id": 386130,
+    "slug": "raidflash-pd-x5-speed-gains-x2-dgx-tp2-using-all-concurrences-for-a-single-user",
+    "title": "RAIDFLASH-PD x5 speed gains! x2-DGX TP2 Using all concurrences for a single user!",
+    "created_at": "2026-10-18T03:12:39.275Z"
+   },
+   {
+    "id": 385733,
+    "slug": "gb10-kernel-regression-6-17-0-1014-7-0-0-1019-nvidia-received-tcp-data-corrupted-onboth-ethernet-and-wi-fi-tls-bad-record-mac-tcpincsumerrors",
+    "title": "GB10 kernel regression 6.17.0-1014 \u2192 7.0.0-1019-nvidia: received TCP data corrupted onboth Ethernet and Wi-Fi (TLS \"bad record mac\", TcpInCsumErrors)",
+    "created_at": "2026-10-13T04:08:42.063Z"
+   },
+   {
+    "id": 382725,
+    "slug": "deepseek-v4-1-flash",
+    "title": "DeepSeek v4.1 Flash",
+    "created_at": "2026-09-08T17:15:40.013Z"
+   },
+   {
+    "id": 385994,
+    "slug": "nvidia-official-qwen3-8-flash-next-checkpoint-for-single-dgx-spark",
+    "title": "NVIDIA official Qwen3.8 Flash Next checkpoint for single DGX Spark",
+    "created_at": "2026-10-16T00:16:37.758Z"
+   },
+   {
+    "id": 1,
+    "slug": "old-vllm-thread",
+    "title": "An older vLLM thread (added to the recording by hand)",
+    "created_at": "2026-04-03T00:00:00.000Z"
+   }
+  ]
+ }
+}

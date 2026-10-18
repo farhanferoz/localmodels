@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from pydantic import TypeAdapter
 
 from .catalogue import ModelSpec
+from .digest import register as register_digest
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .service import _cmd_serve
 from .setup import (
@@ -262,6 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_setup_parser(subparsers)
     _build_serve_parser(subparsers)
     _build_lease_parser(subparsers)
+    register_digest(subparsers)
     return parser
 
 
