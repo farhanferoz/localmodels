@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import math
 import statistics
 import time
@@ -26,6 +27,7 @@ from localmodels.hardware import HardwareReport, available_memory, inspect_hardw
 from localmodels.serving.client import ModelServerProcess
 from localmodels.serving.errors import ServingError
 from localmodels.serving.protocol import InferMessage, LoadMessage, ResultMessage
+from localmodels.stack import fingerprint, stale_components
 from localmodels.version import package_version
 
 if TYPE_CHECKING:
@@ -33,6 +35,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 GIB: Final = 1024**3
+
+log = logging.getLogger(__name__)
 
 
 class TuneError(Exception):
@@ -84,6 +88,8 @@ class TuneRecord(BaseModel):
     quality: str
     chosen: TuneCandidate
     measurements: list[TuneMeasurement]
+    #: The host stack (``stack.fingerprint()``) it was measured on; None for a record made before stamps.
+    stack: dict[str, str] | None = None
 
 
 def _ranks(values: Sequence[float]) -> list[float]:
@@ -298,6 +304,7 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
         quality=quality_name,
         chosen=best.candidate,
         measurements=measurements,
+        stack=fingerprint(),
     )
 
 
@@ -319,7 +326,16 @@ def save_record(path: Path, record: TuneRecord) -> None:
 def load_choice(path: Path, report: HardwareReport) -> TuneCandidate | None:
     """The candidate chosen for this machine, or None when the file or this machine's record is missing."""
     key = hardware_key(report)
-    return next((r.chosen for r in _read_records(path) if r.hardware == key), None)
+    record = next((r for r in _read_records(path) if r.hardware == key), None)
+    if record is None:
+        return None
+    if record.stack is not None and (stale := stale_components(record.stack, fingerprint())):
+        log.warning(
+            "The tune record for %s was measured on a different stack (%s); re-run the tune step.",
+            key,
+            "; ".join(stale),
+        )
+    return record.chosen
 
 
 def untuned_message(model: str, key: str) -> str:

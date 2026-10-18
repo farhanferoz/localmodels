@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING
 
 from localmodels.serving.client import ModelServerProcess
+from localmodels.stack import Engine, LoadOptions, ServerStamp, fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -37,6 +38,7 @@ class ModelHost:
         self._poll_s = poll_s
         self._clock = clock
         self._server: ModelServerProcess | None = None
+        self._load: LoadMessage | None = None
         self._holding = False
         self._last_use = clock()
 
@@ -85,6 +87,7 @@ class ModelHost:
         self._stop_server()
         server = ModelServerProcess(argv, env, identity)
         self._server = server
+        self._load = load
         try:
             server.start()
             server.load(load, cancel_check)
@@ -92,6 +95,22 @@ class ModelHost:
             self._stop_server()
             raise
         return server
+
+    def stamp(self, model_sha256: str | None = None) -> ServerStamp | None:
+        """How the warm server was made (its load's model directory, precision, options); None with no server.
+
+        ``model_sha256`` is the model's hash when the caller knows it; it is never computed here.
+        """
+        if self._server is None or self._load is None:
+            return None
+        return ServerStamp(
+            engine=Engine.PYTORCH,
+            build=self._server.server_version or "unknown",
+            model_path=self._load.model_dir,
+            model_sha256=model_sha256,
+            load=LoadOptions(dtype=self._load.dtype, options=self._load.options),
+            host=fingerprint(),
+        )
 
     def finished(self) -> None:
         """A job ended: restart the idle clock, and give the GPU back if the server is gone."""

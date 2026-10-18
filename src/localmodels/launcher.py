@@ -36,6 +36,7 @@ from .process import (
     build_args,
     require_key_off_loopback,
 )
+from .stack import Engine, LlamaLayout, ServerStamp, fingerprint, llama_cpp_build
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -240,6 +241,22 @@ class LocalServerManager:
 
     def _pidfile(self) -> Path:
         return self.pid_dir / f"{self.spec.port}.pid"
+
+    def stamp(self, model_sha256: str | None = None) -> ServerStamp:
+        """How this server is made: llama.cpp's build, the model file, its layout and the host.
+
+        ``model_sha256`` is the file's hash when the caller knows it (a ``PinnedFile``); never computed here.
+        """
+        return ServerStamp(
+            engine=Engine.LLAMA_CPP,
+            build=llama_cpp_build(Path(self.binary)),
+            model_path=str(self.spec.model_path),
+            model_sha256=model_sha256,
+            layout=LlamaLayout(
+                n_ctx=self.params.n_ctx, n_parallel=self.params.n_parallel, extra_flags=self.extra_flags
+            ),
+            host=fingerprint(),
+        )
 
     def _free_gib(self) -> float | None:
         return self._available_gib(self.params.n_gpu_layers != 0)
