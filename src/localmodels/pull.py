@@ -12,7 +12,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .pinned import repo_dir
+from .pinned import PinnedFile, fetch_snapshot, repo_dir, sha256_file, snapshot_dir, verify_files
+from .process import LocalModelsError
 
 if TYPE_CHECKING:
     from .catalogue import ModelSpec
@@ -25,6 +26,14 @@ class UpdateState(StrEnum):
     UP_TO_DATE = "up_to_date"
     NOT_CACHED = "not_cached"
     CHECK_FAILED = "check_failed"
+
+
+class ModelFileError(LocalModelsError):
+    """A catalogue file cannot be resolved from the Hub cache: unpinned, nameless or failing its hash."""
+
+
+def _default_hub_cache() -> Path:
+    return Path(os.environ.get("HF_HUB_CACHE") or Path.home() / ".cache" / "huggingface" / "hub")
 
 
 def _default_hf_home() -> Path:
@@ -49,6 +58,7 @@ def _dir_size_mb(path: Path) -> float:
 
 def model_status(spec: ModelSpec, *, models_dir: Path, hf_home: Path | None = None) -> dict[str, Any]:
     """Report whether ``spec`` is cached locally, and where — reads the filesystem only."""
+    hf_home_given = hf_home is not None
     hf_home = hf_home or _default_hf_home()
     is_cached = False
     local_path: str | None = None
@@ -57,6 +67,9 @@ def model_status(spec: ModelSpec, *, models_dir: Path, hf_home: Path | None = No
 
     if spec.filename:
         gguf_path = models_dir / spec.filename
+        if not gguf_path.exists() and spec.revision:
+            hub = hf_home / "hub" if hf_home_given else _default_hub_cache()
+            gguf_path = snapshot_dir(spec.repo_id, spec.revision, hub) / spec.filename
         if gguf_path.exists():
             is_cached = True
             local_path = str(gguf_path)
@@ -86,7 +99,11 @@ def model_status(spec: ModelSpec, *, models_dir: Path, hf_home: Path | None = No
 
 
 def pull_model(spec: ModelSpec, *, models_dir: Path, filename: str | None = None) -> Path:
-    """Download ``spec`` (or one file of it) into ``models_dir``, resuming an interrupted pull."""
+    """Download ``spec`` (or one file of it) into ``models_dir``, resuming an interrupted pull.
+
+    This copies into ``models_dir``; to share one pinned, verified file through the Hugging Face cache
+    instead, use ``resolve_model_file``.
+    """
     from huggingface_hub import hf_hub_download, snapshot_download  # noqa: PLC0415 — optional dep
 
     fn = filename or spec.filename
@@ -97,6 +114,28 @@ def pull_model(spec: ModelSpec, *, models_dir: Path, filename: str | None = None
         )
         return Path(path)
     return Path(snapshot_download(repo_id=spec.repo_id, revision=spec.revision))
+
+
+def resolve_model_file(spec: ModelSpec, *, cache_dir: Path | None = None, token: str | None = None) -> Path:
+    """Fetch ``spec.filename`` at ``spec.revision`` into the Hub cache, verify it, and return its path.
+
+    ``cache_dir`` defaults to ``HF_HUB_CACHE``, else ``~/.cache/huggingface/hub``. The file is checked
+    against ``spec.sha256`` when one is recorded.
+    """
+    if not spec.filename:
+        msg = f"{spec.alias}: no filename to resolve; only single-file entries come from the cache"
+        raise ModelFileError(msg)
+    if not spec.revision:
+        msg = f"{spec.alias}: no pinned revision; an unpinned model is not served"
+        raise ModelFileError(msg)
+    cache_dir = cache_dir or _default_hub_cache()
+    root = fetch_snapshot(spec.repo_id, spec.revision, cache_dir, patterns=[spec.filename], token=token)
+    path = root / spec.filename
+    if spec.sha256 and verify_files(root, [PinnedFile(path=spec.filename, sha256=spec.sha256)]):
+        actual = sha256_file(path) if path.is_file() else "missing"
+        msg = f"{spec.filename}: sha256 {actual} does not match the expected {spec.sha256}"
+        raise ModelFileError(msg)
+    return path
 
 
 def check_updates(

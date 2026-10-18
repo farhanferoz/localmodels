@@ -38,6 +38,7 @@ class ModelSpec(BaseModel):
     repo_id: str
     filename: str | None = None
     revision: str | None = None  # a pinned Hub revision; None = the default branch
+    sha256: str | None = None  # the SHA-256 of ``filename``, checked by ``resolve_model_file``
     description: str
     licence: str
     osi_approved: bool
