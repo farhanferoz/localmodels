@@ -48,7 +48,7 @@ ECHO = ("echo", "r1")
 
 MESSAGES: list[Message] = [
     LoadMessage(model_dir="/m", revision="abc", options={"extra": "/e"}),
-    LoadedMessage(seconds=1.5, torch_allocated_gib=2.0, torch_reserved_gib=3.0),
+    LoadedMessage(seconds=1.5, torch_allocated_gib=2.0, torch_reserved_gib=3.0, libraries={"torch": "2.9"}),
     InferMessage(request_id="r1", input_dir="/in", params={"sleep_s": 1}),
     ProgressMessage(request_id="r1", stage=ProgressStage.DECODE, new_tokens=4),
     ResultMessage(request_id="r1", raw_text="x", native_outputs={"a": 1}, timings_s={"t": 0.1}),
@@ -95,7 +95,8 @@ def _serve(*lines: bytes) -> list[Message]:
     return [decode(line) for line in out.getvalue().splitlines()]
 
 
-def test_the_server_loop_answers_each_request_until_shutdown() -> None:
+def test_the_server_loop_answers_each_request_until_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("localmodels.serving.server.LIBRARIES", ("pytest", "no-such-distribution"))
     replies = _serve(
         encode(LoadMessage(model_dir="", revision="r")),
         encode(InferMessage(request_id="r1", input_dir="/in", params={"progress": 1})),
@@ -104,6 +105,8 @@ def test_the_server_loop_answers_each_request_until_shutdown() -> None:
         encode(LoadMessage(model_dir="", revision="after-shutdown")),
     )
     assert [r.op.value for r in replies] == ["loaded", "progress", "result", "error"]
+    assert isinstance(replies[0], LoadedMessage)
+    assert replies[0].libraries == {"pytest": pytest.__version__}  # installed ones only, read from metadata
     assert isinstance(replies[2], ResultMessage)
     assert replies[2].raw_text == "/in"
     assert isinstance(replies[3], ErrorMessage)
