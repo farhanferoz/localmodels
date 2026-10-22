@@ -118,7 +118,7 @@ def _dgx_os_version(release_file: Path) -> str:
 def _cuda_driver_version() -> str:
     """The CUDA version the driver supports, by NVML and then nvidia-smi; neither starts a CUDA context."""
     try:
-        raw = _nvml_read(0, lambda nv, _handle: nv.nvmlSystemGetCudaDriverVersion())
+        raw = _nvml_read("0", lambda nv, _handle: nv.nvmlSystemGetCudaDriverVersion())
         return f"{raw // 1000}.{raw % 1000 // 10}"
     except Exception:  # noqa: BLE001,S110 - a failed probe means "try nvidia-smi"
         pass
