@@ -31,7 +31,6 @@ from .lease import GpuLease, GpuLeaseClient, LeaseRecord, ResidentRecord
 from .process import (
     DRAFT_MODEL_ENV,
     DRAFT_MODEL_FLAGS,
-    SPEC_TYPE_FLAG,
     UBATCH_ENV,
     UBATCH_FLAGS,
     LocalModelsError,
@@ -40,8 +39,10 @@ from .process import (
     ServerStatus,
     _is_pid_alive,
     _process_args,
+    adds_ubatch,
     auth_headers,
     build_args,
+    carries_speculation,
     llama_flags,
     llama_option,
     require_key_off_loopback,
@@ -80,6 +81,8 @@ _PROJECTION_RE = re.compile(r"projected to use (\d+) MiB of device memory")
 _FIT_PARAMS_TIMEOUT_S = 600.0
 # The score is set by a shell that then execs the server (same PID): preexec_fn is not thread-safe.
 _OOM_WRAPPER = 'echo {score} > /proc/self/oom_score_adj && exec "$0" "$@"'
+
+_FILE_FLAGS = ("-m", "--api-key-file", *DRAFT_MODEL_FLAGS)
 
 log = logging.getLogger(__name__)
 
@@ -215,6 +218,13 @@ def _open_log(log_path: Path) -> BinaryIO:
     return log_path.open("wb")
 
 
+def _resolved(args: list[str]) -> list[str]:
+    """``args`` with the value of each flag that names a file resolved, so two spellings of one file agree."""
+    return [
+        str(Path(arg).resolve()) if i and args[i - 1] in _FILE_FLAGS else arg for i, arg in enumerate(args)
+    ]
+
+
 def _is_llama_server_on_port(args: list[str], port: int) -> bool:
     """Check if process arguments belong to a llama-server running on the specified port."""
     if not any("llama-server" in a for a in args):
@@ -237,7 +247,14 @@ def _is_llama_server_on_port(args: list[str], port: int) -> bool:
 
 
 class LocalServerManager:
-    """Manages lifecycle, health verification, and process isolation of one local llama-server."""
+    """Manages lifecycle, health verification, and process isolation of one local llama-server.
+
+    With ``settings`` (a llama.cpp answer) it also passes the answer's ``-ub`` and speculation, each group
+    unless the caller's own ``extra_flags`` or ``extra_env`` carry it. The command line a server runs is
+    ``build_args(binary, spec, params, manager.effective_flags)``, not ``manager.extra_flags``. The caller
+    resolves ``answer.settings.model_file`` into ``spec.model_path``; a file the manager does not serve is
+    listed as ``overridden`` in the stamp.
+    """
 
     def __init__(
         self,
@@ -262,6 +279,9 @@ class LocalServerManager:
         available_gib: Callable[[bool], float | None] = _available_gib,
         settings: SettingsAnswer | None = None,
     ) -> None:
+        if settings is not None and settings.engine is not Engine.LLAMA_CPP:
+            msg = f"a llama-server takes a llama.cpp settings answer, not one for {settings.engine.value}"
+            raise ValueError(msg)
         self.guards = guards or MemoryGuards()
         if contention is Contention.STAY_UP and (
             problem := stay_up_problem(self.guards, resident_allowance_gib)
@@ -338,20 +358,22 @@ class LocalServerManager:
         return (*self.extra_flags, *llama_flags(self.settings.settings, self.extra_flags, self.extra_env))
 
     def _applied(self) -> tuple[Settings, list[str]]:
-        """The settings ``llama_flags`` passed, and the groups the caller's own flags or env kept out."""
+        """The settings this server got from the answer, and those the caller's own flags or env set aside."""
         if self.settings is None:
             return Settings(), []
         chosen = self.settings.settings
-        added = llama_flags(chosen, self.extra_flags, self.extra_env)
-        ubatch, speculation = UBATCH_FLAGS[0] in added, SPEC_TYPE_FLAG in added
+        ubatch = adds_ubatch(chosen, self.extra_flags, self.extra_env)
+        speculation = chosen.spec is not None and not carries_speculation(self.extra_flags, self.extra_env)
         applied = Settings(
             n_ubatch=chosen.n_ubatch if ubatch else None,
             spec=chosen.spec if speculation else None,
-            spec_draft_file=chosen.spec_draft_file if speculation else None,
+            spec_draft_file=chosen.spec_draft_file if speculation and speculates(chosen) else None,
         )
+        served = {Path(file.path).name for file in chosen.model_file or ()}
         wanted = (
             ("n_ubatch", chosen.n_ubatch is not None, ubatch),
-            ("spec", speculates(chosen), speculation),
+            ("spec", chosen.spec is not None, speculation),
+            ("model_file", chosen.model_file is not None, self.spec.model_path.name in served),
         )
         return applied, [name for name, asked, passed in wanted if asked and not passed]
 
@@ -359,11 +381,15 @@ class LocalServerManager:
         """How this server is made: llama.cpp's build, the model file, its layout and the host.
 
         ``model_sha256`` is the file's hash when the caller knows it (a ``PinnedFile``); never computed here.
-        ``settings`` is the lookup answer the caller took its settings from, by default this manager's own.
-        The stamp's ``applied`` is what ``llama_flags`` passed to llama-server (nothing if this manager has no
-        answer), and a group the caller's own flags kept out is added to its ``overridden``.
+        ``settings`` is the lookup answer the caller took its settings from; a manager built with an answer
+        stamps that one (a different ``settings`` raises ``ValueError``: this server runs what it was built
+        with). The stamp's ``applied`` is what the answer gave this server (nothing if the manager has no
+        answer), and a group the caller's own flags set aside is added to its ``overridden``.
         """
-        answer = settings or self.settings
+        if settings is not None and self.settings is not None and settings != self.settings:
+            msg = "this server runs the answer its manager was built with; it cannot be stamped with another"
+            raise ValueError(msg)
+        answer = settings if settings is not None else self.settings
         settings_stamp = None
         if answer is not None:
             applied, kept_out = self._applied()
@@ -513,15 +539,30 @@ class LocalServerManager:
                 if Path(data.get("model_path", "")).name == self.spec.model_path.name:
                     if self.settings is not None and not self._runs_as_started_now(args):
                         # a server with other flags would run the old settings under the new answer's stamp
+                        if holders := self._other_holders():
+                            msg = (
+                                f"port {self.spec.port} runs a llama-server started with other arguments and "
+                                f"{', '.join(holders)} holds it; not stopping it"
+                            )
+                            raise LeaseConflictError(msg)
                         await self.stop()
                         return None
                     return ServerHandle(pid=pid, port=self.spec.port, model_path=self.spec.model_path)
         return None
 
+    def _other_holders(self) -> list[str]:
+        """The other projects whose live lease or resident record names this server's port."""
+        port, own = self.spec.port, self.lease.project
+        held = [lease.project for lease in self.lease.live_others() if lease.port == port]
+        return [*held, *(r.project for r in self.lease.residents() if r.port == port and r.project != own)]
+
     def _runs_as_started_now(self, args: list[str]) -> bool:
-        """Whether a running server's arguments are those this manager would start it with (binary aside)."""
+        """Whether a running server's arguments are those this manager would start it with.
+
+        The binary is not compared, and a file given under another spelling of its path is the same file.
+        """
         wanted = build_args(self.binary, self.spec, self.params, self.effective_flags)
-        return args[len(args) - len(wanted) + 1 :] == wanted[1:]
+        return _resolved(args[len(args) - len(wanted) + 1 :]) == _resolved(wanted[1:])
 
     def _check_port_free(self) -> None:
         try:

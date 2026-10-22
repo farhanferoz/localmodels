@@ -69,13 +69,19 @@ def test_llama_flags_leave_a_group_out_whole_when_the_callers_own_flags_or_env_c
     for flags, env in [
         (("-ub", "512"), None),
         (("--ubatch-size=512",), None),
+        (("--ubatch_size", "512"), None),  # llama.cpp reads underscores in a `--` name as dashes
         ((), {"LLAMA_ARG_UBATCH": "5"}),
+        (("-b", "512"), None),  # a smaller batch size caps `-ub`: the caller's own choice stands
+        ((), {"LLAMA_ARG_BATCH": "512"}),
     ]:
         assert llama_flags(chosen, flags, env) == spec
+    assert llama_flags(chosen, ("-b", "4096"), None) == (*ub, *spec)  # a larger one caps nothing
     # any speculation option keeps all of them out: an alias, a tuning knob, a variable of either family
     for flags, env in [
         (("-md", "/x.gguf"), None), (("--draft-max=8",), None), (("--spec-draft-n-min", "1"), None),
         ((), {"LLAMA_ARG_SPEC_TYPE": "ngram-mod"}), ((), {"LLAMA_ARG_DRAFT_MIN": "1"}),
+        (("--spec_type", "ngram-mod"), None), (("--no-spec-draft-backend-sampling",), None),
+        (("-lcd", "cache.bin"), None), (("--lookup-cache-static", "c.bin"), None),
     ]:  # fmt: skip
         assert llama_flags(chosen, flags, env) == ub
     # the value in force: the last flag, either form, over the environment
@@ -86,3 +92,4 @@ def test_llama_flags_leave_a_group_out_whole_when_the_callers_own_flags_or_env_c
     )
     assert llama_option((), {"LLAMA_ARG_UBATCH": "3"}, names, "LLAMA_ARG_UBATCH") == "3"
     assert llama_option(("-c", "8"), None, names, "LLAMA_ARG_UBATCH") is None
+    assert llama_option(("--ubatch_size", "7"), None, names, "LLAMA_ARG_UBATCH") == "7"

@@ -152,9 +152,13 @@ def build_args(
     ]
 
 
-# The flag and variable names below are read from llama.cpp 5aeac37a3, common/arg.cpp: `-ub` at 1679-1684; the
-# speculation options (those marked `.set_spec()`, plus `--spec-default`) at 3996-4780. Re-derive them when
+# The flag and variable names below are read from llama.cpp 5aeac37a3, common/arg.cpp: `-b` and `-ub` at
+# 1672-1684; the speculation options (those marked `.set_spec()`, their negated names such as
+# `--no-spec-draft-backend-sampling` at 4234-4236, `--spec-default`, and the n-gram cache files `-lcs`
+# and `-lcd` at 1627-1640, which set `params.speculative.ngram_cache`) at 3996-4780. Re-derive them when
 # the build in use moves on.
+BATCH_FLAGS: Final = ("-b", "--batch-size")
+BATCH_ENV: Final = "LLAMA_ARG_BATCH"
 UBATCH_FLAGS: Final = ("-ub", "--ubatch-size")
 UBATCH_ENV: Final = "LLAMA_ARG_UBATCH"
 DRAFT_MODEL_FLAGS: Final = ("--spec-draft-model", "-md", "--model-draft")
@@ -194,9 +198,22 @@ SPEC_FLAGS: Final = (
     "--spec-ngram-map-k-size-n", "--spec-ngram-map-k-size-m", "--spec-ngram-map-k-min-hits",
     "--spec-ngram-map-k4v-size-n", "--spec-ngram-map-k4v-size-m", "--spec-ngram-map-k4v-min-hits",
     "--spec-ngram-size-n", "--spec-ngram-size-m", "--spec-ngram-min-hits",
+    "--no-spec-draft-backend-sampling",
+    "-lcs", "--lookup-cache-static", "-lcd", "--lookup-cache-dynamic",
 )  # fmt: skip
 SPEC_ENV_PREFIX: Final = "LLAMA_ARG_SPEC_"
 SPEC_ENV: Final = ("LLAMA_ARG_DRAFT_MAX", "LLAMA_ARG_DRAFT_MIN", "LLAMA_ARG_N_GPU_LAYERS_DRAFT")
+
+
+def _split_flag(token: str) -> tuple[str, str, str]:
+    """``(name, "=" or "", value)`` of one argument, reading the name as llama.cpp does.
+
+    llama.cpp turns every underscore of an argument that starts with ``--`` into a dash before it looks the
+    name up (arg.cpp:826-829), so ``--ubatch_size`` is ``--ubatch-size``. It rejects ``--flag=value``; that
+    form is read here all the same.
+    """
+    name, equals, value = token.partition("=")
+    return (name.replace("_", "-") if name.startswith("--") else name), equals, value
 
 
 def llama_option(
@@ -207,17 +224,17 @@ def llama_option(
     ``--flag value`` and ``--flag=value`` both count; None when neither the flags nor the environment name it.
     """
     value = (env or {}).get(env_name)
-    for i, flag in enumerate(flags):
-        name, equals, tail = flag.partition("=")
-        if equals and name in names:
+    for i, token in enumerate(flags):
+        name, equals, tail = _split_flag(token)
+        if name in names and equals:
             value = tail
-        elif flag in names and i + 1 < len(flags):
+        elif name in names and i + 1 < len(flags):
             value = flags[i + 1]
     return value
 
 
 def _carries(flags: tuple[str, ...], names: tuple[str, ...]) -> bool:
-    return any(flag.partition("=")[0] in names for flag in flags)
+    return any(_split_flag(token)[0] in names for token in flags)
 
 
 def carries_ubatch(flags: tuple[str, ...], env: Mapping[str, str] | None) -> bool:
@@ -230,6 +247,18 @@ def carries_speculation(flags: tuple[str, ...], env: Mapping[str, str] | None) -
     return _carries(flags, SPEC_FLAGS) or any(
         name.startswith(SPEC_ENV_PREFIX) or name in SPEC_ENV for name in (env or {})
     )
+
+
+def adds_ubatch(settings: Settings, flags: tuple[str, ...], env: Mapping[str, str] | None) -> bool:
+    """Whether ``llama_flags`` adds ``-ub``: the answer has one, the caller gave none and no smaller ``-b``.
+
+    llama.cpp runs ``min(n_batch, n_ubatch)`` (llama-context.cpp:334), so a caller's own smaller batch size
+    would cap the answer's ``-ub``: the caller has decided, and the answer's value is not passed.
+    """
+    if settings.n_ubatch is None or carries_ubatch(flags, env):
+        return False
+    batch = llama_option(flags, env, BATCH_FLAGS, BATCH_ENV)
+    return batch is None or not batch.isdigit() or int(batch) >= settings.n_ubatch
 
 
 def speculates(settings: Settings) -> bool:
@@ -245,10 +274,11 @@ def llama_flags(
     """The llama-server flags a settings answer adds to a caller's own: ``-ub`` and speculation.
 
     Each is one group, left out whole when the caller's flags or environment already carry any of it: a
-    caller's ``--spec-type`` beside a record's draft file would start a speculation nobody chose.
+    caller's ``--spec-type`` beside a record's draft file would start a speculation nobody chose. ``none``
+    adds nothing: it is llama.cpp's default.
     """
     flags: list[str] = []
-    if settings.n_ubatch is not None and not carries_ubatch(extra_flags, extra_env):
+    if adds_ubatch(settings, extra_flags, extra_env):
         flags += [UBATCH_FLAGS[0], str(settings.n_ubatch)]
     if speculates(settings) and not carries_speculation(extra_flags, extra_env):
         assert settings.spec is not None  # noqa: S101 - narrowing for mypy; ``speculates`` checked

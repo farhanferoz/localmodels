@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import logging
 import signal
 import tomllib
 from pathlib import Path
@@ -44,15 +45,19 @@ from .launcher import (
 from .lease import DEFAULT_LEASE_DIR, GpuLease
 from .params import derive_serving_params
 from .process import ServerSpec, resolve_llama_server_bin
-from .stack import Engine
+from .stack import Engine, llama_cpp_build
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from .enums import WorkloadKind
     from .process import ServerHandle
+    from .settings import ModelIdentity, TuneRecipe
 
 # Matches the shared GPU-lease protocol doc (service_c/docs/2026-09-15-gpu-lease-protocol.md):
 # "Polls every 30 s" -- service_a's half of the contract this package now implements.
+log = logging.getLogger(__name__)
+
 _DEFAULT_POLL_S = 30.0
 _DEFAULT_PID_DIR = Path("~/.local/state/localmodels/pids").expanduser()
 
@@ -60,33 +65,46 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 
 
-@functools.cache
-def _settings_request_type() -> type[BaseModel]:
-    """``SettingsRequest``, built on first use.
+class SettingsRequest(BaseModel):
+    """What `lookup` needs for a served model: its identity, the kind of work and a tune recipe.
 
-    Its fields come from ``localmodels.settings``, which ``localmodels`` commands that only import this
-    module must not load.
+    Its field types come from ``localmodels.settings``, which ``localmodels`` commands that only import this
+    module must not load, so the class is completed on first use (``_settings_request_type``). Built in a
+    module that has imported ``ModelIdentity`` and ``TuneRecipe``, pydantic completes it from there as well.
     """
-    from .enums import WorkloadKind  # noqa: PLC0415, TC001 - pydantic reads the annotations below at run time
-    from .settings import ModelIdentity, TuneRecipe  # noqa: PLC0415, TC001 - the same, and the lazy import
 
-    class SettingsRequest(BaseModel):
-        """What `lookup` needs for a served model: its identity, the kind of work and a tune recipe."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-        model_config = ConfigDict(frozen=True)
+    model: ModelIdentity
+    kind: WorkloadKind
+    build: str | None = None
+    recipe: TuneRecipe | None = None
 
-        model: ModelIdentity
-        kind: WorkloadKind
-        build: str | None = None
-        recipe: TuneRecipe | None = None
 
+@functools.cache
+def _settings_request_type() -> type[SettingsRequest]:
+    from .enums import WorkloadKind  # noqa: PLC0415 - the types the class above names, loaded on first use
+    from .settings import ModelIdentity, TuneRecipe  # noqa: PLC0415 - the lazy import
+
+    SettingsRequest.model_rebuild(
+        _types_namespace={
+            "ModelIdentity": ModelIdentity,
+            "TuneRecipe": TuneRecipe,
+            "WorkloadKind": WorkloadKind,
+        }
+    )
     return SettingsRequest
 
 
-def __getattr__(name: str) -> Any:
-    if name == "SettingsRequest":
-        return _settings_request_type()
-    raise AttributeError(name)
+def _identity_problem(identity: ModelIdentity, model_path: Path) -> str | None:
+    """Why ``identity`` is not the file served at ``model_path``, or None (a bare revision cannot be told)."""
+    if identity.files:
+        names = sorted({Path(file.path).name for file in identity.files})
+        if model_path.name not in names:
+            return f"settings_request names the files {', '.join(names)}, not {model_path.name}"
+    elif identity.unpinned and Path(identity.unpinned.split("|")[0]) != model_path.expanduser().resolve():
+        return f"settings_request names the path {identity.unpinned.split('|')[0]}, not {model_path}"
+    return None
 
 
 class ServeConfig(BaseModel):
@@ -117,8 +135,12 @@ class ServeConfig(BaseModel):
     #: Memory a stay-up service holds all the time; required with ``Contention.STAY_UP``.
     resident_allowance_gib: float | None = Field(default=None, gt=0)
     #: A ``SettingsRequest`` (or its dict, from TOML): ask `localmodels.settings.lookup` for the model's
-    #: measured settings and start the server with them. Typed loosely so this module does not import it.
-    settings_request: Any = None
+    #: measured settings and start the server with them. At run time the field is untyped so that this module
+    #: does not import the lookup; the validator below builds the request.
+    if TYPE_CHECKING:
+        settings_request: SettingsRequest | None = None
+    else:
+        settings_request: Any = None
 
     @field_validator("settings_request", mode="before")
     @classmethod
@@ -129,6 +151,10 @@ class ServeConfig(BaseModel):
     def _stay_up_needs_its_guards(self) -> ServeConfig:
         if self.contention is Contention.STAY_UP and (
             problem := stay_up_problem(self.guards, self.resident_allowance_gib)
+        ):
+            raise ValueError(problem)
+        if (request := self.settings_request) is not None and (
+            problem := _identity_problem(request.model, self.model_path)
         ):
             raise ValueError(problem)
         return self
@@ -150,9 +176,11 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     if (request := config.settings_request) is not None:
         from .settings import lookup  # noqa: PLC0415 - only a service asking for measured settings loads it
 
+        build = request.build or llama_cpp_build(Path(binary))
         answer = lookup(
-            request.model, request.kind, engine=Engine.LLAMA_CPP, build=request.build, recipe=request.recipe
+            request.model, request.kind, engine=Engine.LLAMA_CPP, build=build, recipe=request.recipe
         )
+        answer.announce(log)
     return LocalServerManager(
         ServerSpec(
             host=config.host,

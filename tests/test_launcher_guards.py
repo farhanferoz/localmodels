@@ -12,8 +12,9 @@ import pytest
 
 from localmodels.launcher import LocalServerManager, MemoryGuards, ServerStartError
 from localmodels.lease import GpuLease
+from localmodels.pinned import PinnedFile
 from localmodels.process import ServerSpec, build_args
-from localmodels.stack import Settings, SpecType
+from localmodels.stack import Engine, Settings, SpecType
 from tests.test_launcher import _answer, _gpu_params, _make_fake_server
 
 if TYPE_CHECKING:
@@ -164,6 +165,15 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         assert server == build_args(plain.binary, plain.spec, plain.params)
         assert plain.stamp().settings is None
 
+        # no answer, but its own `-ub` and draft: still read by nothing, so the lists stay as they were
+        calls.clear()
+        own = ("-ub", "512", "-md", "/x.gguf")
+        owner = _manager(tmp_path, http, guards, _steady(100), health=1, extra_flags=own)
+        await owner.start()
+        await owner.stop()
+        assert [c[1:] for c in calls[:-1]] == [fit[1:]]
+        assert calls[-1] == build_args(owner.binary, owner.spec, owner.params, own)
+
         # an answer: its flags, and a draft model's own projection beside the model's, at the same `-ub`
         calls.clear()
         asked = _manager(
@@ -196,3 +206,39 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         stamped = kept.stamp()
         assert stamped.settings is not None
         assert (stamped.settings.applied, stamped.settings.overridden) == (Settings(), ["n_ubatch", "spec"])
+
+
+async def test_a_stamp_says_what_the_answer_gave_and_what_the_callers_flags_or_the_served_file_set_aside(
+    tmp_path: Path,
+) -> None:
+    def applied_and_overridden(manager: LocalServerManager) -> tuple[Settings, list[str]]:
+        settings = manager.stamp().settings
+        assert settings is not None
+        return settings.applied, settings.overridden
+
+    def with_answer(chosen: dict[str, Any], **extra: Any) -> LocalServerManager:
+        return _manager(tmp_path, http, MemoryGuards(), _steady(100), settings=_answer(**chosen), **extra)
+
+    async with httpx.AsyncClient() as http:
+        both = {"n_ubatch": 2048, "spec": SpecType.DRAFT_MTP}
+        assert applied_and_overridden(with_answer(both)) == (Settings(**both), [])
+        # a smaller batch size of the caller's caps `-ub`: not passed, not stamped
+        capped = with_answer({"n_ubatch": 2048}, extra_flags=("-b", "512"))
+        assert applied_and_overridden(capped) == (Settings(), ["n_ubatch"])
+        # `none` is a choice: applied when it took effect, overridden when the caller's flags replaced it
+        none = {"spec": SpecType.NONE}
+        assert applied_and_overridden(with_answer(none)) == (Settings(spec=SpecType.NONE), [])
+        theirs = with_answer(none, extra_flags=("--spec-type", "ngram-mod"))
+        assert applied_and_overridden(theirs) == (Settings(), ["spec"])
+        # a quantised file the manager does not serve is set aside; the one it serves is not
+        other, same = (PinnedFile(path=name, sha256="ab" * 32) for name in ("other.gguf", "test.gguf"))
+        assert applied_and_overridden(with_answer({"model_file": (other,)})) == (Settings(), ["model_file"])
+        assert applied_and_overridden(with_answer({"model_file": (same,)})) == (Settings(), [])
+        # this server runs one answer: it is not stamped with another, and takes no other engine's
+        manager = with_answer(both)
+        manager.stamp(settings=_answer(**both))
+        with pytest.raises(ValueError, match="built with"):
+            manager.stamp(settings=_answer(n_ubatch=1))
+        python = _answer(**both).model_copy(update={"engine": Engine.PYTORCH})
+        with pytest.raises(ValueError, match=r"llama\.cpp"):
+            _manager(tmp_path, http, MemoryGuards(), _steady(100), settings=python)

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from localmodels import settings
+from localmodels import retune, settings
 from localmodels.cli import main
 from localmodels.enums import DeviceTier, DeviceType, Precision, WorkloadKind
 from localmodels.hardware import HardwareReport
@@ -87,8 +87,13 @@ LEGACY_MEDGEMMA = {
 
 @pytest.fixture(autouse=True)
 def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
-    """A GB10 host whose stack is ``HOST`` (change the returned dict to change it), and an empty store."""
+    """A GB10 host with stack ``HOST`` (change the returned dict to change it), an empty store, no slurm."""
     stack = dict(HOST)
+    monkeypatch.setenv(
+        retune.SUBMIT_ENV, str(tmp_path / "no-submit.py")
+    )  # never the machine's real submit.py
+    monkeypatch.setenv(settings.RETUNE_ENV, settings.RETUNE_ON)  # pytest turns it off unless it is on
+    monkeypatch.delenv(settings.TUNING_ENV, raising=False)
     monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "state"))
     monkeypatch.setattr(settings, "inspect_hardware", lambda: GB10)
     monkeypatch.setattr(settings, "fingerprint", lambda: stack)
@@ -127,7 +132,7 @@ T, S, RL, RO, U = (
 )
 PINNED = SettingsStatus.PINNED
 REC, RUL, DEF = SettingsSource.RECORD, SettingsSource.RULE, SettingsSource.DEFAULT
-NOT_NEEDED, NO_RECIPE, UNAVAILABLE = TuneState.NOT_NEEDED, TuneState.NO_RECIPE, TuneState.NOT_AVAILABLE
+NOT_NEEDED, NO_RECIPE, NO_SCHEDULER = TuneState.NOT_NEEDED, TuneState.NO_RECIPE, TuneState.NO_SCHEDULER
 FULL, CONFIRM = TunePlan.FULL, TunePlan.CONFIRM
 BF16, F32 = Precision.BFLOAT16, Precision.FLOAT32
 RECIPE = TuneRecipe(project="proj", command=("python", "tune.py"))
@@ -211,7 +216,7 @@ CASES = [
         WorkloadKind.K1,
         None,
         {"recipe": RECIPE},
-        expect(RL, RUL, UNAVAILABLE, FULL, n_ubatch=512, rule_applied=True),
+        expect(RL, RUL, NO_SCHEDULER, FULL, n_ubatch=512, rule_applied=True),
         id="rule names this model, recipe given: first-use tune wanted, never tuned",
     ),
     pytest.param(
@@ -243,7 +248,7 @@ CASES = [
         WorkloadKind.K4,
         None,
         {"default": FP32, "recipe": RECIPE},
-        expect(U, DEF, UNAVAILABLE, FULL, dtype=F32),
+        expect(U, DEF, NO_SCHEDULER, FULL, dtype=F32),
         id="kind with no rule values is untuned",
     ),
     pytest.param(
@@ -259,7 +264,7 @@ CASES = [
         WorkloadKind.K1,
         {},
         {"engine": Engine.LLAMA_CPP_PYTHON, "default": FP32},
-        expect(U, DEF, UNAVAILABLE, None, dtype=F32),
+        expect(U, DEF, TuneState.NOT_AVAILABLE, None, dtype=F32),
         id="llama-cpp-python never takes a llama-server record",
     ),
 ]
@@ -346,13 +351,13 @@ def test_a_record_with_a_field_this_version_lacks_is_still_used() -> None:
 def test_service_bs_legacy_file_answers_stale_until_a_stamped_record_exists(tmp_path: Path) -> None:
     legacy = tmp_path / "medgemma-1-5-4b.json"
     legacy.write_text(json.dumps(LEGACY_MEDGEMMA), encoding="utf-8")
-    answer = lookup(MEDGEMMA, WorkloadKind.K5, legacy_path=legacy, recipe=object())
+    answer = lookup(MEDGEMMA, WorkloadKind.K5, legacy_path=legacy, recipe=RECIPE)
     assert answer.status is SettingsStatus.STALE
     assert answer.stale == ["recorded without a stack stamp"]
     assert answer.settings.dtype is Precision.BFLOAT16
     assert answer.record is not None
     assert answer.record.path == str(legacy)
-    assert (answer.tune_plan, answer.tune) == (TunePlan.CONFIRM, TuneState.NOT_AVAILABLE)
+    assert (answer.tune_plan, answer.tune) == (TunePlan.CONFIRM, TuneState.NO_SCHEDULER)
     put(MEDGEMMA, WorkloadKind.K5, candidate="float16", chosen={"dtype": "float16"})
     assert lookup(MEDGEMMA, WorkloadKind.K5, legacy_path=legacy).settings.dtype is Precision.FLOAT16
     legacy.write_text("{", encoding="utf-8")  # a bad legacy file is absent, whichever store it is read after
@@ -689,6 +694,32 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
     assert len(history_files(MEDGEMMA, k6)) == 1
 
 
+def test_an_adopt_in_a_tune_job_tells_the_pending_file_how_it_went(monkeypatch: pytest.MonkeyPatch) -> None:
+    pending = retune.pending_dir() / "0123abcd.json"
+    pending.parent.mkdir(parents=True)
+    pending.write_text(
+        json.dumps({"state": "queued", "at": 1.0, "job": "7", "key": MEDGEMMA.key, "kind": "K5"})
+    )
+    adopt(adoptable())  # not in a tune job: the file is none of its business
+    assert json.loads(pending.read_text())["state"] == "queued"
+    monkeypatch.setenv(settings.TUNE_CHANGE_ENV, "0123abcd")
+    adopt(adoptable(model=QWEN))  # another model's record, adopted by the same job
+    with pytest.raises(AdoptError, match="quality check"):
+        adopt(adoptable(model=QWEN, quality=""))
+    assert json.loads(pending.read_text())["state"] == "queued"
+    with pytest.raises(AdoptError, match="quality check"):
+        adopt(adoptable(quality=""))
+    held = json.loads(pending.read_text())
+    assert (held["state"], held["job"], "quality check" in held["reason"]) == (
+        "measured_not_adopted",
+        "7",
+        True,
+    )
+    adopt(adoptable())  # the file stays, so the same change is never queued again
+    held = json.loads(pending.read_text())
+    assert (held["state"], "bfloat16 measured 2026-10-22" in held["record"]) == ("adopted", True)
+
+
 def test_two_adopts_racing_lose_nothing() -> None:
     barrier = threading.Barrier(8)
 
@@ -788,6 +819,8 @@ def test_importing_localmodels_or_its_cli_does_not_import_the_lookup() -> None:
         "import sys, localmodels, localmodels.cli, localmodels.lease\n"
         "lazy = ('localmodels.settings', 'localmodels.llama_tune')\n"
         "assert not [m for m in sys.modules if m.startswith(lazy)], sorted(sys.modules)\n"
+        "import localmodels.settings\n"
+        "assert 'localmodels.retune' not in sys.modules, 'the lookup imports retune only to queue a tune'\n"
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)  # noqa: S603
     assert done.returncode == 0, done.stderr

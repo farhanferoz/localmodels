@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from localmodels.atomic import write_text_atomically
-from localmodels.enums import Precision, WorkloadKind
+from localmodels.enums import DeviceType, Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
 from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
 from localmodels.pull import _default_hub_cache, _repo_blob_name
@@ -44,6 +44,7 @@ from localmodels.stack import (
     UNKNOWN,
     Engine,
     LoadOptions,
+    RetunePolicy,
     ServerStamp,
     Settings,
     SettingsSource,
@@ -62,6 +63,8 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Iterator, Mapping
 
+    from localmodels.hardware import HardwareReport
+
 STATE_DIR_ENV: Final = "LOCALMODELS_STATE_DIR"
 DEFAULT_STATE_DIR: Final = Path("~/.local/state/localmodels")
 SCHEMA_VERSION: Final = 1
@@ -73,6 +76,21 @@ _ANY_MODEL: Final = "any"  # a rules.md stamp's model= for a training method
 HISTORY_KEPT: Final = 5  # replaced records kept per model and kind
 MIN_PASSES: Final = 2  # timed passes needed to measure a spread
 SPEED_MARGIN: Final = 0.05  # a candidate must beat the incumbent by more than this (and the timing spread)
+TUNING_ENV: Final = "LOCALMODELS_TUNING"  # set to TUNING_ON in a tune job: its loads queue no tune
+TUNING_ON: Final = "1"
+RETUNE_ENV: Final = (
+    "LOCALMODELS_RETUNE"  # any value but ``on`` turns the re-tune off; ``on`` allows it under pytest
+)
+RETUNE_ON: Final = "on"
+PYTEST_ENV: Final = "PYTEST_CURRENT_TEST"  # set by pytest while a test runs
+TUNE_CHANGE_ENV: Final = "LOCALMODELS_TUNE_CHANGE"  # the change a tune job was queued for (``retune.py``)
+#: Enabled only after the first real llama.cpp tune has run through slurm (HL5).
+LLAMA_AUTO_RETUNE: Final = False
+#: The settings fields a tune sets, by engine; a caller whose ``explicit`` holds all has nothing to tune.
+_TUNED_FIELDS: Final = {
+    Engine.PYTORCH: frozenset({"dtype", "options"}),
+    Engine.LLAMA_CPP: frozenset({"n_ubatch", "spec", "spec_draft_file", "model_file"}),
+}
 
 log = logging.getLogger(__name__)
 
@@ -162,7 +180,12 @@ class SettingsRecord(BaseModel):
 
 
 class TuneRecipe(BaseModel):
-    """How a project's tune is run (design 5.4). Data only: the re-tune that would run it is not built."""
+    """How a project's tune is run (design 5.4); ``lookup`` queues ``command`` through slurm when one is due.
+
+    ``command`` measures with ``run_tune`` and ends by adopting its record (``record_from_tune``, ``adopt``).
+    The reference candidate must be timed at least twice (``repeats >= 2``): with one timed pass the speed
+    margin falls back to 5 % and the spread of the timings is unmeasured.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -233,11 +256,6 @@ RULE_VALUES: Final[Mapping[WorkloadKind, _Rule]] = {
     WorkloadKind.K6: _Rule("K6.precision", Settings(dtype=Precision.BFLOAT16)),
 }
 
-_TUNE_REASON: Final = {
-    TuneState.NOT_AVAILABLE: "automatic re-tune is not built yet",
-    TuneState.NO_RECIPE: "the caller gave no recipe",
-}
-
 #: Sentences already written this process, by (model, kind): ``announce`` speaks once.
 _announced: set[tuple[str, WorkloadKind]] = set()
 
@@ -272,7 +290,7 @@ class SettingsAnswer(BaseModel):
     pinned_vs_store: str | None = None  # what the store would answer now, for a pinned answer
     pin_entry: PinEntry | None = None  # the entry a pinned answer was taken from (it has no ``record``)
     pin_problem: str | None = None  # why a pin that was asked for could not be used
-    tune_detail: str | None = None  # the job id or log path behind ``tune``, once a tune can be queued
+    tune_detail: str | None = None  # the job id, log path or reason behind ``tune``
 
     def stamp(self, applied: Settings | None = None) -> SettingsStamp:
         """The part of a result's stamp that says how its settings were decided.
@@ -349,7 +367,8 @@ class SettingsAnswer(BaseModel):
         if self.overridden:
             out.append(f"overridden by explicit: {', '.join(self.overridden)}")
         plan = f" ({self.tune_plan.value} tune wanted)" if self.tune_plan else ""
-        out.append(f"tune: {self.tune.value}{plan}")
+        detail = f" [{self.tune_detail}]" if self.tune_detail else ""
+        out.append(f"tune: {self.tune.value}{detail}{plan}")
         out.append(f"store: {self.store.value}")
         out.extend(f"note: {note}" for note in self.notes)
         return out
@@ -521,6 +540,7 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     default: Settings | None = None,
     libraries: Mapping[str, str] | None = None,
     recipe: TuneRecipe | None = None,
+    retune: RetunePolicy = RetunePolicy.AUTO,
     legacy_path: Path | None = None,
     pin: Path | None = None,
 ) -> SettingsAnswer:
@@ -532,8 +552,13 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     are listed in ``overridden``, so the status still shows that a measured alternative exists. ``default``
     is what the caller runs when nothing measured applies. ``libraries`` are the versions of the caller's own
     libraries (``{"torch": torch.__version__}``): a record that names one at another version is stale; one it
-    does not name is reported, not a reason. ``recipe`` is how a tune is run (the automatic re-tune is not
-    built: a tune the answer calls for reports ``NOT_AVAILABLE``). ``legacy_path`` is the caller's own tune
+    does not name is reported, not a reason. ``recipe`` is how a tune is run: when the answer calls for one
+    (``tune_plan``) and nothing rules it out, the lookup queues one slurm job for the model and change
+    (``retune.py``) and ``tune`` and ``tune_detail`` say what happened. ``retune=RetunePolicy.OFF``, or
+    ``LOCALMODELS_RETUNE`` set to anything but ``on``, queues nothing (``DISABLED``). Under pytest nothing is
+    queued either unless ``LOCALMODELS_RETUNE=on``. ``LOCALMODELS_TUNING=1`` marks a tune job's own loads,
+    which queue nothing.
+    ``legacy_path`` is the caller's own tune
     file, read when the store has no record. ``pin`` is a study's pin file (``_pin``): the first lookup of a
     model, kind and engine writes the answer into it, later ones return that copy as PINNED whatever the
     store says now; ``explicit`` still wins over it. A ``.lock`` file stays beside the pin file; leave it.
@@ -564,19 +589,21 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         source=SettingsSource.DEFAULT,
     )
 
+    report = None  # the hardware probed for the answer
     if engine is Engine.LLAMA_CPP_PYTHON:
         answer.tune = TuneState.NOT_AVAILABLE
         notes.append(f"{name}: llama-cpp-python has no tune path yet; it runs the caller's default settings.")
     else:
-        _from_store(answer, (engine, build, libraries), legacy_path, notes)
+        report = _from_store(answer, (engine, build, libraries), legacy_path, notes)
 
     if pin is not None:
         # the store's problem note, if any, follows the identity notes and still holds when pinned
         _pin(answer, pin, notes, identity_notes + (answer.store is not StoreState.OK))
     # the tune is decided after the pin, which wants none; a tune is submitted from here, never before
-    if answer.tune_plan:
-        answer.tune = _tune_state(answer.tune_plan, recipe)
-        notes.append(f"A {answer.tune_plan.value} tune is wanted; {_TUNE_REASON[answer.tune]}.")
+    if answer.tune_plan and report is not None:
+        answer.tune = TuneState.NOT_NEEDED
+        if note := _decide_tune(answer, answer.tune_plan, (recipe, retune, explicit, build), report):
+            notes.append(f"A {answer.tune_plan.value} tune is wanted; {note}.")
     if explicit:
         answer.settings, answer.overridden = _apply_explicit(answer.settings, explicit)
         notes.append(
@@ -724,12 +751,16 @@ def _from_store(
     asked: tuple[Engine, str | None, Mapping[str, str] | None],
     legacy_path: Path | None,
     notes: list[str],
-) -> None:
-    """The record for this machine (the store's, else ``legacy_path``'s), else the rule or the default."""
+) -> HardwareReport:
+    """The record for this machine (the store's, else ``legacy_path``'s), else the rule or the default.
+
+    Returns the hardware it probed, for the tune decision.
+    """
     engine, build, libraries = asked
     model, kind = answer.model, answer.kind
     name = f"{model.repository} ({kind.value})"
-    hardware = hardware_key(inspect_hardware())
+    report = inspect_hardware()
+    hardware = hardware_key(report)
     path = record_path(model, kind)
     store = read_store(path)
     record = _pick(store.records, hardware, build, engine)
@@ -742,12 +773,13 @@ def _from_store(
         notes.append(f"Settings records for {name} unusable, treated as absent: {store.problem}")
     if record is None:
         _from_rule(answer, notes, hardware)
-        return
+        return report
     compared = build if engine is Engine.LLAMA_CPP else None
     if engine is Engine.LLAMA_CPP and build is None and record.build:
         compared = _current_build()
         notes.append(f"{name}: no llama.cpp build named; the record's build is compared with {compared}.")
     _from_record(answer, record, path, (compared, libraries), notes)
+    return report
 
 
 def _apply_explicit(chosen: Settings, explicit: Mapping[str, Any]) -> tuple[Settings, list[str]]:
@@ -771,10 +803,92 @@ def _current_build(home: str | None = None) -> str:
     return llama_cpp_build(current_server(llama_home(home)))
 
 
-def _tune_state(plan: TunePlan | None, recipe: object | None) -> TuneState:
-    if plan is None:
-        return TuneState.NOT_NEEDED
-    return TuneState.NOT_AVAILABLE if recipe is not None else TuneState.NO_RECIPE
+def _refused_tune(
+    answer: SettingsAnswer,
+    recipe: TuneRecipe | None,
+    retune: RetunePolicy,
+    explicit: Mapping[str, Any] | None,
+    device: DeviceType,
+) -> tuple[TuneState, str] | None:
+    """Why no tune is queued, checked in the order of design 5.1: (state, reason); None: nothing rules it out.
+
+    ``retune`` is compared by value, so a plain ``"off"`` works. ``LOCALMODELS_RETUNE`` set to anything but
+    ``on`` turns the re-tune off (a switch meant to stop GPU jobs fails closed). Under pytest (the variable it
+    sets while a test runs, or its module already imported, as while it collects) a tune is queued only if
+    that variable is ``on``: a test that loads a model would otherwise submit a real job wherever slurm's
+    ``submit.py`` exists.
+    """
+    fields = _TUNED_FIELDS.get(answer.engine)
+    env = os.environ.get(RETUNE_ENV)
+    env_on = env is not None and env.strip().lower() == RETUNE_ON
+    switched_off = env is not None and not env_on
+    under_pytest = (PYTEST_ENV in os.environ or "_pytest" in sys.modules) and not env_on
+    why_off = "the automatic re-tune is off"
+    if switched_off and env is not None and env.strip().lower() != RetunePolicy.OFF:
+        why_off = f"{RETUNE_ENV}={env!r} is not 'on', so the automatic re-tune is off"
+    checks = (
+        (os.environ.get(TUNING_ENV) == TUNING_ON, TuneState.NOT_NEEDED, ""),  # a tune job's own load
+        (retune == RetunePolicy.OFF or switched_off, TuneState.DISABLED, why_off),
+        (
+            bool(fields and explicit and fields <= set(explicit)),
+            TuneState.NOTHING_TO_TUNE,
+            "the caller's explicit settings cover every field a tune sets",
+        ),
+        (recipe is None, TuneState.NO_RECIPE, "the caller gave no recipe"),
+        (
+            fields is None or (answer.engine is Engine.LLAMA_CPP and not LLAMA_AUTO_RETUNE),
+            TuneState.NOT_AVAILABLE,
+            "this engine's automatic re-tune is not enabled",
+        ),
+        (
+            device is DeviceType.CPU,
+            TuneState.NOT_APPLICABLE,
+            "a tune job runs on the GPU; its record is one this CPU lookup never finds",
+        ),
+        (
+            under_pytest,
+            TuneState.DISABLED,
+            f"automatic re-tune is off under pytest; set {RETUNE_ENV}={RETUNE_ON} to test it",
+        ),
+    )
+    return next(((state, reason) for hit, state, reason in checks if hit), None)
+
+
+def _decide_tune(
+    answer: SettingsAnswer,
+    plan: TunePlan,
+    asked: tuple[TuneRecipe | None, RetunePolicy, Mapping[str, Any] | None, str | None],
+    report: HardwareReport,
+) -> str:
+    """Set ``answer.tune`` and ``tune_detail`` for the tune ``plan`` calls for; the sentence for the notes.
+
+    ``asked`` is the lookup's recipe, retune policy, explicit settings and build; ``report`` the hardware
+    probed for the answer. Queues the job (``retune.request``, imported only here) when nothing in
+    ``_refused_tune`` rules it out. Never raises: anything that goes wrong is ``FAILED_BEFORE``.
+    """
+    recipe, retune, explicit, build = asked
+    refused = _refused_tune(answer, recipe, retune, explicit, report.device)
+    if refused is not None:
+        answer.tune = refused[0]
+        return refused[1]
+    assert recipe is not None  # noqa: S101 - narrowing for mypy: no recipe was refused above
+    from localmodels import retune as retune_module  # noqa: PLC0415 - only a lookup that queues a tune
+
+    try:
+        outcome = retune_module.request(
+            answer.model,
+            answer.kind,
+            hardware=hardware_key(report),
+            build=build,
+            plan=plan,
+            stale=answer.stale,
+            recipe=recipe,
+        )
+    except Exception as exc:  # noqa: BLE001 - the re-tune must never fail a model load
+        answer.tune, answer.tune_detail = TuneState.FAILED_BEFORE, f"{type(exc).__name__}: {exc}"
+        return f"the re-tune failed: {answer.tune_detail}"
+    answer.tune, answer.tune_detail = outcome.state, outcome.detail
+    return outcome.note
 
 
 def _from_record(
@@ -939,6 +1053,30 @@ def adopt(record: SettingsRecord) -> SettingsRecord:
             newer localmodels.
         OSError: the record folder or its history cannot be written (a read-only folder, a full disk).
     """
+    change = os.environ.get(TUNE_CHANGE_ENV)
+    try:
+        stored = _adopt(record)
+    except AdoptError as exc:
+        if change:
+            _tell_retune(change, record, str(exc))
+        raise
+    if change:
+        _tell_retune(change, stored, None)
+    return stored
+
+
+def _tell_retune(change: str, record: SettingsRecord, refusal: str | None) -> None:
+    """In a tune job (``LOCALMODELS_TUNE_CHANGE``): tell the change's pending file how the adopt went.
+
+    The file acts only if it was made for this record's model and kind.
+    """
+    from localmodels import retune  # noqa: PLC0415 - only in a tune job
+
+    adopted = f"{_label(record)} measured {record.measured_at.isoformat()}"
+    retune.job_finished(change, key=record.model.key, kind=record.kind, refusal=refusal, record=adopted)
+
+
+def _adopt(record: SettingsRecord) -> SettingsRecord:
     who = f"{record.model.repository} ({record.kind.value})"
     if not record.quality:
         msg = f"{who}: a record with no quality check adopts nothing"
