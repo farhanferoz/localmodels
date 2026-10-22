@@ -272,10 +272,14 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     and are recorded with ``DEADLINE_ERROR``, and the choice is made among those measured.
 
     Raises:
+        ValueError: two candidates have one name (nothing has been measured).
         TuneError: the reference candidate failed, or no candidate is eligible.
         ServingCancelled: ``cancel_check()`` turned true.
         QuietCardTimeoutError: ``quiet_card`` found a service still loaded after its timeout.
     """
+    if len({c.name for c in candidates}) != len(candidates):
+        msg = "Candidate names must be unique: " + ", ".join(c.name for c in candidates)
+        raise ValueError(msg)
     report = hardware or inspect_hardware()
     measurements: list[TuneMeasurement] = []
     reference_outputs: list[ResultMessage] = []

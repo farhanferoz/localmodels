@@ -147,6 +147,8 @@ class SettingsRecord(BaseModel):
     engine: Engine | None = None  # a record made through another engine is not used
     agreement: Agreement | None = None  # the chosen candidate's, against the reference
     reference: str = ""  # the name of the reference candidate
+    # PyTorch tune measurements. Another engine's go in a field of their own: readers ignore unknown fields,
+    # but one that met a different shape here would drop the whole record.
     measurements: list[TuneMeasurement] = Field(default_factory=list)
     previous: str | None = None  # the replaced record's candidate, or its settings described
     tune_job: str | None = None
@@ -315,22 +317,36 @@ def _first_error(exc: ValidationError) -> str:
     return f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
 
 
-def read_store(path: Path) -> StoreRead:
-    """Read one store file; never raises. A bad file, a newer schema or an invalid record is absent."""
+def _load_items(path: Path) -> tuple[list[Any], StoreState, str]:
+    """The raw entries of a store file, its state and what was wrong with it; never raises.
+
+    The schema number is read first: a file whose schema is newer than ``SCHEMA_VERSION`` is
+    ``NEWER_SCHEMA`` whatever else it holds. Without an integer schema the file is ``UNREADABLE``.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        schema, items = payload["schema"], payload["records"]
-        if not isinstance(schema, int) or not isinstance(items, list):
-            msg = "schema is not a number or records is not a list"
+        schema = payload["schema"]
+        if not isinstance(schema, int):
+            msg = "schema is not a number"
+            raise TypeError(msg)
+        if schema > SCHEMA_VERSION:
+            return [], StoreState.NEWER_SCHEMA, f"{path}: schema {schema}, written by a newer localmodels"
+        items = payload["records"]
+        if not isinstance(items, list):
+            msg = "records is not a list"
             raise TypeError(msg)
     except FileNotFoundError:
-        return StoreRead([], StoreState.OK, "")
+        return [], StoreState.OK, ""
     except _BAD_FILE as exc:
-        return StoreRead([], StoreState.UNREADABLE, f"{path}: {exc!r}")
-    if schema > SCHEMA_VERSION:
-        return StoreRead(
-            [], StoreState.NEWER_SCHEMA, f"{path}: schema {schema}, written by a newer localmodels"
-        )
+        return [], StoreState.UNREADABLE, f"{path}: {exc!r}"
+    return items, StoreState.OK, ""
+
+
+def read_store(path: Path) -> StoreRead:
+    """Read one store file; never raises. A bad file, a newer schema or an invalid record is absent."""
+    items, state, problem = _load_items(path)
+    if state is not StoreState.OK:
+        return StoreRead([], state, problem)
     records, problems = [], []
     for index, item in enumerate(items):
         try:
@@ -612,48 +628,82 @@ def _label(record: SettingsRecord) -> str:
     return record.candidate or _describe(record.chosen)
 
 
-def _read_items(path: Path) -> tuple[list[Any], bool]:
-    """The raw entries of a store file, and whether the file was unreadable (then there are none).
-
-    Raises:
-        AdoptError: the file was written by a newer localmodels; it is never written.
-    """
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        schema, items = payload["schema"], payload["records"]
-        if not isinstance(schema, int) or not isinstance(items, list):
-            msg = "schema is not a number or records is not a list"
-            raise TypeError(msg)
-    except FileNotFoundError:
-        return [], False
-    except _BAD_FILE:
-        return [], True
-    if schema > SCHEMA_VERSION:
-        msg = f"{path} has schema {schema}, written by a newer localmodels; it is not overwritten"
-        raise AdoptError(msg)
-    return items, False
-
-
-def _to_history(path: Path, kind: WorkloadKind, texts: list[str]) -> None:
-    """Keep ``texts`` (one record each) in the history of the file at ``path``; the newest few stay."""
+def _to_history(path: Path, kind: WorkloadKind, files: list[bytes]) -> None:
+    """Keep ``files`` (one record each, as stored) in the history of ``path``; the newest few stay."""
     folder = settings_dir() / "history" / path.parent.name / kind.value
+    folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-    for index, text in enumerate(texts):
-        write_text_atomically(folder / f"{stamp}-{index}.json", text)
+    for index, content in enumerate(files):
+        (folder / f"{stamp}-{index}.json").write_bytes(content)
     for old in sorted(folder.glob("*.json"))[:-HISTORY_KEPT]:
         old.unlink()
+
+
+def _unusable_measurement(record: SettingsRecord) -> str:
+    """Why ``record``'s own measurements do not support its candidate; "" if they do or there are none."""
+    if not record.measurements:
+        return ""
+    named = [m for m in record.measurements if m.candidate.name == record.candidate]
+    if not named or not all(_eligible(m) for m in named):
+        return f"the measurements show {record.candidate!r} as missing, failed, not fitting or not agreeing"
+    return ""
+
+
+class _Split(NamedTuple):
+    """A store's entries sorted for an adopt: the ones that stay, the ones that go to history."""
+
+    entries: list[Any]  # raw entries that stay; the new record goes at ``slot`` (None: at the end)
+    slot: int | None
+    history: list[bytes]
+    newest: SettingsRecord | None  # of this hardware and engine, any build
+
+
+def _raw(item: Any) -> bytes:
+    return json.dumps(item, indent=2).encode() + b"\n"
+
+
+def _split(items: list[Any], record: SettingsRecord) -> _Split:
+    """Sort ``items`` for adopting ``record``: the entry of its slot is replaced, every other one stays."""
+    slot_key = (record.hardware, record.build, record.engine)
+    entries: list[Any] = []
+    history: list[bytes] = []
+    here: list[tuple[SettingsRecord, Any]] = []  # this hardware and engine, any build
+    slot = None
+    for item in items:
+        try:
+            old = SettingsRecord.model_validate(item)
+        except ValidationError:
+            entries.append(item)  # another version's entry: kept as it is
+            continue
+        if old.hardware == record.hardware and old.engine in (None, record.engine):
+            here.append((old, item))
+        if (old.hardware, old.build, old.engine) != slot_key:
+            entries.append(item)
+            continue
+        history.append(_raw(item))
+        if slot is None:
+            slot = len(entries)
+            entries.append(None)
+    newest = max(here, key=lambda pair: pair[0].measured_at.timestamp(), default=None)
+    if newest is not None and (newest[0].hardware, newest[0].build, newest[0].engine) != slot_key:
+        history.append(_raw(newest[1]))  # another build's entry stays in the store, and is kept here too
+    return _Split(entries, slot, history, newest[0] if newest else None)
 
 
 def adopt(record: SettingsRecord) -> SettingsRecord:
     """Make ``record`` the current one for its hardware, build and engine; what was stored comes back.
 
-    The replaced entry goes to ``history/`` and its candidate is kept as ``previous``. Every other entry stays
-    exactly as it was, including one this version cannot read (a newer localmodels wrote it). An unreadable
-    file is copied to ``history/`` and replaced. An exclusive lock on the file means two adopts lose nothing.
+    The entry it replaces goes to ``history/``, as does the newest entry of the same hardware and engine
+    (any build) if that is another one; ``previous`` is that newest entry's candidate when the choice changed,
+    else the ``previous`` it already carried. Every other entry stays exactly as it was, including one this
+    version cannot read (a newer localmodels wrote it). An unreadable file is copied byte for byte to
+    ``history/`` and replaced. An exclusive lock on the file means two adopts lose nothing.
 
     Raises:
-        AdoptError: the record has no quality check, its chosen candidate's agreement did not pass, or the
-            file was written by a newer localmodels.
+        AdoptError: the record has no quality check, its chosen candidate's agreement did not pass, its own
+            measurements (if it carries any) do not support its candidate, or the file was written by a
+            newer localmodels.
+        OSError: the record folder or its history cannot be written (a read-only folder, a full disk).
     """
     who = f"{record.model.repository} ({record.kind.value})"
     if not record.quality:
@@ -662,45 +712,40 @@ def adopt(record: SettingsRecord) -> SettingsRecord:
     if record.agreement is None or not record.agreement.passed:
         msg = f"{who}: the chosen candidate's agreement did not pass"
         raise AdoptError(msg)
+    if problem := _unusable_measurement(record):
+        msg = f"{who}: {problem}"
+        raise AdoptError(msg)
     path = record_path(record.model, record.kind)
     with _locked(path):
-        items, unreadable = _read_items(path)
-        if unreadable:
-            _to_history(path, record.kind, [path.read_text(encoding="utf-8", errors="replace")])
-        entries: list[Any] = []
-        replaced: list[tuple[SettingsRecord, Any]] = []
-        slot: int | None = None
-        for item in items:
-            try:
-                old = SettingsRecord.model_validate(item)
-            except ValidationError:
-                entries.append(item)  # another version's entry: kept as it is
-                continue
-            if (old.hardware, old.build, old.engine) != (record.hardware, record.build, record.engine):
-                entries.append(item)
-                continue
-            replaced.append((old, item))
-            if slot is None:
-                slot = len(entries)
-                entries.append(None)
-        previous = _label(replaced[0][0]) if replaced else None
+        items, state, problem = _load_items(path)
+        if state is StoreState.NEWER_SCHEMA:
+            msg = f"{problem}; it is not overwritten"
+            raise AdoptError(msg)
+        entries, slot, history, newest = _split(items, record)
+        if state is StoreState.UNREADABLE:
+            history.append(path.read_bytes())
+        changed = newest is not None and newest.chosen != record.chosen
+        previous = None
+        if newest is not None:
+            previous = _label(newest) if changed else newest.previous
         stored = record.model_copy(update={"previous": previous, "adopted_at": datetime.now(UTC)})
+        entry = stored.model_dump(mode="json")
         if slot is None:
-            entries.append(stored.model_dump(mode="json"))
+            entries.append(entry)
         else:
-            entries[slot] = stored.model_dump(mode="json")
-        if replaced:
-            _to_history(path, record.kind, [json.dumps(item, indent=2) + "\n" for _, item in replaced])
-        payload = {"schema": SCHEMA_VERSION, "records": entries}
-        write_text_atomically(path, json.dumps(payload, indent=2) + "\n")
-    changed = bool(replaced) and replaced[0][0].chosen != stored.chosen
+            entries[slot] = entry
+        if history:
+            _to_history(path, record.kind, history)
+        write_text_atomically(
+            path, json.dumps({"schema": SCHEMA_VERSION, "records": entries}, indent=2) + "\n"
+        )
     log.log(
         logging.WARNING if changed else logging.INFO,
         "settings for %s (%s) %s: %s%s, agreement %.3f (%s)",
         record.model.repository,
         record.kind.value,
         "changed" if changed else "adopted",
-        f"{previous} -> " if changed else "",
+        f"{_label(newest)} -> " if changed and newest else "",
         _label(stored),
         record.agreement.score,
         record.quality,
@@ -737,19 +782,30 @@ def record_from_tune(
     libraries: Mapping[str, str] | None = None,
     recipe_project: str | None = None,
     tune_job: str | None = None,
+    legacy_path: Path | None = None,
 ) -> SettingsRecord:
     """The store record for a PyTorch ``tune``, after the speed margin of design 5.5; adopt it with ``adopt``.
 
-    The incumbent is the candidate the store holds for this hardware if this tune measured it and it is
-    eligible, else the reference. A candidate other than the reference or the incumbent is chosen only if it
-    beats the incumbent's median inference time by more than the larger of ``SPEED_MARGIN`` and the
-    reference's timing spread; otherwise the incumbent stays, so timing noise cannot change the settings.
-    ``libraries`` are the caller's versions, added for names the tune's server did not report.
+    The incumbent is the candidate the store holds for this hardware (else ``legacy_path``'s, as ``lookup``
+    reads it) if this tune measured it and it is eligible, else the reference. A candidate other than the
+    reference or the incumbent is chosen only if its median inference time beats the incumbent's by more than
+    the larger of ``SPEED_MARGIN`` and the reference's timing spread (whole passes, as a fraction of the
+    quickest); otherwise the incumbent stays, so timing noise cannot change the settings. ``libraries`` are
+    the caller's versions, added for names the tune's server did not report.
+
+    Raises:
+        AdoptError: the tune's chosen candidate is not an eligible measurement (it failed, does not fit or
+            did not agree).
     """
     by_name = {m.candidate.name: m for m in tune.measurements}
-    chosen = by_name[tune.chosen.name]
-    store = read_store(record_path(model, kind))
-    stored = _pick(store.records, tune.hardware, None, Engine.PYTORCH)
+    chosen = next((m for m in tune.measurements if m.candidate == tune.chosen), None)
+    if _eligible(chosen) is None or chosen is None:
+        msg = f"{model.repository} ({kind.value}): the tune's choice {tune.chosen.name!r} is not eligible"
+        raise AdoptError(msg)
+    records = read_store(record_path(model, kind)).records
+    stored = _pick(records, tune.hardware, None, Engine.PYTORCH)
+    if stored is None and legacy_path is not None:
+        stored = _pick(_read_legacy(legacy_path, model, kind).records, tune.hardware, None, Engine.PYTORCH)
     incumbent = _eligible(by_name.get(stored.candidate) if stored else None) or _eligible(
         by_name.get(tune.reference)
     )
@@ -757,7 +813,15 @@ def record_from_tune(
         assert chosen.infer_s_median is not None  # noqa: S101 - narrowing for mypy; the tune chose an eligible one
         assert incumbent.infer_s_median is not None  # noqa: S101
         faster = incumbent.infer_s_median / chosen.infer_s_median - 1
-        if faster <= max(SPEED_MARGIN, _timing_spread(by_name[tune.reference])):
+        reference = by_name[tune.reference]
+        if len(reference.pass_s) < MIN_PASSES:
+            log.info(
+                "%s (%s): the reference was timed once, so its spread is not measured; only %.0f %% applies",
+                model.repository,
+                kind.value,
+                SPEED_MARGIN * 100,
+            )
+        if faster <= max(SPEED_MARGIN, _timing_spread(reference)):
             chosen = incumbent
     return SettingsRecord(
         model=model,

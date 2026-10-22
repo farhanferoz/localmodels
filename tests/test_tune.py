@@ -49,9 +49,14 @@ FAST_BUT_WRONG = TuneCandidate(name="fp16", dtype=Precision.FLOAT16, options={"t
 BROKEN = TuneCandidate(name="bad", dtype=Precision.FLOAT16, options={"fail_dtype": "float16"})
 
 
-def tune(*candidates: TuneCandidate, repeats: int = 1, deadline: float | None = None) -> TuneRecord:
+def tune(
+    *candidates: TuneCandidate,
+    repeats: int = 1,
+    deadline: float | None = None,
+    inputs: list[InferMessage] = INPUTS,
+) -> TuneRecord:
     return run_tune(
-        argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=INPUTS, candidates=candidates,
+        argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=inputs, candidates=candidates,
         quality=text_agreement(0.9), quality_name="text 0.9", headroom_gib=0.0, hardware=CPU,
         repeats=repeats, deadline=deadline,
     )  # fmt: skip
@@ -72,11 +77,12 @@ def test_the_fastest_candidate_that_passes_quality_is_chosen() -> None:
 
 
 def test_the_reference_reports_its_libraries_and_each_timed_pass_is_totalled() -> None:
-    record = tune(SLOW, FAST, repeats=2)
+    two_inputs = [*INPUTS, InferMessage(request_id="b", input_dir="the second input")]
+    record = tune(SLOW, FAST, repeats=2, inputs=two_inputs)
     assert record.libraries == {"torch": "9.9"}
     reference = record.measurements[0]
-    assert len(reference.pass_s) == 2
-    assert sum(reference.pass_s) == pytest.approx(sum(reference.infer_s))  # one input per pass
+    times = reference.infer_s
+    assert reference.pass_s == pytest.approx([times[0] + times[1], times[2] + times[3]])
 
 
 def test_a_deadline_stops_new_candidates_but_never_the_reference_and_keeps_what_was_measured() -> None:
@@ -96,10 +102,12 @@ def test_a_candidate_that_cannot_run_is_recorded_and_skipped() -> None:
     assert record.chosen.name == "bf16"
 
 
-def test_a_reference_that_cannot_run_ends_the_tune() -> None:
+def test_a_reference_that_cannot_run_or_two_candidates_of_one_name_end_the_tune() -> None:
     reference = TuneCandidate(name="fp32", dtype=Precision.FLOAT32, options={"fail_dtype": "float32"})
     with pytest.raises(TuneError, match="Reference candidate fp32 failed"):
         tune(reference, FAST)
+    with pytest.raises(ValueError, match="unique"):
+        tune(SLOW, FAST, FAST.model_copy(update={"dtype": Precision.FLOAT16}))
 
 
 def test_score_agreement_uses_rank_correlation_with_ties_and_the_largest_difference() -> None:

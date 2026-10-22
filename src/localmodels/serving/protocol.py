@@ -68,7 +68,9 @@ class LoadedMessage(_Message):
     torch_allocated_gib: float
     torch_reserved_gib: float
     #: Library versions the server runs (``server.LIBRARIES``); here, not in ``ready``, so that a client of
-    #: an older localmodels still reads ``ready`` and refuses by version before it meets this field.
+    #: an older localmodels still reads ``ready`` and refuses by version before it meets this field. That
+    #: needs the version number to have moved: a client with the same version cannot read this field and
+    #: reports a malformed message.
     libraries: dict[str, str] = Field(default_factory=dict)
 
 

@@ -463,13 +463,22 @@ def test_adoption_needs_a_quality_check_and_a_passed_agreement_and_never_writes_
     for refused in (adoptable(quality=""), adoptable(agreement=None), adoptable(agreement=failed)):
         with pytest.raises(AdoptError, match=r"quality check|agreement"):
             adopt(refused)
+    unfit = [measured("bfloat16", Precision.BFLOAT16, 0.5, fits=False)]
+    with pytest.raises(AdoptError, match="measurements show 'bfloat16'"):
+        adopt(adoptable(measurements=unfit))  # its own measurement says it does not fit
     path = record_path(MEDGEMMA, K5)
     assert not path.exists()
     path.parent.mkdir(parents=True)
-    path.write_text('{"schema": 2, "records": []}')
-    with pytest.raises(AdoptError, match="newer localmodels"):
-        adopt(adoptable())
-    assert path.read_text() == '{"schema": 2, "records": []}'
+    for newer in (
+        '{"schema": 2, "records": []}',
+        '{"schema": 2, "entries": []}',
+        '{"schema": 3, "records": {}}',
+    ):
+        path.write_text(newer)  # a newer layout is never taken for a damaged file
+        with pytest.raises(AdoptError, match="newer localmodels"):
+            adopt(adoptable())
+        assert path.read_text() == newer
+        assert read_store(path).state is StoreState.NEWER_SCHEMA
 
 
 def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
@@ -493,7 +502,7 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
         ):
             adopt(adoptable(dtype=dtype))
         again = adopt(adoptable(dtype=Precision.FLOAT32))
-    assert again.previous == "float32"
+    assert again.previous == "bfloat16"  # unchanged: it keeps the change before it, not its own candidate
     records = json.loads(path.read_text())["records"]
     assert [records[0], records[1]] == [future, other]  # entries it does not own stay exactly as they were
     assert [r["candidate"] for r in records[2:]] == ["float32"]  # one entry for this slot, replaced
@@ -502,10 +511,20 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
     assert changes[0].startswith("settings for google/medgemma-1.5-4b-it (K5) changed: bfloat16 -> float32, ")
     assert "agreement 0.907 (text 0.9)" in changes[0]
     assert len(changes) == 5  # the last choice was unchanged: it only says it was adopted
-    path.write_text("not json at all")
-    adopt(adoptable())
-    assert any(f.read_text() == "not json at all" for f in history_files(MEDGEMMA, K5))
-    assert [r.candidate for r in read_store(path).records] == ["bfloat16"]
+    for damaged in (b'{"version": 2, "records": []}', b"\xff\xfe not text"):
+        path.write_bytes(damaged)  # no schema number: unreadable, so copied byte for byte and replaced
+        adopt(adoptable())
+        assert damaged in [f.read_bytes() for f in history_files(MEDGEMMA, K5)]
+        assert [r.candidate for r in read_store(path).records] == ["bfloat16"]
+    k6 = WorkloadKind.K6  # a new build writes beside the old build's entry, and still reports the change
+    adopt(adoptable(kind=k6, build="aaa1111"))
+    with caplog.at_level(logging.WARNING, logger="localmodels.settings"):
+        caplog.clear()
+        moved = adopt(adoptable(kind=k6, build="bbb2222", dtype=Precision.FLOAT32))
+    assert moved.previous == "bfloat16"
+    assert [r.build for r in read_store(record_path(MEDGEMMA, k6)).records] == ["aaa1111", "bbb2222"]
+    assert "changed: bfloat16 -> float32" in caplog.text
+    assert len(history_files(MEDGEMMA, k6)) == 1
 
 
 def test_two_adopts_racing_lose_nothing() -> None:
@@ -524,37 +543,62 @@ def test_two_adopts_racing_lose_nothing() -> None:
 
 
 def measured(name: str, dtype: Precision, median: float, **fields: Any) -> TuneMeasurement:
-    return TuneMeasurement(
-        candidate=TuneCandidate(name=name, dtype=dtype), infer_s=[median], infer_s_median=median,
-        peak_gib=1.0, agreement=PASSED, fits=True, **fields,
+    return TuneMeasurement.model_validate(
+        {
+            "candidate": TuneCandidate(name=name, dtype=dtype), "infer_s": [median],
+            "infer_s_median": median, "peak_gib": 1.0, "agreement": PASSED, "fits": True, **fields,
+        }
     )  # fmt: skip
 
 
-def tune_of(fast_median: float, reference_passes: list[float]) -> TuneRecord:
-    """float32 (reference, 1.0 s), bfloat16 (0.5 s; the store's incumbent) and float16 (``fast_median``)."""
+def tune_of(medians: dict[str, float], passes: list[float] | None = None, failed: str = "") -> TuneRecord:
+    """The candidates named in ``medians`` (the first is the reference) timed so; ``failed`` did not agree."""
     ms = [
-        measured("float32", Precision.FLOAT32, 1.0, pass_s=reference_passes),
-        measured("bfloat16", Precision.BFLOAT16, 0.5),
-        measured("float16", Precision.FLOAT16, fast_median),
-    ]
-    best = min(ms, key=lambda m: m.infer_s_median or 0)
+        measured(
+            name, Precision(name), median, pass_s=passes or [] if index == 0 else [],
+            **({"agreement": PASSED.model_copy(update={"passed": False})} if name == failed else {}),
+        )
+        for index, (name, median) in enumerate(medians.items())
+    ]  # fmt: skip
+    best = min((m for m in ms if m.agreement and m.agreement.passed), key=lambda m: m.infer_s_median or 0)
     return TuneRecord(
         hardware=GB10_KEY, localmodels_version="0.6.0", measured_at=datetime(2026, 10, 22, tzinfo=UTC),
-        reference="float32", quality="text 0.9", chosen=best.candidate, measurements=ms, stack=HOST,
-        libraries={"torch": "2.9"},
+        reference=next(iter(medians)), quality="text 0.9", chosen=best.candidate, measurements=ms,
+        stack=HOST, libraries={"torch": "2.9"},
     )  # fmt: skip
 
 
-def test_a_faster_candidate_displaces_the_incumbent_only_beyond_the_margin_and_the_timing_spread() -> None:
+F32, B16, F16 = "float32", "bfloat16", "float16"
+
+
+def test_a_faster_candidate_displaces_the_incumbent_only_beyond_the_margin_and_the_timing_spread(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     put(MEDGEMMA, K5, candidate="bfloat16", engine="pytorch")  # the incumbent
     ask = {"model": MEDGEMMA, "kind": K5, "libraries": {"torch": "2.8", "transformers": "5.0"}}
-    cases = [(0.485, [1.0]), (0.45, [1.0]), (0.45, [1.0, 1.2])]
-    assert [record_from_tune(tune_of(fast, passes), **ask).candidate for fast, passes in cases] == [
-        "bfloat16",  # 3 % faster than the incumbent
-        "float16",  # 11 % faster
-        "bfloat16",  # 11 % faster, but the reference's two passes differ by 20 %
+    cases = [  # medians by candidate, reference passes, candidate not agreeing, chosen, spread noted
+        ({F32: 1.0, B16: 0.5, F16: 0.485}, [1.0], "", B16, True),  # 3 % faster than the incumbent
+        ({F32: 1.0, B16: 0.5, F16: 0.45}, [1.0], "", F16, True),  # 11 % faster
+        ({F32: 1.0, B16: 0.5, F16: 0.45}, [1.0, 1.2], "", B16, False),  # the reference's passes differ 20 %
+        ({F32: 1.0, B16: 0.5, F16: 0.485}, [1.0], B16, F16, True),  # the incumbent did not agree: float32 is
+        (
+            {F32: 1.0, F16: 0.97},
+            [1.0],
+            "",
+            F32,
+            True,
+        ),  # the incumbent was not measured: float32 is, 3 % ahead
+        ({F32: 0.49, B16: 0.5, F16: 0.6}, [1.0], "", F32, False),  # the reference wins without the margin
     ]
-    record = record_from_tune(tune_of(0.45, [1.0]), **ask, recipe_project="service_b", tune_job="12")
+    for medians, passes, failed, expected, noted in cases:
+        with caplog.at_level(logging.INFO, logger="localmodels.settings"):
+            caplog.clear()
+            chosen = record_from_tune(tune_of(medians, passes, failed), **ask).candidate
+        assert (medians, chosen) == (medians, expected)
+        assert ("spread is not measured" in caplog.text) is noted
+    record = record_from_tune(
+        tune_of({F32: 1.0, B16: 0.5, F16: 0.45}), **ask, recipe_project="service_b", tune_job="12"
+    )
     assert (record.chosen, record.engine, record.agreement) == (
         Settings(dtype=Precision.FLOAT16),
         Engine.PYTORCH,
@@ -564,6 +608,16 @@ def test_a_faster_candidate_displaces_the_incumbent_only_beyond_the_margin_and_t
         "float32", 3, "service_b", "12",
     )  # fmt: skip
     assert record.libraries == {"torch": "2.9", "transformers": "5.0"}  # the tune's own report wins
+    unfit = tune_of({F32: 1.0, F16: 0.4})
+    unfit.measurements[1].fits = False
+    with pytest.raises(AdoptError, match="not eligible"):
+        record_from_tune(unfit, **ask)  # a choice that does not fit is never recorded
+    record_path(MEDGEMMA, K5).unlink()  # no stored record: the caller's own file holds the incumbent
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(LEGACY_MEDGEMMA))
+    close = tune_of({F32: 1.0, B16: 0.5, F16: 0.485}, [1.0])
+    assert record_from_tune(close, **ask, legacy_path=legacy).candidate == B16
+    assert record_from_tune(close, **ask).candidate == F16
 
 
 def test_importing_localmodels_or_its_cli_does_not_import_the_lookup() -> None:
