@@ -79,6 +79,7 @@ class SettingsStatus(StrEnum):
     RULE = "rule"  # no record; the rule was measured on this model, but not on this file and machine
     RULE_OTHER_MODEL = "rule-other-model"  # no record; the rule was measured on other models only
     UNTUNED = "untuned"  # nothing measured applies
+    PINNED = "pinned"  # a study's own copy of an earlier answer, kept whatever the store says now
 
 
 class SettingsSource(StrEnum):
@@ -87,6 +88,7 @@ class SettingsSource(StrEnum):
     RECORD = "record"
     RULE = "rule"
     DEFAULT = "default"
+    PIN = "pin"
 
 
 class TuneState(StrEnum):
@@ -146,6 +148,41 @@ class LoadOptions(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class SettingsStamp(BaseModel):
+    """How a result's settings were decided: what ran, where it came from and how far it could be trusted.
+
+    ``record_id`` is the store file and the time the record was measured (``<path>@<ISO time>``);
+    ``rule`` is the id of the rule that answered; ``stale`` is one line per changed part of the stack;
+    ``overridden`` names the fields the caller's own settings replaced; ``pinned`` is the pin file the
+    answer came from or was written to; ``changed_from`` is the previous choice's name when a re-tune
+    changed it; ``recipe_project`` is the project whose inputs made the record.
+
+    For a pinned answer ``status`` is PINNED and ``pinned_status`` is the status the pinned settings had when
+    they were pinned, with ``record_id``, ``rule``, ``stale`` and ``recipe_project`` as they were then: a
+    result pinned from an untuned answer still reads untuned. ``pin_problem`` says why a pin that was asked
+    for could not be used (the answer is then not pinned). ``tune_detail`` is the job id or log path of a
+    queued or failed tune.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: SettingsStatus
+    source: SettingsSource
+    applied: Settings
+    record_id: str | None = None
+    rule: str | None = None
+    stale: list[str] = Field(default_factory=list)
+    tune: TuneState
+    store: StoreState
+    overridden: list[str] = Field(default_factory=list)
+    pinned: str | None = None
+    pinned_status: SettingsStatus | None = None
+    pin_problem: str | None = None
+    tune_detail: str | None = None
+    changed_from: str | None = None
+    recipe_project: str | None = None
+
+
 class ServerStamp(BaseModel):
     """How a result's server was made: engine, build, model file, layout or load options, and the host.
 
@@ -162,6 +199,9 @@ class ServerStamp(BaseModel):
     layout: LlamaLayout | None = None
     load: LoadOptions | None = None
     host: dict[str, str]
+    # set by a caller that took its settings from a lookup; left out of a dump when None, so a caller with
+    # no settings keeps the JSON it always had
+    settings: SettingsStamp | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _read_text(path: Path) -> str | None:

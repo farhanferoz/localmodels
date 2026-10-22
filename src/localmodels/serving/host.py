@@ -23,13 +23,14 @@ from localmodels.hardware import available_memory
 from localmodels.lease import LeaseRecord, ResidentRecord
 from localmodels.serving.client import ModelServerProcess
 from localmodels.serving.errors import ServingError, ServingErrorCode
-from localmodels.stack import Engine, LoadOptions, ServerStamp, fingerprint
+from localmodels.stack import Engine, LoadOptions, ServerStamp, Settings, fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence
 
     from localmodels.lease import GpuLeaseClient
     from localmodels.serving.protocol import LoadMessage
+    from localmodels.settings import SettingsAnswer
 
 LOW_MEMORY: Final = "low available memory"
 """What ``yield_if_requested`` returns, instead of a project, when a stay-up host unloads for memory."""
@@ -217,10 +218,14 @@ class ModelHost:
             raise
         return server
 
-    def stamp(self, model_sha256: str | None = None) -> ServerStamp | None:
+    def stamp(
+        self, model_sha256: str | None = None, settings: SettingsAnswer | None = None
+    ) -> ServerStamp | None:
         """How the warm server was made (its load's model directory, precision, options); None with no server.
 
         ``model_sha256`` is the model's hash when the caller knows it; it is never computed here.
+        ``settings`` is the lookup answer the caller took its settings from; its stamp is attached, with
+        what this load really used (its precision and options) as the settings applied.
         """
         if self._server is None or self._load is None:
             return None
@@ -231,6 +236,9 @@ class ModelHost:
             model_sha256=model_sha256,
             load=LoadOptions(dtype=self._load.dtype, options=self._load.options),
             host=fingerprint(),
+            settings=settings.stamp(Settings(dtype=self._load.dtype, options=self._load.options))
+            if settings
+            else None,
         )
 
     def finished(self) -> None:
