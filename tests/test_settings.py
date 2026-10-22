@@ -786,7 +786,8 @@ def test_importing_localmodels_or_its_cli_does_not_import_the_lookup() -> None:
     """In a fresh interpreter: slurm's lease keeper imports this package and must not pay for the lookup."""
     code = (
         "import sys, localmodels, localmodels.cli, localmodels.lease\n"
-        "assert not [m for m in sys.modules if m.startswith('localmodels.settings')], sorted(sys.modules)\n"
+        "lazy = ('localmodels.settings', 'localmodels.llama_tune')\n"
+        "assert not [m for m in sys.modules if m.startswith(lazy)], sorted(sys.modules)\n"
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)  # noqa: S603
     assert done.returncode == 0, done.stderr
