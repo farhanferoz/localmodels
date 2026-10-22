@@ -484,18 +484,24 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
         first = adopt(adoptable())
         assert (first.previous, first.adopted_at is not None) == (None, True)
         assert history_files(MEDGEMMA, K5) == []
-        for dtype in (Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT32, Precision.BFLOAT16):
+        for dtype in (
+            Precision.FLOAT32,
+            Precision.BFLOAT16,
+            Precision.FLOAT32,
+            Precision.BFLOAT16,
+            Precision.FLOAT32,
+        ):
             adopt(adoptable(dtype=dtype))
-        again = adopt(adoptable(dtype=Precision.BFLOAT16))
-    assert again.previous == "bfloat16"
+        again = adopt(adoptable(dtype=Precision.FLOAT32))
+    assert again.previous == "float32"
     records = json.loads(path.read_text())["records"]
     assert [records[0], records[1]] == [future, other]  # entries it does not own stay exactly as they were
-    assert [r["candidate"] for r in records[2:]] == ["bfloat16"]  # one entry for this slot, replaced
+    assert [r["candidate"] for r in records[2:]] == ["float32"]  # one entry for this slot, replaced
     assert len(history_files(MEDGEMMA, K5)) == 5  # six were replaced; the oldest was deleted
     changes = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert changes[0].startswith("settings for google/medgemma-1.5-4b-it (K5) changed: bfloat16 -> float32, ")
     assert "agreement 0.907 (text 0.9)" in changes[0]
-    assert len(changes) == 4  # the unchanged choice only says it was adopted
+    assert len(changes) == 5  # the last choice was unchanged: it only says it was adopted
     path.write_text("not json at all")
     adopt(adoptable())
     assert any(f.read_text() == "not json at all" for f in history_files(MEDGEMMA, K5))
