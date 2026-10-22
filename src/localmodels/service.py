@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import signal
 import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .hardware import inspect_hardware
 from .launcher import (
@@ -43,6 +44,7 @@ from .launcher import (
 from .lease import DEFAULT_LEASE_DIR, GpuLease
 from .params import derive_serving_params
 from .process import ServerSpec, resolve_llama_server_bin
+from .stack import Engine
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -56,6 +58,35 @@ _DEFAULT_PID_DIR = Path("~/.local/state/localmodels/pids").expanduser()
 
 EXIT_OK = 0
 EXIT_ERROR = 1
+
+
+@functools.cache
+def _settings_request_type() -> type[BaseModel]:
+    """``SettingsRequest``, built on first use.
+
+    Its fields come from ``localmodels.settings``, which ``localmodels`` commands that only import this
+    module must not load.
+    """
+    from .enums import WorkloadKind  # noqa: PLC0415, TC001 - pydantic reads the annotations below at run time
+    from .settings import ModelIdentity, TuneRecipe  # noqa: PLC0415, TC001 - the same, and the lazy import
+
+    class SettingsRequest(BaseModel):
+        """What `lookup` needs for a served model: its identity, the kind of work and a tune recipe."""
+
+        model_config = ConfigDict(frozen=True)
+
+        model: ModelIdentity
+        kind: WorkloadKind
+        build: str | None = None
+        recipe: TuneRecipe | None = None
+
+    return SettingsRequest
+
+
+def __getattr__(name: str) -> Any:
+    if name == "SettingsRequest":
+        return _settings_request_type()
+    raise AttributeError(name)
 
 
 class ServeConfig(BaseModel):
@@ -85,6 +116,14 @@ class ServeConfig(BaseModel):
     guards: MemoryGuards = Field(default_factory=MemoryGuards)
     #: Memory a stay-up service holds all the time; required with ``Contention.STAY_UP``.
     resident_allowance_gib: float | None = Field(default=None, gt=0)
+    #: A ``SettingsRequest`` (or its dict, from TOML): ask `localmodels.settings.lookup` for the model's
+    #: measured settings and start the server with them. Typed loosely so this module does not import it.
+    settings_request: Any = None
+
+    @field_validator("settings_request", mode="before")
+    @classmethod
+    def _as_settings_request(cls, value: Any) -> Any:
+        return None if value is None else _settings_request_type().model_validate(value)
 
     @model_validator(mode="after")
     def _stay_up_needs_its_guards(self) -> ServeConfig:
@@ -107,6 +146,13 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     params = derive_serving_params(hardware.device, hardware.total_memory_gb)
     binary = config.binary or resolve_llama_server_bin()
     lease = GpuLease(config.lease_dir, project=config.project)
+    answer = None
+    if (request := config.settings_request) is not None:
+        from .settings import lookup  # noqa: PLC0415 - only a service asking for measured settings loads it
+
+        answer = lookup(
+            request.model, request.kind, engine=Engine.LLAMA_CPP, build=request.build, recipe=request.recipe
+        )
     return LocalServerManager(
         ServerSpec(
             host=config.host,
@@ -126,6 +172,7 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
         extra_env=config.extra_env,
         guards=config.guards,
         resident_allowance_gib=config.resident_allowance_gib,
+        settings=answer,
     )
 
 
