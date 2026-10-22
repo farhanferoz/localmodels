@@ -12,13 +12,17 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import logging
 import os
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
+from localmodels.enums import WorkloadKind
 from localmodels.launcher import (
     Contention,
     LeaseConflictError,
@@ -29,7 +33,12 @@ from localmodels.launcher import (
 )
 from localmodels.lease import GpuLease, QuietRequest
 from localmodels.process import ServerHandle
-from localmodels.service import ServeConfig, load_serve_config, run_serve
+from localmodels.service import ServeConfig, _build_manager, load_serve_config, run_serve
+from localmodels.stack import Engine
+from tests.test_launcher import _answer
+
+if TYPE_CHECKING:
+    from localmodels.settings import SettingsAnswer
 
 _OTHER_LEASE_HELD_S = 0.3
 
@@ -351,3 +360,44 @@ def test_stay_up_refused_for_memory_waits_and_retries_instead_of_exiting(tmp_pat
     assert asyncio.run(asyncio.wait_for(serve, timeout=5)) is SupervisorExit.STOPPED
     assert len(starts) == 3
     assert min(b - a for a, b in itertools.pairwise(starts)) >= config.poll_s  # paced, never a tight loop
+
+
+def test_a_settings_request_is_looked_up_for_the_manager_and_only_when_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    request = {"model": {"repository": "org/model", "unpinned": "/m.gguf|1|2"}, "kind": "K5"}
+    asked: list[dict[str, object]] = []
+
+    def lookup(model: object, kind: object, **kwargs: object) -> SettingsAnswer:
+        asked.append({"model": model, "kind": kind, **kwargs})
+        return _answer().model_copy(update={"notes": ["a note from the lookup"]})
+
+    monkeypatch.setattr("localmodels.settings.lookup", lookup)
+    monkeypatch.setattr("localmodels.service.llama_cpp_build", lambda _binary: "built1")
+    config = ServeConfig(
+        port=8091,
+        model_path=Path("/m.gguf"),
+        project="p",
+        binary=tmp_path / "llama-server",
+        device_override="cpu",
+    )
+    assert _build_manager(config, httpx.AsyncClient()).settings is None
+    assert asked == []
+
+    # the build asked about is the binary's own unless the request names one; the notes reach the log
+    for named, build in [(None, "built1"), ("abc1234", "abc1234")]:
+        asked.clear()
+        asking = ServeConfig(**{**config.model_dump(), "settings_request": {**request, "build": named}})
+        manager = _build_manager(asking, httpx.AsyncClient())
+        assert manager.settings is not None
+        (call,) = asked
+        assert (call["kind"], call["engine"], call["build"], call["recipe"]) == (
+            WorkloadKind.K5, Engine.LLAMA_CPP, build, None,
+        )  # fmt: skip
+        assert call["model"].repository == "org/model"  # type: ignore[attr-defined]
+    assert "a note from the lookup" in caplog.text
+
+    # an identity that is not the served file is refused when the config loads
+    with pytest.raises(ValidationError, match=r"settings_request names the path /m\.gguf, not /other\.gguf"):
+        ServeConfig(**{**config.model_dump(), "model_path": "/other.gguf", "settings_request": request})
