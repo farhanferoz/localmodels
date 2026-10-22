@@ -246,3 +246,20 @@ def test_a_path_on_a_network_filesystem_is_recognised_by_its_closest_mount(tmp_p
     assert network_filesystem(Path("/mnt/nas/cache/m.gguf"), str(mounts)) is None  # the closest mount decides
     assert network_filesystem(Path("/home/user/m.gguf"), str(mounts)) is None
     assert network_filesystem(Path("/home/user/m.gguf"), str(tmp_path / "absent")) is None
+
+
+def test_gpu_process_memory_is_per_process_and_none_without_a_reading(monkeypatch) -> None:
+    monkeypatch.setattr(hw_mod.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    rows = "4242, 4468\n7, 100\n7, 50\n99, [N/A]\n"  # one process on two GPUs; one with no figure
+    monkeypatch.setattr(hw_mod.subprocess, "run", lambda *_a, **_k: type("R", (), {"stdout": rows})())
+    assert hw_mod.gpu_process_memory_mib() == {4242: 4468, 7: 150}
+    monkeypatch.setattr(hw_mod.subprocess, "run", lambda *_a, **_k: type("R", (), {"stdout": ""})())
+    assert hw_mod.gpu_process_memory_mib() == {}  # no process on the card is not "no reading"
+
+    def fails(*_a, **_k):
+        raise subprocess.CalledProcessError(1, "nvidia-smi")
+
+    monkeypatch.setattr(hw_mod.subprocess, "run", fails)
+    assert hw_mod.gpu_process_memory_mib() is None
+    monkeypatch.setattr(hw_mod.shutil, "which", lambda _: None)
+    assert hw_mod.gpu_process_memory_mib() is None

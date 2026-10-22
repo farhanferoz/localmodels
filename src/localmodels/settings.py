@@ -174,6 +174,9 @@ class SettingsRecord(BaseModel):
     previous: str | None = None  # the replaced record's candidate, or its settings described
     tune_job: str | None = None
     adopted_at: datetime | None = None
+    # llama.cpp tune measurements (``llama_tune``), one JSON object per step. Untyped on purpose and apart
+    # from ``measurements``: a reader that met another shape there would drop the whole record.
+    llama_measurements: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TuneRecipe(BaseModel):
