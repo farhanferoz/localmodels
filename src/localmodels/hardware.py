@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -50,8 +51,41 @@ def _parse_device(override: str) -> DeviceType:
         raise ValueError(msg) from exc
 
 
-def _nvml_read[T](index: int, read: Callable[[Any, Any], T]) -> T:
-    """``read(pynvml, handle)`` for NVML device ``index``, between NVML's init and shutdown.
+_UUID_PREFIXES = ("GPU-", "MIG-")
+_CUDA_INDEX = re.compile(r"\+?\d+")
+
+
+def _cuda_gpu(ordinal: int) -> str | None:
+    """How nvidia-smi and NVML name this process's CUDA device ``ordinal``; None when it is hidden.
+
+    NVML and nvidia-smi number every GPU on the host whatever the variable says, so without this a process
+    whose GPU was hidden on purpose (``CUDA_VISIBLE_DEVICES=""``) was told it had one, then failed in torch.
+    CUDA reads the variable as a comma-separated list up to the first entry it cannot use, each entry an index
+    read like ``strtoul`` (``"0abc"`` is 0) or a UUID, and a repeated entry hides every GPU (CUDA driver
+    580.173.02 on a one-GPU host, 2026-10-22: no device for ``""``, ``" "``, ``"-1"``, ``"1"``,
+    ``"NoDevFiles"``, ``"-1,0"`` and ``"0,0"``; GPU 0 for ``"0"``, ``"0abc"``, ``"+0"`` and ``"0,-1"``). An
+    index past the host's last GPU and a shortened UUID (which CUDA accepts, nvidia-smi does not) are left for
+    the probe to fail on.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return str(ordinal)
+    gpus: list[str] = []
+    for raw in visible.split(","):
+        entry = raw.strip()
+        if not entry.startswith(_UUID_PREFIXES):
+            index = _CUDA_INDEX.match(entry)
+            if index is None:
+                break
+            entry = str(int(index.group()))
+        if entry in gpus:
+            return None
+        gpus.append(entry)
+    return gpus[ordinal] if ordinal < len(gpus) else None
+
+
+def _nvml_read[T](gpu: str, read: Callable[[Any, Any], T]) -> T:
+    """``read(pynvml, handle)`` for NVML device ``gpu`` (an index or a UUID), between init and shutdown.
 
     Raises what NVML raises (ImportError without pynvml).
     """
@@ -59,20 +93,25 @@ def _nvml_read[T](index: int, read: Callable[[Any, Any], T]) -> T:
 
     pynvml.nvmlInit()
     try:
-        return read(pynvml, pynvml.nvmlDeviceGetHandleByIndex(index))
+        handle = (
+            pynvml.nvmlDeviceGetHandleByIndex(int(gpu))
+            if gpu.isdigit()
+            else pynvml.nvmlDeviceGetHandleByUUID(gpu)
+        )
+        return read(pynvml, handle)
     finally:
         pynvml.nvmlShutdown()
 
 
-def _smi_query(fields: str, index: int = 0) -> list[str] | None:
-    """The comma-separated ``fields`` nvidia-smi reports for GPU ``index``; None when it fails."""
+def _smi_query(fields: str, gpu: str) -> list[str] | None:
+    """The comma-separated ``fields`` nvidia-smi reports for ``gpu`` (an index or a UUID); None on failure."""
     smi = shutil.which("nvidia-smi")
     if smi is None:
         return None
     try:
         out = (
             subprocess.run(  # noqa: S603 — smi is a shutil.which() result, not a literal
-                [smi, "-i", str(index), f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                [smi, "-i", gpu, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -87,15 +126,18 @@ def _smi_query(fields: str, index: int = 0) -> list[str] | None:
 
 
 def _cuda_memory_gb() -> tuple[str, float | None] | None:
+    gpu = _cuda_gpu(0)
+    if gpu is None:
+        return None
     try:
         name, total = _nvml_read(
-            0, lambda nv, h: (nv.nvmlDeviceGetName(h), nv.nvmlDeviceGetMemoryInfo(h).total)
+            gpu, lambda nv, h: (nv.nvmlDeviceGetName(h), nv.nvmlDeviceGetMemoryInfo(h).total)
         )
         if total and total > 0:
             return (name if isinstance(name, str) else name.decode(), total / _GIB)
     except Exception:  # noqa: BLE001,S110 — probe failure is not an error, it means "no CUDA"
         pass
-    parts = _smi_query("name,memory.total")
+    parts = _smi_query("name,memory.total", gpu)
     if parts is None or len(parts) != 2:  # noqa: PLR2004 — the two fields asked for
         return None
     name, mib = parts
@@ -148,6 +190,10 @@ def inspect_hardware(device_override: str | None = None) -> HardwareReport:
     """
     assumptions: list[str] = []
     system, arch = platform.system().lower(), platform.machine().lower()
+    if _cuda_gpu(0) is None:
+        assumptions.append(
+            f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r} leaves this process no CUDA GPU."
+        )
 
     if device_override is not None:
         device = _parse_device(device_override)
@@ -228,12 +274,16 @@ def host_available_bytes(meminfo_path: str = _MEMINFO) -> int | None:
     return fields["MemAvailable"] * 1024 if "MemAvailable" in fields else None
 
 
-def _cuda_free_bytes(index: int) -> tuple[int | None, bool] | None:
-    """(free bytes, unified) of CUDA device ``index`` by NVML, then nvidia-smi; None when neither reads it.
+def _cuda_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:
+    """(free bytes, unified) of CUDA device ``ordinal`` by NVML, then nvidia-smi; None when neither reads it.
 
     Unified (the device's memory is the host's RAM, free bytes None) when NVML reports the memory as not
-    supported or nvidia-smi as ``[N/A]``: the GB10 of a DGX Spark does both.
+    supported or nvidia-smi as ``[N/A]``: the GB10 of a DGX Spark does both. None too when
+    CUDA_VISIBLE_DEVICES hides the device (``_cuda_gpu``).
     """
+    gpu = _cuda_gpu(ordinal)
+    if gpu is None:
+        return None
 
     def free(nv: Any, handle: Any) -> tuple[int | None, bool]:
         try:
@@ -244,10 +294,10 @@ def _cuda_free_bytes(index: int) -> tuple[int | None, bool] | None:
             raise
 
     try:
-        return _nvml_read(index, free)
+        return _nvml_read(gpu, free)
     except Exception:  # noqa: BLE001,S110 — probe failure is not an error, it means "try nvidia-smi"
         pass
-    parts = _smi_query("memory.free", index)
+    parts = _smi_query("memory.free", gpu)
     if parts is None:
         return None
     if parts[0].isdigit():
@@ -260,9 +310,9 @@ def _cuda_free_bytes(index: int) -> tuple[int | None, bool] | None:
 def available_memory(device: str = "cuda", meminfo_path: str = _MEMINFO) -> AvailableMemory | None:
     """How much a new allocation on ``device`` (``"cuda"``, ``"cuda:1"``, ``"cpu"``, ``"mps"``) can get now.
 
-    None when it cannot be measured, so a caller can tell "unknown" from a number. A GPU with its own
-    memory: that memory's free bytes. A GPU that shares the host's RAM (such as a DGX Spark's GB10):
-    ``host_available_bytes``, because the driver's own free count (``cudaMemGetInfo``,
+    None when it cannot be measured or CUDA_VISIBLE_DEVICES hides the GPU, so a caller can tell "unknown" from
+    a number. A GPU with its own memory: that memory's free bytes. A GPU that shares the host's RAM (such as a
+    DGX Spark's GB10): ``host_available_bytes``, because the driver's own free count (``cudaMemGetInfo``,
     ``torch.cuda.mem_get_info``, nvidia-smi) leaves out the page cache the kernel gives back on demand, so
     after a large file read it reports far less than an allocation can get (NVIDIA, DGX Spark porting guide:
     "the cudaMemGetInfo API does not account for memory that could potentially be reclaimed"; measured on a
