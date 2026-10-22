@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from .params import ServingParams
+    from .settings import SettingsAnswer
 
 __all__ = [
     "Contention",
@@ -318,10 +319,11 @@ class LocalServerManager:
     def _pidfile(self) -> Path:
         return self.pid_dir / f"{self.spec.port}.pid"
 
-    def stamp(self, model_sha256: str | None = None) -> ServerStamp:
+    def stamp(self, model_sha256: str | None = None, settings: SettingsAnswer | None = None) -> ServerStamp:
         """How this server is made: llama.cpp's build, the model file, its layout and the host.
 
         ``model_sha256`` is the file's hash when the caller knows it (a ``PinnedFile``); never computed here.
+        ``settings`` is the lookup answer the caller took its settings from; its stamp is attached.
         """
         return ServerStamp(
             engine=Engine.LLAMA_CPP,
@@ -335,6 +337,7 @@ class LocalServerManager:
                 extra_flags=self.extra_flags,
             ),
             host=fingerprint(),
+            settings=settings.stamp() if settings else None,
         )
 
     def free_gib(self) -> float | None:

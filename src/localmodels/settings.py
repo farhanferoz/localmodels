@@ -12,18 +12,21 @@ localmodels`` does not load this module (slurm's lease keeper runs this package)
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime  # noqa: TC003 - pydantic needs it at runtime
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from localmodels.atomic import write_text_atomically
 from localmodels.enums import Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
 from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
@@ -33,8 +36,11 @@ from localmodels.serving.tune import TuneRecord, _read_records, hardware_key, un
 from localmodels.stack import (
     UNKNOWN,
     Engine,
+    LoadOptions,
+    ServerStamp,
     Settings,
     SettingsSource,
+    SettingsStamp,
     SettingsStatus,
     StoreState,
     TunePlan,
@@ -47,7 +53,7 @@ from localmodels.stack import SpecType as SpecType  # noqa: PLC0414 - re-exporte
 
 if TYPE_CHECKING:
     import argparse
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 STATE_DIR_ENV: Final = "LOCALMODELS_STATE_DIR"
 DEFAULT_STATE_DIR: Final = Path("~/.local/state/localmodels")
@@ -159,6 +165,7 @@ class RecordRef(BaseModel):
     stack: dict[str, str] | None
     build: str | None
     recipe_project: str | None
+    changed_from: str | None = None  # the previous choice's name when a re-tune changed it
 
 
 class RuleRef(BaseModel):
@@ -193,6 +200,10 @@ _TUNE_REASON: Final = {
 _announced: set[tuple[str, WorkloadKind]] = set()
 
 
+def _record_id(record: RecordRef | None) -> str | None:
+    return f"{record.path}@{record.measured_at.isoformat()}" if record else None
+
+
 def _describe(settings: Settings) -> str:
     fields = settings.model_dump(mode="json", exclude_defaults=True)
     return ", ".join(f"{name}={value}" for name, value in fields.items()) or "no opinion"
@@ -202,6 +213,7 @@ class SettingsAnswer(BaseModel):
     """What to load a model with, how far to trust it, and where that came from."""
 
     model: ModelIdentity
+    engine: Engine = Engine.PYTORCH
     kind: WorkloadKind
     settings: Settings
     status: SettingsStatus
@@ -214,6 +226,49 @@ class SettingsAnswer(BaseModel):
     overridden: list[str] = Field(default_factory=list)
     store: StoreState = StoreState.OK
     notes: list[str] = Field(default_factory=list)
+    pinned: str | None = None  # the pin file the answer came from or was written to
+    pinned_vs_store: str | None = None  # what the store would answer now, for a pinned answer
+    pin_record_id: str | None = None  # the record the pin was made from (a pinned answer has no ``record``)
+
+    def stamp(self) -> SettingsStamp:
+        """The part of a result's stamp that says how its settings were decided."""
+        record = self.record
+        return SettingsStamp(
+            status=self.status,
+            source=self.source,
+            applied=self.settings,
+            record_id=self.pin_record_id or _record_id(record),
+            rule=self.rule.id if self.rule else None,
+            stale=self.stale,
+            tune=self.tune,
+            store=self.store,
+            overridden=self.overridden,
+            pinned=self.pinned,
+            changed_from=record.changed_from if record else None,
+            recipe_project=record.recipe_project if record else None,
+        )
+
+    def server_stamp(self, model_path: str, build: str, model_sha256: str | None = None) -> ServerStamp:
+        """The stamp of an in-process load made with this answer; ``build`` is the library's version.
+
+        ``model_sha256`` defaults to the hash of the identity's file when it has exactly one.
+        """
+        if model_sha256 is None and len(self.model.files) == 1:
+            model_sha256 = self.model.files[0].sha256
+        load = (
+            LoadOptions(dtype=self.settings.dtype, options=dict(self.settings.options))
+            if self.settings.dtype
+            else None
+        )
+        return ServerStamp(
+            engine=self.engine,
+            build=build,
+            model_path=model_path,
+            model_sha256=model_sha256,
+            load=load,
+            host=fingerprint(),
+            settings=self.stamp(),
+        )
 
     def announce(self, logger: logging.Logger) -> None:
         """Write the notes once per process per model and kind: info when tuned, else a warning."""
@@ -252,6 +307,16 @@ class SettingsAnswer(BaseModel):
 def settings_dir() -> Path:
     """The store: ``$LOCALMODELS_STATE_DIR``/settings, else ``~/.local/state/localmodels/settings``."""
     return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / "settings"
+
+
+@contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``path``'s sibling ``.lock`` file for the block (created if absent)."""
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def _slug(repository: str) -> str:
@@ -392,6 +457,7 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     libraries: Mapping[str, str] | None = None,
     recipe: TuneRecipe | None = None,
     legacy_path: Path | None = None,
+    pin: Path | None = None,
 ) -> SettingsAnswer:
     """What to load ``model`` with for ``kind`` work on this machine; it never fails a load.
 
@@ -403,7 +469,9 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     libraries (``{"torch": torch.__version__}``): a record that names one at another version is stale; one it
     does not name is reported, not a reason. ``recipe`` is how a tune is run (the automatic re-tune is not
     built: a tune the answer calls for reports ``NOT_AVAILABLE``). ``legacy_path`` is the caller's own tune
-    file, read when the store has no record. A record made through llama-server is never applied to
+    file, read when the store has no record. ``pin`` is a study's pin file (``_pin``): the first lookup of a
+    model and kind writes the answer into it, later ones return that copy as PINNED whatever the store says
+    now; ``explicit`` still wins over it. A record made through llama-server is never applied to
     ``Engine.LLAMA_CPP_PYTHON``, which has no tune path yet. ``ValueError`` (pydantic's included) for an
     ``explicit`` key that is not a settings field or a value that is not valid: a caller's bug, not a store
     problem.
@@ -419,8 +487,14 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         notes.append(f"{name} is identified by its path, size and modification time, not its content.")
     if engine is Engine.LLAMA_CPP and not model.files:
         notes.append(f"{name} is identified by revision only: every file of this revision shares a record.")
+    identity_notes = len(notes)
     answer = SettingsAnswer(
-        model=model, kind=kind, settings=default, status=SettingsStatus.UNTUNED, source=SettingsSource.DEFAULT
+        model=model,
+        engine=engine,
+        kind=kind,
+        settings=default,
+        status=SettingsStatus.UNTUNED,
+        source=SettingsSource.DEFAULT,
     )
 
     if engine is Engine.LLAMA_CPP_PYTHON:
@@ -432,6 +506,8 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         if answer.tune_plan:
             notes.append(f"A {answer.tune_plan.value} tune is wanted; {_TUNE_REASON[answer.tune]}.")
 
+    if pin is not None:
+        _pin(answer, pin, notes, identity_notes)
     if explicit:
         answer.settings, answer.overridden = _apply_explicit(answer.settings, explicit)
         notes.append(
@@ -439,6 +515,128 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         )
     answer.notes = notes
     return answer
+
+
+class PinEntry(BaseModel):
+    """One pinned answer: the settings a study was given for a model and kind, and how they were decided."""
+
+    model: ModelIdentity
+    kind: WorkloadKind
+    settings: Settings  # as resolved, before the caller's ``explicit`` was applied
+    status: SettingsStatus
+    source: SettingsSource
+    record_id: str | None
+    stack: dict[str, str]  # ``fingerprint()`` when the entry was made
+    pinned_at: datetime
+
+
+class PinFile(NamedTuple):
+    """The entries of a pin file, the items as they stand in it, and why it cannot be used ("" if it can)."""
+
+    entries: list[PinEntry]
+    items: list[Any]
+    problem: str
+
+
+def read_pins(path: Path) -> PinFile:
+    """Read a pin file; never raises. An absent file has no entries; a bad one is unusable as a whole."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        schema, items = payload["schema"], payload["entries"]
+        if not isinstance(schema, int) or not isinstance(items, list):
+            msg = "schema is not a number or entries is not a list"
+            raise TypeError(msg)
+        if schema > SCHEMA_VERSION:
+            return PinFile([], [], f"{path}: schema {schema}, written by a newer localmodels")
+        return PinFile([PinEntry.model_validate(item) for item in items], items, "")
+    except FileNotFoundError:
+        return PinFile([], [], "")
+    except ValidationError as exc:
+        return PinFile([], [], f"{path}: {_first_error(exc)}")
+    except _BAD_FILE as exc:
+        return PinFile([], [], f"{path}: {exc!r}")
+
+
+def _pin(answer: SettingsAnswer, pin: Path, notes: list[str], keep: int) -> None:
+    """Pin ``answer`` (the store's resolution, before ``explicit``), or replace it with the pin's copy.
+
+    A model and kind not in ``pin`` yet is added and the answer is returned as it is. An entry already in
+    the file is returned as PINNED with no tune wanted, and ``pinned_vs_store`` says what the store would
+    answer now. A file that cannot be read or written is never replaced: the answer stays unpinned and says
+    why. ``keep`` is how many of ``notes`` are about the model's identity and so still hold when pinned.
+    """
+    name = f"{answer.model.repository} ({answer.kind.value})"
+    try:
+        entry, problem = _pin_entry(pin, answer)
+    except OSError as exc:
+        notes.append(f"{name}: cannot write the pin file {pin}, so this answer is not pinned: {exc!r}")
+        return
+    if problem:
+        notes.append(f"{name}: pin file unusable and left as it is, so this answer is not pinned: {problem}")
+        return
+    answer.pinned = str(pin)
+    if entry is None:  # this lookup made the entry
+        return
+    now = _store_now(answer, entry)
+    answer.pinned_vs_store = now or "the store agrees"
+    del notes[keep:]
+    if now:
+        notes.append(
+            f"{name}: settings pinned in {pin} on {entry.pinned_at:%Y-%m-%d} stay in use; "
+            f"the store would now answer {now}."
+        )
+    answer.settings, answer.status, answer.source = entry.settings, SettingsStatus.PINNED, SettingsSource.PIN
+    answer.record, answer.rule, answer.stale = None, None, []
+    answer.tune, answer.tune_plan = TuneState.NOT_NEEDED, None
+    answer.pin_record_id = entry.record_id
+
+
+def _pin_entry(pin: Path, answer: SettingsAnswer) -> tuple[PinEntry | None, str]:
+    """The entry for the answer's model and kind: (entry, ""), or (None, "") if added now, or (None, why not).
+
+    The file is read again under the lock before an entry is added, so when two processes of a study pin
+    one model, the first to write wins and the other uses its entry.
+    """
+    found = read_pins(pin)
+    entry = _pinned_entry(found, answer)
+    if entry is not None or found.problem:
+        return entry, found.problem
+    with _locked(pin):
+        found = read_pins(pin)
+        entry = _pinned_entry(found, answer)
+        if entry is None and not found.problem:
+            _add_pin(pin, found, answer)
+        return entry, found.problem
+
+
+def _pinned_entry(found: PinFile, answer: SettingsAnswer) -> PinEntry | None:
+    return next((e for e in found.entries if (e.model.key, e.kind) == (answer.model.key, answer.kind)), None)
+
+
+def _add_pin(pin: Path, found: PinFile, answer: SettingsAnswer) -> None:
+    """Write ``found``'s items and the entry for ``answer`` (as resolved from the store) to ``pin``."""
+    entry = PinEntry(
+        model=answer.model,
+        kind=answer.kind,
+        settings=answer.settings,
+        status=answer.status,
+        source=answer.source,
+        record_id=_record_id(answer.record),
+        stack=fingerprint(),
+        pinned_at=datetime.now(UTC),
+    )
+    items = [*found.items, entry.model_dump(mode="json")]
+    write_text_atomically(pin, json.dumps({"schema": SCHEMA_VERSION, "entries": items}, indent=2) + "\n")
+
+
+def _store_now(answer: SettingsAnswer, entry: PinEntry) -> str | None:
+    """What the store answers now (status, settings, stale) if that differs from the pin; else None."""
+    if (answer.status, answer.settings) == (entry.status, entry.settings):
+        return None
+    parts = [f"{answer.status.value} ({_describe(answer.settings)})", *answer.stale]
+    if answer.store is not StoreState.OK:
+        parts.append(f"store {answer.store.value}")
+    return "; ".join(parts)
 
 
 def _from_store(

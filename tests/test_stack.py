@@ -9,14 +9,25 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from localmodels.enums import ModelSizeClass, Precision, QuantLevel
+from localmodels.enums import ModelSizeClass, Precision, QuantLevel, WorkloadKind
 from localmodels.launcher import LocalServerManager
 from localmodels.lease import GpuLease, GpuLeaseClient
 from localmodels.params import ServingParams
+from localmodels.pinned import PinnedFile
 from localmodels.process import ServerSpec
 from localmodels.serving.host import ModelHost
 from localmodels.serving.protocol import LoadMessage
-from localmodels.stack import UNKNOWN, Engine, fingerprint, llama_cpp_build
+from localmodels.settings import ModelIdentity, SettingsAnswer
+from localmodels.stack import (
+    UNKNOWN,
+    Engine,
+    ServerStamp,
+    Settings,
+    SettingsSource,
+    SettingsStatus,
+    fingerprint,
+    llama_cpp_build,
+)
 from localmodels.version import package_version
 from tests.test_serving import ECHO, ECHO_ARGV, ECHO_ENV
 
@@ -32,6 +43,15 @@ DGX_RELEASE = (
     'DGX_OTA_VERSION="7.5.0"\nDGX_OTA_DATE="Thu Aug 27"\n\nDGX_OTA_VERSION="7.6.0"\n'
 )
 AARCH64, X86_64 = 183, 62
+ANSWER = SettingsAnswer(
+    model=ModelIdentity(
+        repository="google/medgemma-1.5-4b-it", files=(PinnedFile(path="m.gguf", sha256="cd" * 32),)
+    ),
+    kind=WorkloadKind.K5,
+    settings=Settings(dtype=Precision.BFLOAT16),
+    status=SettingsStatus.TUNED,
+    source=SettingsSource.RECORD,
+)
 RELATIVE = {AARCH64: 1027, X86_64: 8}  # R_*_RELATIVE
 
 
@@ -129,6 +149,15 @@ def test_a_manager_stamps_what_it_started(tmp_path: Path) -> None:
     )
     assert (stamp.load, stamp.host) == (None, fingerprint())
     assert manager.stamp().model_sha256 is None
+    # a stamp stored before settings were stamped still parses; one with settings round-trips
+    old = {k: v for k, v in manager.stamp().model_dump(mode="json").items() if k != "settings"}
+    assert ServerStamp.model_validate(old).settings is None
+    stamped = manager.stamp(settings=ANSWER)
+    assert stamped.settings == ANSWER.stamp()
+    assert ServerStamp.model_validate_json(stamped.model_dump_json()) == stamped
+    # an in-process load's stamp takes the identity's sole file as its hash unless the caller gives one
+    assert ANSWER.server_stamp("/m", "2.10.0").model_sha256 == "cd" * 32
+    assert ANSWER.server_stamp("/m", "2.10.0", model_sha256="ef" * 32).model_sha256 == "ef" * 32
 
 
 def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
@@ -138,6 +167,7 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
     try:
         host.server(ECHO, ECHO_ARGV, ECHO_ENV, load, lambda: False)
         stamp = host.stamp()
+        assert host.stamp(settings=ANSWER).settings == ANSWER.stamp()
     finally:
         host.unload()
     assert stamp is not None
@@ -146,6 +176,7 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
     )  # fmt: skip
     assert stamp.load is not None
     assert (stamp.load.dtype, stamp.load.options) == (Precision.FLOAT16, {"attn": "sdpa"})
+    assert stamp.settings is None
     assert host.stamp() is None
 
 
