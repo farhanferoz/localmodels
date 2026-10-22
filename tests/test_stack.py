@@ -21,6 +21,7 @@ from localmodels.settings import ModelIdentity, SettingsAnswer
 from localmodels.stack import (
     UNKNOWN,
     Engine,
+    LoadOptions,
     ServerStamp,
     Settings,
     SettingsSource,
@@ -149,15 +150,32 @@ def test_a_manager_stamps_what_it_started(tmp_path: Path) -> None:
     )
     assert (stamp.load, stamp.host) == (None, fingerprint())
     assert manager.stamp().model_sha256 is None
-    # a stamp stored before settings were stamped still parses; one with settings round-trips
-    old = {k: v for k, v in manager.stamp().model_dump(mode="json").items() if k != "settings"}
+    # no settings: the JSON it always had, which parses; with settings: a stamp that round-trips
+    assert "settings" not in manager.stamp().model_dump_json()
+    old = manager.stamp().model_dump(mode="json")
+    assert "settings" not in old
     assert ServerStamp.model_validate(old).settings is None
     stamped = manager.stamp(settings=ANSWER)
-    assert stamped.settings == ANSWER.stamp()
+    assert stamped.settings is not None
+    assert (stamped.settings.status, stamped.settings.applied) == (
+        SettingsStatus.TUNED,
+        Settings(),
+    )  # none given yet
     assert ServerStamp.model_validate_json(stamped.model_dump_json()) == stamped
-    # an in-process load's stamp takes the identity's sole file as its hash unless the caller gives one
+    # an in-process load's stamp: the identity's sole file is its hash unless given; its engine and precision
     assert ANSWER.server_stamp("/m", "2.10.0").model_sha256 == "cd" * 32
     assert ANSWER.server_stamp("/m", "2.10.0", model_sha256="ef" * 32).model_sha256 == "ef" * 32
+    python = ANSWER.model_copy(update={"engine": Engine.LLAMA_CPP_PYTHON, "tune_detail": "job 7"})
+    in_process = python.server_stamp("/m", "0.3.1", applied=Settings(dtype=Precision.FLOAT16))
+    assert (in_process.engine, in_process.load) == (
+        Engine.LLAMA_CPP_PYTHON,
+        LoadOptions(dtype=Precision.FLOAT16),
+    )
+    assert in_process.settings is not None
+    assert (in_process.settings.applied.dtype, in_process.settings.tune_detail) == (
+        Precision.FLOAT16,
+        "job 7",
+    )
 
 
 def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
@@ -167,7 +185,7 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
     try:
         host.server(ECHO, ECHO_ARGV, ECHO_ENV, load, lambda: False)
         stamp = host.stamp()
-        assert host.stamp(settings=ANSWER).settings == ANSWER.stamp()
+        stamped = host.stamp(settings=ANSWER)  # the answer says bfloat16; the load used float16
     finally:
         host.unload()
     assert stamp is not None
@@ -177,6 +195,10 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
     assert stamp.load is not None
     assert (stamp.load.dtype, stamp.load.options) == (Precision.FLOAT16, {"attn": "sdpa"})
     assert stamp.settings is None
+    assert stamped is not None
+    assert stamped.settings is not None
+    assert stamped.settings.status is SettingsStatus.TUNED
+    assert stamped.settings.applied == Settings(dtype=Precision.FLOAT16, options={"attn": "sdpa"})
     assert host.stamp() is None
 
 

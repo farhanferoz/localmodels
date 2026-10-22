@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import contextlib
+import fcntl
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -34,8 +36,7 @@ from localmodels.settings import (
 from localmodels.stack import Engine, LoadOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
-    from pathlib import Path
+    from collections.abc import Callable
 
 GB10 = HardwareReport(
     platform="linux", arch="aarch64", device=DeviceType.CUDA, device_name="NVIDIA GB10",
@@ -368,60 +369,103 @@ def test_explicit_settings_win_and_are_listed_without_changing_the_status() -> N
         lookup(QWEN, WorkloadKind.K6, explicit={"dtpye": "float32"})
 
 
-def test_a_pin_keeps_the_first_answer_for_each_model_and_kind(tmp_path: Path) -> None:
-    pin = tmp_path / "study" / "pin.json"
-    put(QWEN, WorkloadKind.K6)
+def test_a_pin_keeps_the_first_answer_for_each_model_kind_and_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    pin = Path("study/pin.json")  # relative, as the design writes it: the stamp must name the file in full
+    put(QWEN, WorkloadKind.K6, recipe_project="proj")
     first = lookup(QWEN, WorkloadKind.K6, pin=pin)
-    assert (first.status, first.settings.dtype, first.pinned) == (T, BF16, str(pin))
+    assert (first.status, first.settings.dtype, first.pinned) == (T, BF16, str(tmp_path / pin))
     stamp = first.server_stamp("/models/qwen", "2.10.0")
-    assert (stamp.engine, stamp.load, stamp.settings) == (
-        Engine.PYTORCH,
-        LoadOptions(dtype=BF16),
-        first.stamp(),
-    )
+    assert (stamp.engine, stamp.load) == (Engine.PYTORCH, LoadOptions(dtype=BF16))
     assert first.record is not None
     assert stamp.settings is not None
-    assert stamp.settings.pinned == str(pin)
-    assert stamp.settings.record_id == f"{first.record.path}@2026-10-20T00:00:00+00:00"
-    # the store moves on: a newer record and a changed driver
+    assert (stamp.settings.status, stamp.settings.pinned, stamp.settings.pinned_status) == (
+        T, str(tmp_path / pin), None,
+    )  # fmt: skip
+    record_id = f"{first.record.path}@2026-10-20T00:00:00+00:00"
+    assert (stamp.settings.record_id, stamp.settings.recipe_project) == (record_id, "proj")
+    # the store moves on: a newer record and a changed driver; the pin does not
     put(QWEN, WorkloadKind.K6, chosen={"dtype": "float16"}, candidate="float16", stack=NEWER_DRIVER)
     again = lookup(QWEN, WorkloadKind.K6, pin=pin, recipe=RECIPE)
     assert (again.status, again.source, again.settings.dtype) == (PINNED, SettingsSource.PIN, BF16)
     assert (again.tune, again.tune_plan, again.stale) == (NOT_NEEDED, None, [])
     assert (again.pinned_vs_store or "").startswith("stale (dtype=float16)")
     assert any("stay in use" in note for note in again.notes)
-    assert again.stamp().record_id == stamp.settings.record_id
-    # another model, and another kind of the first, each get their own entry; explicit wins and is not pinned
+    pinned = again.stamp()  # the stamp still says how the pinned settings were decided
+    assert (pinned.status, pinned.pinned_status, pinned.record_id, pinned.recipe_project) == (
+        PINNED, T, record_id, "proj",
+    )  # fmt: skip
+    assert (pinned.stale, pinned.rule, pinned.tune) == ([], None, NOT_NEEDED)
+    # a pin made from a stale answer, with a caller's own dtype on top that is not pinned
+    put(QWEN, WorkloadKind.K5, stack=NEWER_DRIVER)
+    stale = lookup(QWEN, WorkloadKind.K5, pin=pin, explicit={"dtype": "float32"}).stamp()
+    assert (stale.status, stale.stale, stale.overridden, stale.applied.dtype) == (
+        S, ["driver: 590.2 -> 580.1"], ["dtype"], F32,
+    )  # fmt: skip
+    later = lookup(QWEN, WorkloadKind.K5, pin=pin).stamp()
+    assert (later.status, later.pinned_status, later.stale, later.overridden, later.applied.dtype) == (
+        PINNED, S, ["driver: 590.2 -> 580.1"], [], BF16,
+    )  # fmt: skip
+    # another model, another kind and another engine each get their own entry; explicit wins and is not pinned
     fp16 = Settings(dtype=Precision.FLOAT16)
     explicit = {"dtype": "float32"}
     other = lookup(FLASH, WorkloadKind.K6, pin=pin, default=fp16, explicit=explicit)
-    lookup(QWEN, WorkloadKind.K5, pin=pin)
-    entries = {(e["model"]["repository"], e["kind"]): e for e in json.loads(pin.read_text())["entries"]}
-    assert set(entries) == {(FLASH.repository, "K6"), (QWEN.repository, "K5"), (QWEN.repository, "K6")}
-    assert entries[(FLASH.repository, "K6")]["settings"]["dtype"] == "float16"
-    assert entries[(QWEN.repository, "K6")]["settings"]["dtype"] == "bfloat16"
+    in_process = lookup(QWEN, WorkloadKind.K6, pin=pin, engine=Engine.LLAMA_CPP_PYTHON)
+    assert in_process.status is not PINNED
+    entries = {
+        (e["model"]["repository"], e["kind"], e["engine"]): e for e in json.loads(pin.read_text())["entries"]
+    }
+    assert set(entries) == {
+        (FLASH.repository, "K6", "pytorch"), (QWEN.repository, "K5", "pytorch"),
+        (QWEN.repository, "K6", "pytorch"), (QWEN.repository, "K6", "llama-cpp-python"),
+    }  # fmt: skip
+    assert entries[(FLASH.repository, "K6", "pytorch")]["settings"]["dtype"] == "float16"
+    assert entries[(QWEN.repository, "K6", "pytorch")]["settings"]["dtype"] == "bfloat16"
     assert (other.settings.dtype, other.overridden) == (Precision.FLOAT32, ["dtype"])
     over = lookup(FLASH, WorkloadKind.K6, pin=pin, default=fp16, explicit=explicit)
     assert (over.status, over.settings.dtype, over.overridden) == (PINNED, Precision.FLOAT32, ["dtype"])
+    untuned = over.stamp()  # pinned from a rule measured on other models: still untuned on its face
+    assert (untuned.pinned_status, untuned.rule) == (RO, "K6.precision")
     assert lookup(FLASH, WorkloadKind.K6, pin=pin).settings == fp16
+    record_path(QWEN, WorkloadKind.K6).write_text(
+        "{"
+    )  # a damaged store is still reported beside a pinned answer
+    damaged = lookup(QWEN, WorkloadKind.K6, pin=pin)
+    assert (damaged.status, damaged.store) == (PINNED, StoreState.UNREADABLE)
+    assert any(str(record_path(QWEN, WorkloadKind.K6)) in note for note in damaged.notes)
 
 
-def test_an_entry_another_process_adds_first_is_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("written", "pinned"),
+    [
+        pytest.param(None, True, id="a valid entry"),
+        pytest.param("{", False, id="a damaged file"),
+    ],
+)
+def test_a_lookup_waits_for_the_pin_lock_and_reads_the_file_again_before_writing(
+    tmp_path: Path, written: str | None, pinned: bool
+) -> None:
     pin, theirs = tmp_path / "pin.json", tmp_path / "theirs.json"
     put(QWEN, WorkloadKind.K6, chosen={"dtype": "float16"})
     lookup(QWEN, WorkloadKind.K6, pin=theirs)
     put(QWEN, WorkloadKind.K6)
-    real = settings._locked
-
-    @contextlib.contextmanager
-    def locked_after_theirs(path: Path) -> Iterator[None]:
-        with real(path):
-            path.write_text(theirs.read_text(encoding="utf-8"), encoding="utf-8")  # written while we waited
-            yield
-
-    monkeypatch.setattr(settings, "_locked", locked_after_theirs)
-    answer = lookup(QWEN, WorkloadKind.K6, pin=pin)
-    assert (answer.status, answer.settings.dtype) == (SettingsStatus.PINNED, Precision.FLOAT16)
+    answers: list[settings.SettingsAnswer] = []
+    worker = threading.Thread(target=lambda: answers.append(lookup(QWEN, WorkloadKind.K6, pin=pin)))
+    with pin.with_name("pin.json.lock").open("a") as held:  # a flock belongs to the open file
+        fcntl.flock(held, fcntl.LOCK_EX)
+        worker.start()
+        worker.join(0.3)
+        assert worker.is_alive()
+        assert not pin.exists()
+        # another process was first
+        pin.write_text(theirs.read_text(encoding="utf-8") if written is None else written, encoding="utf-8")
+    worker.join(5)
+    answer = answers[0]
+    assert (answer.status is PINNED) == pinned
+    assert answer.settings.dtype is (Precision.FLOAT16 if pinned else BF16)
+    assert pin.read_text(encoding="utf-8") == (theirs.read_text(encoding="utf-8") if pinned else written)
 
 
 @pytest.mark.parametrize(
@@ -440,8 +484,8 @@ def test_an_entry_another_process_adds_first_is_used(tmp_path: Path, monkeypatch
         ),
     ],
 )
-def test_a_pin_file_that_cannot_be_used_is_left_as_it_is(
-    damage: Callable[[Path], object], tmp_path: Path
+def test_a_pin_file_that_cannot_be_used_is_left_as_it_is_and_the_result_says_so(
+    damage: Callable[[Path], object], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     folder = tmp_path / "study"
     folder.mkdir()
@@ -454,8 +498,34 @@ def test_a_pin_file_that_cannot_be_used_is_left_as_it_is(
     finally:
         folder.chmod(0o700)
     assert (answer.status, answer.pinned, answer.pinned_vs_store) == (T, None, None)
-    assert any(str(pin) in note for note in answer.notes)
+    assert str(pin) in (answer.pin_problem or "")
+    assert answer.stamp().pin_problem == answer.pin_problem
+    with caplog.at_level(logging.WARNING):  # the store answer is tuned, but the pin that was asked for failed
+        answer.announce(logging.getLogger("test"))
+    assert [r.levelno for r in caplog.records if str(pin) in r.getMessage()] == [logging.WARNING]
     assert (pin.read_bytes() if pin.exists() else None) == before
+
+
+def test_a_pin_that_cannot_take_an_entry_unpins_only_that_model(tmp_path: Path) -> None:
+    pin = tmp_path / "pin.json"
+    put(QWEN, WorkloadKind.K6)
+    lookup(QWEN, WorkloadKind.K6, pin=pin)
+    payload = json.loads(pin.read_text())
+    payload["entries"].append({"model": "an entry a later version could write"})
+    pin.write_text(json.dumps(payload), encoding="utf-8")
+    before = pin.read_bytes()
+    put(QWEN, WorkloadKind.K6, chosen={"dtype": "float16"})
+    kept = lookup(QWEN, WorkloadKind.K6, pin=pin)  # its own entry is valid
+    assert (kept.status, kept.settings.dtype) == (PINNED, BF16)
+    # a file with an entry this version cannot read takes no more entries
+    refused = lookup(FLASH, WorkloadKind.K6, pin=pin)
+    assert (refused.pinned, "entry 1" in (refused.pin_problem or "")) == (None, True)
+    assert pin.read_bytes() == before
+    # settings that are not JSON: the answer comes back unpinned, not as an error
+    odd = Settings(options={"matmul": object()})
+    unpinned = lookup(DETECTOR, WorkloadKind.K6, pin=tmp_path / "odd.json", default=odd)
+    assert (unpinned.pinned, "cannot pin" in (unpinned.pin_problem or "")) == (None, True)
+    assert not (tmp_path / "odd.json").exists()
 
 
 def test_rules_md_is_read_at_run_time_and_the_value_table_matches_it(monkeypatch: pytest.MonkeyPatch) -> None:

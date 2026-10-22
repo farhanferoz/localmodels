@@ -179,6 +179,12 @@ ones the record names. The store is never a reason for a load to fail: a bad or 
 `localmodels settings show --model REPO --revision REV --kind K6` (or `--file NAME`) prints one answer and loads nothing; `settings check` lists the
 stored records that are stale on this host and exits 1 when any is. Automatic re-tuning is not built yet: an answer
 that calls for a tune reports `tune: not-available`.
+A study that must not change mid-way passes `pin=Path("study/settings-pin.json")` to `lookup`: the first lookup of each model,
+kind and engine writes its answer into that file, later lookups return it as `pinned` whatever the store says now (`explicit=`
+still wins, a pinned answer queues no tune, and the stamp keeps the status the pinned settings had); a pin file that cannot be
+read or written is never replaced, the answer comes back unpinned and `pin_problem` says why. To attach the decision to a result,
+pass the answer to `LocalServerManager.stamp(settings=answer)` or `ModelHost.stamp(settings=answer)`, or build the stamp of an
+in-process load with `answer.server_stamp(model_path, build)`; it appears as `ServerStamp.settings`.
 
 ## Monthly digest
 

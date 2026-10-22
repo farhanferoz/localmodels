@@ -39,7 +39,7 @@ from .process import (
     build_args,
     require_key_off_loopback,
 )
-from .stack import Engine, LlamaLayout, ServerStamp, fingerprint, llama_cpp_build
+from .stack import Engine, LlamaLayout, ServerStamp, Settings, fingerprint, llama_cpp_build
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -323,7 +323,8 @@ class LocalServerManager:
         """How this server is made: llama.cpp's build, the model file, its layout and the host.
 
         ``model_sha256`` is the file's hash when the caller knows it (a ``PinnedFile``); never computed here.
-        ``settings`` is the lookup answer the caller took its settings from; its stamp is attached.
+        ``settings`` is the lookup answer the caller took its settings from; its stamp is attached with no
+        settings applied, because this manager passes none of them to llama-server yet.
         """
         return ServerStamp(
             engine=Engine.LLAMA_CPP,
@@ -337,7 +338,7 @@ class LocalServerManager:
                 extra_flags=self.extra_flags,
             ),
             host=fingerprint(),
-            settings=settings.stamp() if settings else None,
+            settings=settings.stamp(Settings()) if settings else None,
         )
 
     def free_gib(self) -> float | None:

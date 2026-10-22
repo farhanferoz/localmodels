@@ -156,6 +156,12 @@ class SettingsStamp(BaseModel):
     ``overridden`` names the fields the caller's own settings replaced; ``pinned`` is the pin file the
     answer came from or was written to; ``changed_from`` is the previous choice's name when a re-tune
     changed it; ``recipe_project`` is the project whose inputs made the record.
+
+    For a pinned answer ``status`` is PINNED and ``pinned_status`` is the status the pinned settings had when
+    they were pinned, with ``record_id``, ``rule``, ``stale`` and ``recipe_project`` as they were then: a
+    result pinned from an untuned answer still reads untuned. ``pin_problem`` says why a pin that was asked
+    for could not be used (the answer is then not pinned). ``tune_detail`` is the job id or log path of a
+    queued or failed tune.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -170,6 +176,9 @@ class SettingsStamp(BaseModel):
     store: StoreState
     overridden: list[str] = Field(default_factory=list)
     pinned: str | None = None
+    pinned_status: SettingsStatus | None = None
+    pin_problem: str | None = None
+    tune_detail: str | None = None
     changed_from: str | None = None
     recipe_project: str | None = None
 
@@ -190,7 +199,9 @@ class ServerStamp(BaseModel):
     layout: LlamaLayout | None = None
     load: LoadOptions | None = None
     host: dict[str, str]
-    settings: SettingsStamp | None = None  # set by a caller that took its settings from a lookup
+    # set by a caller that took its settings from a lookup; left out of a dump when None, so a caller with
+    # no settings keeps the JSON it always had
+    settings: SettingsStamp | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _read_text(path: Path) -> str | None:
