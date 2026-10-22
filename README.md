@@ -189,7 +189,8 @@ pass the answer to `LocalServerManager.stamp(settings=answer)` or `ModelHost.sta
 in-process load with `answer.server_stamp(model_path, build)`; it appears as `ServerStamp.settings`.
 To start a llama-server with an answer, pass `LocalServerManager(settings=answer)` (or set `settings_request` in the `serve` config): it
 adds `-ub` and the speculative-decoding flags, each as a group the caller's own `extra_flags` or `extra_env` win (the stamp lists it as
-`overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it.
+`overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it
+(unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)`, not `manager.extra_flags`.
 
 ## Monthly digest
 
