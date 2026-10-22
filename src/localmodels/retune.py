@@ -2,8 +2,9 @@
 
 ``settings.lookup`` calls ``request`` when a tune is due and nothing rules it out; this module is imported
 only then. One tune job is queued per *change* (a model, a kind, the hardware, the build and what went
-stale, as an 8-character id). The id's file under the store, ``pending/<change id>.json``, is created with exclusive create
-while holding a lock, so two processes or projects asking at once cannot both submit. Its states:
+stale, as an 8-character id). The id's file under the store, ``pending/<change id>.json``, is created with
+exclusive create while holding a lock, so two processes or projects asking at once cannot both submit. Its
+states:
 
 * ``submitting``: the creator is running ``submit.py``; older than the submit timeout plus a margin counts as
   ``submit_failed``.
@@ -177,7 +178,7 @@ def job_is_live(job: str) -> bool | None:
 
 
 def _live_count(folder: Path, now: float) -> int:
-    """Tune jobs holding a slot: a fresh ``submitting`` file, or a ``queued`` one whose job is not finished."""
+    """Tune jobs holding a slot: a fresh ``submitting`` file, or a ``queued`` one not known to be finished."""
     count = 0
     for path in folder.glob("*.json"):
         pending, _ = _read(path)

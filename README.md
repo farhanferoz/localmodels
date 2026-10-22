@@ -179,14 +179,19 @@ or an announced path; a repository alone is refused. The caller's `libraries={"t
 ones the record names. The store is never a reason for a load to fail: a bad or newer file is treated as absent and announced
 (`answer.announce(log)`). The module is imported on demand; `import localmodels` does not load it.
 `localmodels settings show --model REPO --revision REV --kind K6` (or `--file NAME`) prints one answer and loads nothing; `settings check` lists the
-stored records that are stale on this host and exits 1 when any is. Automatic re-tuning is not built yet: an answer
-that calls for a tune reports `tune: not-available`.
+stored records that are stale on this host and exits 1 when any is.
 A study that must not change mid-way passes `pin=Path("study/settings-pin.json")` to `lookup`: the first lookup of each model,
 kind and engine writes its answer into that file, later lookups return it as `pinned` whatever the store says now (`explicit=`
 still wins, a pinned answer queues no tune, and the stamp keeps the status the pinned settings had); a pin file that cannot be
 read or written is never replaced, the answer comes back unpinned and `pin_problem` says why. To attach the decision to a result,
 pass the answer to `LocalServerManager.stamp(settings=answer)` or `ModelHost.stamp(settings=answer)`, or build the stamp of an
 in-process load with `answer.server_stamp(model_path, build)`; it appears as `ServerStamp.settings`.
+A lookup that is given a `recipe=TuneRecipe(...)` and finds a tune due (a first use, or a stale record) queues one slurm
+job per model and change by running slurm's `submit.py` (`$LOCALMODELS_SUBMIT`, default
+`~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the answer's `tune` and
+`tune_detail` say what happened (`queued`, `already-queued`, `waiting`, `failed-before`, `measured-not-adopted`, ...). Until the
+job adopts a record the model runs on its current settings. `retune=RetunePolicy.OFF` (per call) or `LOCALMODELS_RETUNE=off`
+(per process) turns it off; a test suite that loads models should set it. Only PyTorch tunes are queued so far.
 
 ## Monthly digest
 
