@@ -95,8 +95,24 @@ class TuneState(StrEnum):
     """What the lookup did about a tune."""
 
     NOT_NEEDED = "not-needed"
-    NOT_AVAILABLE = "not-available"  # a tune is wanted and a recipe is given; automatic re-tune is not built
+    NOT_AVAILABLE = "not-available"  # a tune is wanted, but this engine's automatic re-tune is not enabled
     NO_RECIPE = "no-recipe"  # a tune is wanted and the caller gave no recipe
+    QUEUED = "queued"  # this lookup submitted it; ``tune_detail`` is the slurm job id
+    ALREADY_QUEUED = "already-queued"  # another lookup did and it has not finished (the job id)
+    DISABLED = "disabled"  # the caller or the environment turned the automatic re-tune off
+    NO_SCHEDULER = "no-scheduler"  # no ``submit.py`` here, or slurm could not be asked about a queued job
+    NOT_APPLICABLE = "not-applicable"  # the lookup's hardware is one a tune job cannot produce
+    NOTHING_TO_TUNE = "nothing-to-tune"  # the caller's explicit settings cover every field a tune sets
+    FAILED_BEFORE = "failed-before"  # a tune was tried and did not finish (the log, or why it was not queued)
+    MEASURED_NOT_ADOPTED = "measured-not-adopted"  # a tune measured but its result was refused (the reason)
+    WAITING = "waiting"  # the cap on simultaneous tune jobs is reached; a later lookup submits
+
+
+class RetunePolicy(StrEnum):
+    """Whether a lookup may queue a tune by itself (D2); ``LOCALMODELS_RETUNE=off`` has the same effect."""
+
+    AUTO = "auto"
+    OFF = "off"
 
 
 class TunePlan(StrEnum):
