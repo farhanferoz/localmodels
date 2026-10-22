@@ -190,6 +190,14 @@ in-process load with `answer.server_stamp(model_path, build)`; it appears as `Se
 To start a llama-server with an answer, pass `LocalServerManager(settings=answer)` (or set `settings_request` in the `serve` config): it
 adds `-ub` and the speculative-decoding flags, each as a group the caller's own `extra_flags` or `extra_env` win (the stamp lists it as
 `overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it.
+`python -m localmodels.llama_tune --help` is the tune that makes such a record (the recipe command for llama.cpp; run it through slurm,
+never by hand on the card). It measures the reference first, then `-ub` (`llama-bench`, then a teacher-forced `llama-perplexity` check
+against 512 with a restart control; only for prompts of at least 512 tokens), the speculation candidates you declare and, with your own
+`--quality-command`, other quantised files, each with the server's own peak memory from `nvidia-smi`. It keeps to `--soft-limit-s` by
+starting the most valuable candidate first and skipping what would not fit, adopts a candidate only past a 5 % speed margin with every check
+passed, and writes `record.json` and its measurements to `--run-dir` (which holds a base file of about 16 GiB while it runs). The quality
+command gets the live server in `LLAMA_TUNE_SERVER_URL` and the file in `LLAMA_TUNE_MODEL_FILE`, and ends by printing
+`{"score": 0.93, "passed": true}`; it exits 0 when it passes. The module is imported on demand.
 
 ## Monthly digest
 

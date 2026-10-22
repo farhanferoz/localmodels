@@ -281,7 +281,7 @@ async def test_chosen_by_the_limits_the_margin_and_a_measured_memory_figure(
     assert (
         read_store(record_path(MODEL, K1 if "kind" not in changes else K3)).records[0].chosen == stored.chosen
     )
-    assert {m["step"] for m in stored.llama_measurements} >= {"server"}
+    assert {m["step"] for m in stored.llama_measurements} >= {"server", "layout"}
 
 
 async def test_a_speculative_arm_that_does_not_repeat_across_a_restart_is_not_adopted(tmp_path: Path) -> None:

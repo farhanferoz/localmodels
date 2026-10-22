@@ -114,7 +114,6 @@ SPEC_MIN_SIMILARITY: Final = 0.65  # a tripwire for a broken draft setup, not a 
 # servers (design 6.2)
 HOST: Final = "127.0.0.1"
 SERVER_READY_TIMEOUT_S: Final = 1800.0  # a 94 GB model read from the local disk (service_c's allowance)
-SERVER_STOP_GRACE_S: Final = 120.0
 KILL_BELOW_GIB: Final = 10.0  # service_c's floor: above earlyoom's SIGTERM at 8 GiB on this host
 OOM_SCORE_ADJ: Final = 1000  # the server, never the tune, is the kernel's first pick
 REQUEST_TIMEOUT_S: Final = 900.0
@@ -152,6 +151,7 @@ class Step(StrEnum):
     KL = "teacher-forced"
     SERVER = "server"
     NOT_MEASURED = "not-measured"
+    LAYOUT = "layout"
 
 
 class Priority(IntEnum):
@@ -417,6 +417,15 @@ class KlResult(BaseModel):
     stats: KlStats | None = None
     agreement: Agreement | None = None
     error: str | None = None
+
+
+class Layout(BaseModel):
+    """The serving layout every candidate was measured at; the role fixes it, so it is never a candidate."""
+
+    step: Step = Step.LAYOUT
+    n_ctx: int
+    n_parallel: int
+    kv_unified: bool
 
 
 class NotMeasured(BaseModel):
@@ -920,7 +929,6 @@ class LlamaTune:
             pid_dir=self.spec.run_dir / f"server-{self._servers}",
             binary=self.spec.server_bin,
             ready_timeout_s=SERVER_READY_TIMEOUT_S,
-            stop_grace_s=SERVER_STOP_GRACE_S,
             guards=guards,
             settings=answer,
         )
@@ -1132,6 +1140,8 @@ class LlamaTune:
             ", ".join(checks) if checks else "reference kept; no candidate passed"
         )
         self.measurements.extend(self.arms)
+        params = spec.params
+        layout = Layout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
         return SettingsRecord(
             model=spec.reference.identity,
             kind=spec.kind,
@@ -1147,7 +1157,7 @@ class LlamaTune:
             agreement=agreement,
             reference="reference",
             tune_job=os.environ.get("SLURM_JOB_ID"),
-            llama_measurements=[m.model_dump(mode="json") for m in self.measurements],
+            llama_measurements=[m.model_dump(mode="json") for m in (layout, *self.measurements)],
         )
 
 
