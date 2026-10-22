@@ -76,7 +76,11 @@ MIN_PASSES: Final = 2  # timed passes needed to measure a spread
 SPEED_MARGIN: Final = 0.05  # a candidate must beat the incumbent by more than this (and the timing spread)
 TUNING_ENV: Final = "LOCALMODELS_TUNING"  # set to TUNING_ON in a tune job: its loads queue no tune
 TUNING_ON: Final = "1"
-RETUNE_ENV: Final = "LOCALMODELS_RETUNE"  # ``off`` turns the automatic re-tune off for the process
+RETUNE_ENV: Final = (
+    "LOCALMODELS_RETUNE"  # ``off`` turns the automatic re-tune off; ``on`` allows it under pytest
+)
+RETUNE_ON: Final = "on"
+PYTEST_ENV: Final = "PYTEST_CURRENT_TEST"  # set by pytest while a test runs
 TUNE_CHANGE_ENV: Final = "LOCALMODELS_TUNE_CHANGE"  # the change a tune job was queued for (``retune.py``)
 #: Enabled only after the first real llama.cpp tune has run through slurm (HL5).
 LLAMA_AUTO_RETUNE: Final = False
@@ -245,14 +249,6 @@ RULE_VALUES: Final[Mapping[WorkloadKind, _Rule]] = {
     WorkloadKind.K2: _Rule("K2.layout", Settings(n_ubatch=512)),
     WorkloadKind.K5: _Rule("K5.precision", Settings(dtype=Precision.BFLOAT16)),
     WorkloadKind.K6: _Rule("K6.precision", Settings(dtype=Precision.BFLOAT16)),
-}
-
-_TUNE_REASON: Final = {
-    TuneState.NOT_AVAILABLE: "this engine's automatic re-tune is not enabled",
-    TuneState.NO_RECIPE: "the caller gave no recipe",
-    TuneState.DISABLED: "the automatic re-tune is off",
-    TuneState.NOTHING_TO_TUNE: "the caller's explicit settings cover every field a tune sets",
-    TuneState.NOT_APPLICABLE: "a tune job runs on the GPU; its record is one this CPU lookup never finds",
 }
 
 #: Sentences already written this process, by (model, kind): ``announce`` speaks once.
@@ -554,8 +550,9 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     does not name is reported, not a reason. ``recipe`` is how a tune is run: when the answer calls for one
     (``tune_plan``) and nothing rules it out, the lookup queues one slurm job for the model and change
     (``retune.py``) and ``tune`` and ``tune_detail`` say what happened. ``retune=RetunePolicy.OFF``, or
-    ``LOCALMODELS_RETUNE=off`` in the environment, queues nothing (``DISABLED``); a process that loads models
-    in tests should set it. ``LOCALMODELS_TUNING=1`` marks a tune job's own loads, which queue nothing.
+    ``LOCALMODELS_RETUNE=off`` in the environment, queues nothing (``DISABLED``). Under pytest nothing is
+    queued either unless ``LOCALMODELS_RETUNE=on``. ``LOCALMODELS_TUNING=1`` marks a tune job's own loads,
+    which queue nothing.
     ``legacy_path`` is the caller's own tune
     file, read when the store has no record. ``pin`` is a study's pin file (``_pin``): the first lookup of a
     model, kind and engine writes the answer into it, later ones return that copy as PINNED whatever the
@@ -801,24 +798,44 @@ def _refused_tune(
     retune: RetunePolicy,
     explicit: Mapping[str, Any] | None,
     device: DeviceType,
-) -> TuneState | None:
-    """Why no tune is queued, checked in the order of design 5.1; None: nothing rules it out."""
+) -> tuple[TuneState, str] | None:
+    """Why no tune is queued, checked in the order of design 5.1: (state, reason); None: nothing rules it out.
+
+    Under pytest a tune is queued only if ``LOCALMODELS_RETUNE=on``: a test that loads a model would otherwise
+    submit a real job wherever slurm's ``submit.py`` exists. ``off`` (or ``retune=OFF``) wins over ``on``.
+    """
     fields = _TUNED_FIELDS.get(answer.engine)
+    env = os.environ.get(RETUNE_ENV, "").strip().lower()
     checks = (
-        (os.environ.get(TUNING_ENV) == TUNING_ON, TuneState.NOT_NEEDED),  # a tune job's own load
+        (os.environ.get(TUNING_ENV) == TUNING_ON, TuneState.NOT_NEEDED, ""),  # a tune job's own load
         (
-            retune is RetunePolicy.OFF or os.environ.get(RETUNE_ENV, "").strip().lower() == RetunePolicy.OFF,
+            retune is RetunePolicy.OFF or env == RetunePolicy.OFF,
             TuneState.DISABLED,
+            "the automatic re-tune is off",
         ),
-        (bool(fields and explicit and fields <= set(explicit)), TuneState.NOTHING_TO_TUNE),
-        (recipe is None, TuneState.NO_RECIPE),
+        (
+            bool(fields and explicit and fields <= set(explicit)),
+            TuneState.NOTHING_TO_TUNE,
+            "the caller's explicit settings cover every field a tune sets",
+        ),
+        (recipe is None, TuneState.NO_RECIPE, "the caller gave no recipe"),
         (
             fields is None or (answer.engine is Engine.LLAMA_CPP and not LLAMA_AUTO_RETUNE),
             TuneState.NOT_AVAILABLE,
+            "this engine's automatic re-tune is not enabled",
         ),
-        (device is DeviceType.CPU, TuneState.NOT_APPLICABLE),
+        (
+            device is DeviceType.CPU,
+            TuneState.NOT_APPLICABLE,
+            "a tune job runs on the GPU; its record is one this CPU lookup never finds",
+        ),
+        (
+            PYTEST_ENV in os.environ and env != RETUNE_ON,
+            TuneState.DISABLED,
+            f"automatic re-tune is off under pytest; set {RETUNE_ENV}={RETUNE_ON} to test it",
+        ),
     )
-    return next((state for hit, state in checks if hit), None)
+    return next(((state, reason) for hit, state, reason in checks if hit), None)
 
 
 def _decide_tune(
@@ -835,9 +852,15 @@ def _decide_tune(
     """
     report = inspect_hardware()
     refused = _refused_tune(answer, recipe, retune, explicit, report.device)
+    value = os.environ.get(RETUNE_ENV, "").strip().lower()
+    ignored = (
+        f" ({RETUNE_ENV}={value!r} is neither 'on' nor 'off' and was ignored)"
+        if value not in ("", RetunePolicy.OFF, RETUNE_ON)
+        else ""
+    )
     if refused is not None:
-        answer.tune = refused
-        return _TUNE_REASON.get(refused, "")
+        answer.tune = refused[0]
+        return refused[1] + ignored if refused[1] else ""
     assert recipe is not None  # noqa: S101 - narrowing for mypy: no recipe was refused above
     from localmodels import retune as retune_module  # noqa: PLC0415 - only a lookup that queues a tune
 
@@ -852,7 +875,7 @@ def _decide_tune(
         measured_at=answer.record.measured_at.timestamp() if answer.record else None,
     )
     answer.tune, answer.tune_detail = outcome.state, outcome.detail
-    return outcome.note
+    return outcome.note + ignored
 
 
 def _from_record(

@@ -92,7 +92,7 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     monkeypatch.setenv(
         retune.SUBMIT_ENV, str(tmp_path / "no-submit.py")
     )  # never the machine's real submit.py
-    monkeypatch.delenv(settings.RETUNE_ENV, raising=False)
+    monkeypatch.setenv(settings.RETUNE_ENV, settings.RETUNE_ON)  # pytest turns it off unless it is on
     monkeypatch.delenv(settings.TUNING_ENV, raising=False)
     monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "state"))
     monkeypatch.setattr(settings, "inspect_hardware", lambda: GB10)

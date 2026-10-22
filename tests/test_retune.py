@@ -86,7 +86,8 @@ def slurm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Slurm:
     monkeypatch.setenv("FAKE_DIR", str(folder))
     monkeypatch.setenv(retune.SUBMIT_ENV, str(script))
     monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "state"))
-    for name in (settings.RETUNE_ENV, settings.TUNING_ENV, settings.TUNE_CHANGE_ENV):
+    monkeypatch.setenv(settings.RETUNE_ENV, settings.RETUNE_ON)  # pytest turns it off unless it is on
+    for name in (settings.TUNING_ENV, settings.TUNE_CHANGE_ENV):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(settings, "inspect_hardware", lambda: GPU)
     monkeypatch.setattr(settings, "_announced", set())
@@ -213,6 +214,7 @@ def test_at_most_two_tune_jobs_are_live_and_a_free_slot_goes_to_the_next_lookup(
     [
         pytest.param(GPU, {"retune": RetunePolicy.OFF}, {}, TuneState.DISABLED, id="policy off"),
         pytest.param(GPU, {}, {settings.RETUNE_ENV: "off"}, TuneState.DISABLED, id="environment off"),
+        pytest.param(GPU, {}, {settings.RETUNE_ENV: ""}, TuneState.DISABLED, id="pytest without on"),
         pytest.param(GPU, {}, {settings.TUNING_ENV: "1"}, TuneState.NOT_NEEDED, id="a tune job's own load"),
         pytest.param(GPU, {"recipe": None}, {}, TuneState.NO_RECIPE, id="no recipe"),
         pytest.param(
@@ -245,6 +247,7 @@ def test_what_queues_nothing_creates_nothing(
         monkeypatch.setenv(name, value)
     answer = lookup(MODEL, KIND, **{"recipe": recipe(tmp_path), **call})
     assert answer.tune is expected
+    assert any("off under pytest" in note for note in answer.notes) == (env.get(settings.RETUNE_ENV) == "")
     assert answer.tune_plan is TunePlan.FULL
     assert slurm.submissions() == []
     assert not retune.pending_dir().exists()

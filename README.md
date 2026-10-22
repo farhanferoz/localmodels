@@ -191,7 +191,9 @@ job per model and change by running slurm's `submit.py` (`$LOCALMODELS_SUBMIT`, 
 `~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the answer's `tune` and
 `tune_detail` say what happened (`queued`, `already-queued`, `waiting`, `failed-before`, `measured-not-adopted`, ...). Until the
 job adopts a record the model runs on its current settings. `retune=RetunePolicy.OFF` (per call) or `LOCALMODELS_RETUNE=off`
-(per process) turns it off; a test suite that loads models should set it. Only PyTorch tunes are queued so far.
+(per process) turns it off. Under pytest it is off by default (`tune: disabled`, nothing created), so a test suite that loads
+models never submits a job; `LOCALMODELS_RETUNE=on` turns it on for a test of the re-tune itself, and `off` still wins over `on`.
+Only PyTorch tunes are queued so far.
 
 ## Monthly digest
 
