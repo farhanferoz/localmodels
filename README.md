@@ -186,6 +186,11 @@ still wins, a pinned answer queues no tune, and the stamp keeps the status the p
 read or written is never replaced, the answer comes back unpinned and `pin_problem` says why. To attach the decision to a result,
 pass the answer to `LocalServerManager.stamp(settings=answer)` or `ModelHost.stamp(settings=answer)`, or build the stamp of an
 in-process load with `answer.server_stamp(model_path, build)`; it appears as `ServerStamp.settings`.
+To start a llama-server with an answer, pass `LocalServerManager(settings=answer)` (or set `settings_request` in the `serve` config): it
+adds `-ub` and the speculative-decoding flags, each as a group the caller's own `extra_flags` or `extra_env` win (the stamp lists it as
+`overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it
+(unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)`, not `manager.extra_flags`.
+
 A lookup that is given a `recipe=TuneRecipe(...)` and finds a tune due (a first use, or a stale record) queues one slurm
 job per model and change by running slurm's `submit.py` (`$LOCALMODELS_SUBMIT`, default
 `~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the answer's `tune` and

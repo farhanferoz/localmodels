@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import logging
 import signal
 import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .hardware import inspect_hardware
 from .launcher import (
@@ -43,19 +45,66 @@ from .launcher import (
 from .lease import DEFAULT_LEASE_DIR, GpuLease
 from .params import derive_serving_params
 from .process import ServerSpec, resolve_llama_server_bin
+from .stack import Engine, llama_cpp_build
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from .enums import WorkloadKind
     from .process import ServerHandle
+    from .settings import ModelIdentity, TuneRecipe
 
 # Matches the shared GPU-lease protocol doc (service_c/docs/2026-09-15-gpu-lease-protocol.md):
 # "Polls every 30 s" -- service_a's half of the contract this package now implements.
+log = logging.getLogger(__name__)
+
 _DEFAULT_POLL_S = 30.0
 _DEFAULT_PID_DIR = Path("~/.local/state/localmodels/pids").expanduser()
 
 EXIT_OK = 0
 EXIT_ERROR = 1
+
+
+class SettingsRequest(BaseModel):
+    """What `lookup` needs for a served model: its identity, the kind of work and a tune recipe.
+
+    Its field types come from ``localmodels.settings``, which ``localmodels`` commands that only import this
+    module must not load, so the class is completed on first use (``_settings_request_type``). Built in a
+    module that has imported ``ModelIdentity`` and ``TuneRecipe``, pydantic completes it from there as well.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model: ModelIdentity
+    kind: WorkloadKind
+    build: str | None = None
+    recipe: TuneRecipe | None = None
+
+
+@functools.cache
+def _settings_request_type() -> type[SettingsRequest]:
+    from .enums import WorkloadKind  # noqa: PLC0415 - the types the class above names, loaded on first use
+    from .settings import ModelIdentity, TuneRecipe  # noqa: PLC0415 - the lazy import
+
+    SettingsRequest.model_rebuild(
+        _types_namespace={
+            "ModelIdentity": ModelIdentity,
+            "TuneRecipe": TuneRecipe,
+            "WorkloadKind": WorkloadKind,
+        }
+    )
+    return SettingsRequest
+
+
+def _identity_problem(identity: ModelIdentity, model_path: Path) -> str | None:
+    """Why ``identity`` is not the file served at ``model_path``, or None (a bare revision cannot be told)."""
+    if identity.files:
+        names = sorted({Path(file.path).name for file in identity.files})
+        if model_path.name not in names:
+            return f"settings_request names the files {', '.join(names)}, not {model_path.name}"
+    elif identity.unpinned and Path(identity.unpinned.split("|")[0]) != model_path.expanduser().resolve():
+        return f"settings_request names the path {identity.unpinned.split('|')[0]}, not {model_path}"
+    return None
 
 
 class ServeConfig(BaseModel):
@@ -85,11 +134,27 @@ class ServeConfig(BaseModel):
     guards: MemoryGuards = Field(default_factory=MemoryGuards)
     #: Memory a stay-up service holds all the time; required with ``Contention.STAY_UP``.
     resident_allowance_gib: float | None = Field(default=None, gt=0)
+    #: A ``SettingsRequest`` (or its dict, from TOML): ask `localmodels.settings.lookup` for the model's
+    #: measured settings and start the server with them. At run time the field is untyped so that this module
+    #: does not import the lookup; the validator below builds the request.
+    if TYPE_CHECKING:
+        settings_request: SettingsRequest | None = None
+    else:
+        settings_request: Any = None
+
+    @field_validator("settings_request", mode="before")
+    @classmethod
+    def _as_settings_request(cls, value: Any) -> Any:
+        return None if value is None else _settings_request_type().model_validate(value)
 
     @model_validator(mode="after")
     def _stay_up_needs_its_guards(self) -> ServeConfig:
         if self.contention is Contention.STAY_UP and (
             problem := stay_up_problem(self.guards, self.resident_allowance_gib)
+        ):
+            raise ValueError(problem)
+        if (request := self.settings_request) is not None and (
+            problem := _identity_problem(request.model, self.model_path)
         ):
             raise ValueError(problem)
         return self
@@ -107,6 +172,15 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
     params = derive_serving_params(hardware.device, hardware.total_memory_gb)
     binary = config.binary or resolve_llama_server_bin()
     lease = GpuLease(config.lease_dir, project=config.project)
+    answer = None
+    if (request := config.settings_request) is not None:
+        from .settings import lookup  # noqa: PLC0415 - only a service asking for measured settings loads it
+
+        build = request.build or llama_cpp_build(Path(binary))
+        answer = lookup(
+            request.model, request.kind, engine=Engine.LLAMA_CPP, build=build, recipe=request.recipe
+        )
+        answer.announce(log)
     return LocalServerManager(
         ServerSpec(
             host=config.host,
@@ -126,6 +200,7 @@ def _build_manager(config: ServeConfig, http: httpx.AsyncClient) -> LocalServerM
         extra_env=config.extra_env,
         guards=config.guards,
         resident_allowance_gib=config.resident_allowance_gib,
+        settings=answer,
     )
 
 

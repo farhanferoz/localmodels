@@ -160,7 +160,7 @@ def test_a_manager_stamps_what_it_started(tmp_path: Path) -> None:
     assert (stamped.settings.status, stamped.settings.applied) == (
         SettingsStatus.TUNED,
         Settings(),
-    )  # none given yet
+    )  # this manager has no answer, so it passed none of the settings
     assert ServerStamp.model_validate_json(stamped.model_dump_json()) == stamped
     # an in-process load's stamp: the identity's sole file is its hash unless given; its engine and precision
     assert ANSWER.server_stamp("/m", "2.10.0").model_sha256 == "cd" * 32

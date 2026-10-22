@@ -4,7 +4,15 @@ import pytest
 
 from localmodels.enums import DeviceType, ServingRole
 from localmodels.params import derive_serving_params
-from localmodels.process import BinaryNotFoundError, ServerSpec, build_args, resolve_llama_server_bin
+from localmodels.process import (
+    BinaryNotFoundError,
+    ServerSpec,
+    build_args,
+    llama_flags,
+    llama_option,
+    resolve_llama_server_bin,
+)
+from localmodels.stack import Settings, SpecType
 
 
 def test_binary_chain_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -51,3 +59,37 @@ def test_build_args_offloads_by_device_adds_kvu_only_for_a_role_and_keeps_extra_
         assert args[args.index("-np") : args.index("-np") + 3] == ["-np", slots, "-kvu"]
         assert "-ub" not in args
         assert args[-2:] == ["--spec-type", "draft-mtp"]
+
+
+def test_llama_flags_leave_a_group_out_whole_when_the_callers_own_flags_or_env_carry_any_of_it() -> None:
+    chosen = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file="/d.gguf")
+    ub, spec = ("-ub", "2048"), ("--spec-type", "draft-mtp", "--spec-draft-model", "/d.gguf")
+    assert llama_flags(chosen, (), None) == (*ub, *spec)
+    assert llama_flags(Settings(spec=SpecType.NONE), (), None) == llama_flags(Settings(), (), None) == ()
+    for flags, env in [
+        (("-ub", "512"), None),
+        (("--ubatch-size=512",), None),
+        (("--ubatch_size", "512"), None),  # llama.cpp reads underscores in a `--` name as dashes
+        ((), {"LLAMA_ARG_UBATCH": "5"}),
+        (("-b", "512"), None),  # a smaller batch size caps `-ub`: the caller's own choice stands
+        ((), {"LLAMA_ARG_BATCH": "512"}),
+    ]:
+        assert llama_flags(chosen, flags, env) == spec
+    assert llama_flags(chosen, ("-b", "4096"), None) == (*ub, *spec)  # a larger one caps nothing
+    # any speculation option keeps all of them out: an alias, a tuning knob, a variable of either family
+    for flags, env in [
+        (("-md", "/x.gguf"), None), (("--draft-max=8",), None), (("--spec-draft-n-min", "1"), None),
+        ((), {"LLAMA_ARG_SPEC_TYPE": "ngram-mod"}), ((), {"LLAMA_ARG_DRAFT_MIN": "1"}),
+        (("--spec_type", "ngram-mod"), None), (("--no-spec-draft-backend-sampling",), None),
+        (("-lcd", "cache.bin"), None), (("--lookup-cache-static", "c.bin"), None),
+    ]:  # fmt: skip
+        assert llama_flags(chosen, flags, env) == ub
+    # the value in force: the last flag, either form, over the environment
+    names = ("-ub", "--ubatch-size")
+    assert (
+        llama_option(("-ub", "1", "--ubatch-size=2"), {"LLAMA_ARG_UBATCH": "3"}, names, "LLAMA_ARG_UBATCH")
+        == "2"
+    )
+    assert llama_option((), {"LLAMA_ARG_UBATCH": "3"}, names, "LLAMA_ARG_UBATCH") == "3"
+    assert llama_option(("-c", "8"), None, names, "LLAMA_ARG_UBATCH") is None
+    assert llama_option(("--ubatch_size", "7"), None, names, "LLAMA_ARG_UBATCH") == "7"
