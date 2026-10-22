@@ -52,6 +52,9 @@ class Engine(StrEnum):
     """What serves the model."""
 
     LLAMA_CPP = "llama.cpp"
+    LLAMA_CPP_PYTHON = (
+        "llama-cpp-python"  # carries its own llama.cpp: a llama-server record never applies to it
+    )
     PYTORCH = "pytorch"
 
 
