@@ -12,24 +12,34 @@ localmodels`` does not load this module (slurm's lease keeper runs this package)
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime  # noqa: TC003 - pydantic needs it at runtime
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from localmodels.atomic import write_text_atomically
 from localmodels.enums import Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
 from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
 from localmodels.pull import _default_hub_cache, _repo_blob_name
 from localmodels.rules import EXIT_STALE, StampKey, rules_text, stamps
-from localmodels.serving.tune import TuneRecord, _read_records, hardware_key, untuned_message
+from localmodels.serving.tune import (
+    Agreement,
+    TuneMeasurement,
+    TuneRecord,
+    _read_records,
+    hardware_key,
+    untuned_message,
+)
 from localmodels.stack import (
     UNKNOWN,
     Engine,
@@ -47,7 +57,7 @@ from localmodels.stack import SpecType as SpecType  # noqa: PLC0414 - re-exporte
 
 if TYPE_CHECKING:
     import argparse
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 STATE_DIR_ENV: Final = "LOCALMODELS_STATE_DIR"
 DEFAULT_STATE_DIR: Final = Path("~/.local/state/localmodels")
@@ -57,6 +67,9 @@ _KEY_CHARS: Final = 16
 _SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _BAD_FILE: Final = (OSError, ValueError, KeyError, TypeError, RecursionError)  # what a damaged file raises
 _ANY_MODEL: Final = "any"  # a rules.md stamp's model= for a training method
+HISTORY_KEPT: Final = 5  # replaced records kept per model and kind
+MIN_PASSES: Final = 2  # timed passes needed to measure a spread
+SPEED_MARGIN: Final = 0.05  # a candidate must beat the incumbent by more than this (and the timing spread)
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +145,12 @@ class SettingsRecord(BaseModel):
     libraries: dict[str, str] = Field(default_factory=dict)
     recipe_project: str | None = None
     engine: Engine | None = None  # a record made through another engine is not used
+    agreement: Agreement | None = None  # the chosen candidate's, against the reference
+    reference: str = ""  # the name of the reference candidate
+    measurements: list[TuneMeasurement] = Field(default_factory=list)
+    previous: str | None = None  # the replaced record's candidate, or its settings described
+    tune_job: str | None = None
+    adopted_at: datetime | None = None
 
 
 class TuneRecipe(BaseModel):
@@ -252,6 +271,16 @@ class SettingsAnswer(BaseModel):
 def settings_dir() -> Path:
     """The store: ``$LOCALMODELS_STATE_DIR``/settings, else ``~/.local/state/localmodels/settings``."""
     return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / "settings"
+
+
+@contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``path``'s sibling ``.lock`` file for the block (created if absent)."""
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def _slug(repository: str) -> str:
@@ -573,6 +602,180 @@ def stale_records(host: Mapping[str, str], current_build: str | None) -> tuple[l
                 who = f"{record.model.repository} {record.kind.value} ({record.hardware})"
                 stale.append(f"{who}: {', '.join(changed)} [{path}]")
     return stale, problems, total
+
+
+class AdoptError(ValueError):
+    """A record that must not become current, or a store file that must not be written."""
+
+
+def _label(record: SettingsRecord) -> str:
+    return record.candidate or _describe(record.chosen)
+
+
+def _read_items(path: Path) -> tuple[list[Any], bool]:
+    """The raw entries of a store file, and whether the file was unreadable (then there are none).
+
+    Raises:
+        AdoptError: the file was written by a newer localmodels; it is never written.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        schema, items = payload["schema"], payload["records"]
+        if not isinstance(schema, int) or not isinstance(items, list):
+            msg = "schema is not a number or records is not a list"
+            raise TypeError(msg)
+    except FileNotFoundError:
+        return [], False
+    except _BAD_FILE:
+        return [], True
+    if schema > SCHEMA_VERSION:
+        msg = f"{path} has schema {schema}, written by a newer localmodels; it is not overwritten"
+        raise AdoptError(msg)
+    return items, False
+
+
+def _to_history(path: Path, kind: WorkloadKind, texts: list[str]) -> None:
+    """Keep ``texts`` (one record each) in the history of the file at ``path``; the newest few stay."""
+    folder = settings_dir() / "history" / path.parent.name / kind.value
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    for index, text in enumerate(texts):
+        write_text_atomically(folder / f"{stamp}-{index}.json", text)
+    for old in sorted(folder.glob("*.json"))[:-HISTORY_KEPT]:
+        old.unlink()
+
+
+def adopt(record: SettingsRecord) -> SettingsRecord:
+    """Make ``record`` the current one for its hardware, build and engine; what was stored comes back.
+
+    The replaced entry goes to ``history/`` and its candidate is kept as ``previous``. Every other entry stays
+    exactly as it was, including one this version cannot read (a newer localmodels wrote it). An unreadable
+    file is copied to ``history/`` and replaced. An exclusive lock on the file means two adopts lose nothing.
+
+    Raises:
+        AdoptError: the record has no quality check, its chosen candidate's agreement did not pass, or the
+            file was written by a newer localmodels.
+    """
+    who = f"{record.model.repository} ({record.kind.value})"
+    if not record.quality:
+        msg = f"{who}: a record with no quality check adopts nothing"
+        raise AdoptError(msg)
+    if record.agreement is None or not record.agreement.passed:
+        msg = f"{who}: the chosen candidate's agreement did not pass"
+        raise AdoptError(msg)
+    path = record_path(record.model, record.kind)
+    with _locked(path):
+        items, unreadable = _read_items(path)
+        if unreadable:
+            _to_history(path, record.kind, [path.read_text(encoding="utf-8", errors="replace")])
+        entries: list[Any] = []
+        replaced: list[tuple[SettingsRecord, Any]] = []
+        slot: int | None = None
+        for item in items:
+            try:
+                old = SettingsRecord.model_validate(item)
+            except ValidationError:
+                entries.append(item)  # another version's entry: kept as it is
+                continue
+            if (old.hardware, old.build, old.engine) != (record.hardware, record.build, record.engine):
+                entries.append(item)
+                continue
+            replaced.append((old, item))
+            if slot is None:
+                slot = len(entries)
+                entries.append(None)
+        previous = _label(replaced[0][0]) if replaced else None
+        stored = record.model_copy(update={"previous": previous, "adopted_at": datetime.now(UTC)})
+        if slot is None:
+            entries.append(stored.model_dump(mode="json"))
+        else:
+            entries[slot] = stored.model_dump(mode="json")
+        if replaced:
+            _to_history(path, record.kind, [json.dumps(item, indent=2) + "\n" for _, item in replaced])
+        payload = {"schema": SCHEMA_VERSION, "records": entries}
+        write_text_atomically(path, json.dumps(payload, indent=2) + "\n")
+    changed = bool(replaced) and replaced[0][0].chosen != stored.chosen
+    log.log(
+        logging.WARNING if changed else logging.INFO,
+        "settings for %s (%s) %s: %s%s, agreement %.3f (%s)",
+        record.model.repository,
+        record.kind.value,
+        "changed" if changed else "adopted",
+        f"{previous} -> " if changed else "",
+        _label(stored),
+        record.agreement.score,
+        record.quality,
+    )
+    return stored
+
+
+def _eligible(measurement: TuneMeasurement | None) -> TuneMeasurement | None:
+    """``measurement`` if its candidate ran, fits and agreed with the reference; else None."""
+    if (
+        measurement is not None
+        and measurement.error is None
+        and measurement.fits
+        and measurement.agreement is not None
+        and measurement.agreement.passed
+        and measurement.infer_s_median is not None
+    ):
+        return measurement
+    return None
+
+
+def _timing_spread(reference: TuneMeasurement) -> float:
+    """How far the reference's timed passes differ, as a fraction of the quickest; 0 with fewer than two."""
+    if len(reference.pass_s) < MIN_PASSES or min(reference.pass_s) <= 0:
+        return 0.0
+    return (max(reference.pass_s) - min(reference.pass_s)) / min(reference.pass_s)
+
+
+def record_from_tune(
+    tune: TuneRecord,
+    *,
+    model: ModelIdentity,
+    kind: WorkloadKind,
+    libraries: Mapping[str, str] | None = None,
+    recipe_project: str | None = None,
+    tune_job: str | None = None,
+) -> SettingsRecord:
+    """The store record for a PyTorch ``tune``, after the speed margin of design 5.5; adopt it with ``adopt``.
+
+    The incumbent is the candidate the store holds for this hardware if this tune measured it and it is
+    eligible, else the reference. A candidate other than the reference or the incumbent is chosen only if it
+    beats the incumbent's median inference time by more than the larger of ``SPEED_MARGIN`` and the
+    reference's timing spread; otherwise the incumbent stays, so timing noise cannot change the settings.
+    ``libraries`` are the caller's versions, added for names the tune's server did not report.
+    """
+    by_name = {m.candidate.name: m for m in tune.measurements}
+    chosen = by_name[tune.chosen.name]
+    store = read_store(record_path(model, kind))
+    stored = _pick(store.records, tune.hardware, None, Engine.PYTORCH)
+    incumbent = _eligible(by_name.get(stored.candidate) if stored else None) or _eligible(
+        by_name.get(tune.reference)
+    )
+    if incumbent is not None and chosen.candidate.name not in (tune.reference, incumbent.candidate.name):
+        assert chosen.infer_s_median is not None  # noqa: S101 - narrowing for mypy; the tune chose an eligible one
+        assert incumbent.infer_s_median is not None  # noqa: S101
+        faster = incumbent.infer_s_median / chosen.infer_s_median - 1
+        if faster <= max(SPEED_MARGIN, _timing_spread(by_name[tune.reference])):
+            chosen = incumbent
+    return SettingsRecord(
+        model=model,
+        kind=kind,
+        hardware=tune.hardware,
+        measured_at=tune.measured_at,
+        chosen=Settings(dtype=chosen.candidate.dtype, options=chosen.candidate.options),
+        candidate=chosen.candidate.name,
+        quality=tune.quality,
+        stack=tune.stack,
+        engine=Engine.PYTORCH,
+        libraries={**(libraries or {}), **tune.libraries},
+        recipe_project=recipe_project,
+        agreement=chosen.agreement,
+        reference=tune.reference,
+        measurements=tune.measurements,
+        tune_job=tune_job,
+    )
 
 
 def cmd_settings_show(args: argparse.Namespace) -> int:

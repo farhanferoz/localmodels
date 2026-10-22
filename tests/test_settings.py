@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -17,7 +18,9 @@ from localmodels.cli import main
 from localmodels.enums import DeviceTier, DeviceType, Precision, WorkloadKind
 from localmodels.hardware import HardwareReport
 from localmodels.rules import rules_text, stamps
+from localmodels.serving.tune import Agreement, TuneCandidate, TuneMeasurement, TuneRecord
 from localmodels.settings import (
+    AdoptError,
     ModelIdentity,
     Settings,
     SettingsRecord,
@@ -27,7 +30,10 @@ from localmodels.settings import (
     TunePlan,
     TuneRecipe,
     TuneState,
+    adopt,
     lookup,
+    read_store,
+    record_from_tune,
     record_path,
 )
 from localmodels.stack import Engine
@@ -428,6 +434,130 @@ def test_settings_show_prints_an_answer_and_check_lists_stale_records(
     assert "1 of 1 records stale." in out
     host["driver"] = "590.2"
     assert main(["settings", "check", "--home", str(tmp_path)]) == 0
+
+
+K5 = WorkloadKind.K5
+PASSED = Agreement(score=0.907, passed=True, detail="mean word similarity 0.907")
+
+
+def adoptable(
+    hardware: str = GB10_KEY, dtype: Precision = Precision.BFLOAT16, **fields: Any
+) -> SettingsRecord:
+    """A record that may be adopted (it names its quality check and its passed agreement)."""
+    return SettingsRecord.model_validate(
+        {
+            "model": MEDGEMMA, "kind": K5, "hardware": hardware, "chosen": Settings(dtype=dtype),
+            "measured_at": datetime(2026, 10, 22, tzinfo=UTC), "candidate": dtype.value,
+            "quality": "text 0.9", "agreement": PASSED, "engine": Engine.PYTORCH, **fields,
+        }
+    )  # fmt: skip
+
+
+def history_files(model: ModelIdentity, kind: WorkloadKind) -> list[Path]:
+    folder = settings.settings_dir() / "history" / record_path(model, kind).parent.name / kind.value
+    return sorted(folder.glob("*.json"))
+
+
+def test_adoption_needs_a_quality_check_and_a_passed_agreement_and_never_writes_a_newer_file() -> None:
+    failed = PASSED.model_copy(update={"passed": False})
+    for refused in (adoptable(quality=""), adoptable(agreement=None), adoptable(agreement=failed)):
+        with pytest.raises(AdoptError, match=r"quality check|agreement"):
+            adopt(refused)
+    path = record_path(MEDGEMMA, K5)
+    assert not path.exists()
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema": 2, "records": []}')
+    with pytest.raises(AdoptError, match="newer localmodels"):
+        adopt(adoptable())
+    assert path.read_text() == '{"schema": 2, "records": []}'
+
+
+def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = record_path(MEDGEMMA, K5)
+    path.parent.mkdir(parents=True)
+    future = {"model": "a shape this version cannot read", "added_by": "a newer localmodels"}
+    other = adoptable(hardware="cuda:Other:24GB:x86_64").model_dump(mode="json")
+    path.write_text(json.dumps({"schema": 1, "records": [future, other]}))
+    with caplog.at_level(logging.INFO, logger="localmodels.settings"):
+        first = adopt(adoptable())
+        assert (first.previous, first.adopted_at is not None) == (None, True)
+        assert history_files(MEDGEMMA, K5) == []
+        for dtype in (Precision.FLOAT32, Precision.BFLOAT16, Precision.FLOAT32, Precision.BFLOAT16):
+            adopt(adoptable(dtype=dtype))
+        again = adopt(adoptable(dtype=Precision.BFLOAT16))
+    assert again.previous == "bfloat16"
+    records = json.loads(path.read_text())["records"]
+    assert [records[0], records[1]] == [future, other]  # entries it does not own stay exactly as they were
+    assert [r["candidate"] for r in records[2:]] == ["bfloat16"]  # one entry for this slot, replaced
+    assert len(history_files(MEDGEMMA, K5)) == 5  # six were replaced; the oldest was deleted
+    changes = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert changes[0].startswith("settings for google/medgemma-1.5-4b-it (K5) changed: bfloat16 -> float32, ")
+    assert "agreement 0.907 (text 0.9)" in changes[0]
+    assert len(changes) == 4  # the unchanged choice only says it was adopted
+    path.write_text("not json at all")
+    adopt(adoptable())
+    assert any(f.read_text() == "not json at all" for f in history_files(MEDGEMMA, K5))
+    assert [r.candidate for r in read_store(path).records] == ["bfloat16"]
+
+
+def test_two_adopts_racing_lose_nothing() -> None:
+    barrier = threading.Barrier(8)
+
+    def racer(index: int) -> None:
+        barrier.wait()
+        adopt(adoptable(hardware=f"cuda:Card {index}:24GB:x86_64"))
+
+    threads = [threading.Thread(target=racer, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(read_store(record_path(MEDGEMMA, K5)).records) == 8
+
+
+def measured(name: str, dtype: Precision, median: float, **fields: Any) -> TuneMeasurement:
+    return TuneMeasurement(
+        candidate=TuneCandidate(name=name, dtype=dtype), infer_s=[median], infer_s_median=median,
+        peak_gib=1.0, agreement=PASSED, fits=True, **fields,
+    )  # fmt: skip
+
+
+def tune_of(fast_median: float, reference_passes: list[float]) -> TuneRecord:
+    """float32 (reference, 1.0 s), bfloat16 (0.5 s; the store's incumbent) and float16 (``fast_median``)."""
+    ms = [
+        measured("float32", Precision.FLOAT32, 1.0, pass_s=reference_passes),
+        measured("bfloat16", Precision.BFLOAT16, 0.5),
+        measured("float16", Precision.FLOAT16, fast_median),
+    ]
+    best = min(ms, key=lambda m: m.infer_s_median or 0)
+    return TuneRecord(
+        hardware=GB10_KEY, localmodels_version="0.6.0", measured_at=datetime(2026, 10, 22, tzinfo=UTC),
+        reference="float32", quality="text 0.9", chosen=best.candidate, measurements=ms, stack=HOST,
+        libraries={"torch": "2.9"},
+    )  # fmt: skip
+
+
+def test_a_faster_candidate_displaces_the_incumbent_only_beyond_the_margin_and_the_timing_spread() -> None:
+    put(MEDGEMMA, K5, candidate="bfloat16", engine="pytorch")  # the incumbent
+    ask = {"model": MEDGEMMA, "kind": K5, "libraries": {"torch": "2.8", "transformers": "5.0"}}
+    cases = [(0.485, [1.0]), (0.45, [1.0]), (0.45, [1.0, 1.2])]
+    assert [record_from_tune(tune_of(fast, passes), **ask).candidate for fast, passes in cases] == [
+        "bfloat16",  # 3 % faster than the incumbent
+        "float16",  # 11 % faster
+        "bfloat16",  # 11 % faster, but the reference's two passes differ by 20 %
+    ]
+    record = record_from_tune(tune_of(0.45, [1.0]), **ask, recipe_project="service_b", tune_job="12")
+    assert (record.chosen, record.engine, record.agreement) == (
+        Settings(dtype=Precision.FLOAT16),
+        Engine.PYTORCH,
+        PASSED,
+    )
+    assert (record.reference, len(record.measurements), record.recipe_project, record.tune_job) == (
+        "float32", 3, "service_b", "12",
+    )  # fmt: skip
+    assert record.libraries == {"torch": "2.9", "transformers": "5.0"}  # the tune's own report wins
 
 
 def test_importing_localmodels_or_its_cli_does_not_import_the_lookup() -> None:
