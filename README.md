@@ -118,6 +118,7 @@ localmodels setup [--role chat] [--models-dir DIR] [--catalogue FILE] [--yes]
 localmodels serve --config <toml>
 localmodels lease {status,acquire,wait,begin-wait,admitted,release} --project NAME ...
 localmodels rules {show KIND,check}
+localmodels settings {show --model REPO (--revision REV | --file NAME) --kind KIND,check}
 localmodels llama {build --commit SHA,list,switch COMMIT,prune}
 localmodels digest run
 ```
@@ -156,13 +157,28 @@ its own it waits for every other live lease, as before.
 `localmodels rules show K2` prints the measured rule for one kind of workload (K1 interactive text generation to K10
 fine-tuning; `src/localmodels/rules.md`): the rule, its evidence, the stack it was measured on (a `stamp:` line) and
 a benchmark recipe, then the newest digest lines for that kind. `localmodels rules check` compares every stamp with
-this host and the current llama.cpp build and exits 1 when a stamped component changed, naming the rules to re-measure.
+this host and the current llama.cpp build and exits 1 when a stamped component changed, naming the rules to re-measure;
+it also lists stamps that do not name the models they were measured on (`model=`).
 
 `localmodels llama build --commit SHA` compiles one llama.cpp commit on the CPU into `~/cache/llama.cpp/builds/<commit>`
 (`LOCALMODELS_LLAMA_HOME` moves it), with the CMake options of the build in `~/dev/llama.cpp/build`. `llama list` shows
 the builds, which is `current` and which projects name each (`builds/users.toml`); `llama switch COMMIT` moves `current`
 only when that build's `comparison.json` (from the K1-K3 recipes against the current build) records a pass; `llama
 prune` deletes builds that are neither current nor named.
+
+## Measured settings
+
+`localmodels.settings.lookup(model, kind, ...)` answers what to load a model with on this machine and how far to trust
+it, from a tune record in `~/.local/state/localmodels/settings` (`$LOCALMODELS_STATE_DIR` moves it), else the written
+rule of the kind, else the caller's default. Only a record is `tuned`; a record whose stack or llama.cpp build changed
+is `stale` and stays in use; a rule measured on this model is `rule`; a rule measured on other models only is
+`rule-other-model` and changes nothing (the caller's default stays). `explicit=` settings are never overridden (`options` key by key). A model is identified by its files, or a 40-character revision,
+or an announced path; a repository alone is refused. The caller's `libraries={"torch": ...}` are compared with the
+ones the record names. The store is never a reason for a load to fail: a bad or newer file is treated as absent and announced
+(`answer.announce(log)`). The module is imported on demand; `import localmodels` does not load it.
+`localmodels settings show --model REPO --revision REV --kind K6` (or `--file NAME`) prints one answer and loads nothing; `settings check` lists the
+stored records that are stale on this host and exits 1 when any is. Automatic re-tuning is not built yet: an answer
+that calls for a tune reports `tune: not-available`.
 
 ## Monthly digest
 
