@@ -63,6 +63,8 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Iterator, Mapping
 
+    from localmodels.hardware import HardwareReport
+
 STATE_DIR_ENV: Final = "LOCALMODELS_STATE_DIR"
 DEFAULT_STATE_DIR: Final = Path("~/.local/state/localmodels")
 SCHEMA_VERSION: Final = 1
@@ -77,7 +79,7 @@ SPEED_MARGIN: Final = 0.05  # a candidate must beat the incumbent by more than t
 TUNING_ENV: Final = "LOCALMODELS_TUNING"  # set to TUNING_ON in a tune job: its loads queue no tune
 TUNING_ON: Final = "1"
 RETUNE_ENV: Final = (
-    "LOCALMODELS_RETUNE"  # ``off`` turns the automatic re-tune off; ``on`` allows it under pytest
+    "LOCALMODELS_RETUNE"  # any value but ``on`` turns the re-tune off; ``on`` allows it under pytest
 )
 RETUNE_ON: Final = "on"
 PYTEST_ENV: Final = "PYTEST_CURRENT_TEST"  # set by pytest while a test runs
@@ -550,7 +552,7 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     does not name is reported, not a reason. ``recipe`` is how a tune is run: when the answer calls for one
     (``tune_plan``) and nothing rules it out, the lookup queues one slurm job for the model and change
     (``retune.py``) and ``tune`` and ``tune_detail`` say what happened. ``retune=RetunePolicy.OFF``, or
-    ``LOCALMODELS_RETUNE=off`` in the environment, queues nothing (``DISABLED``). Under pytest nothing is
+    ``LOCALMODELS_RETUNE`` set to anything but ``on``, queues nothing (``DISABLED``). Under pytest nothing is
     queued either unless ``LOCALMODELS_RETUNE=on``. ``LOCALMODELS_TUNING=1`` marks a tune job's own loads,
     which queue nothing.
     ``legacy_path`` is the caller's own tune
@@ -584,19 +586,20 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         source=SettingsSource.DEFAULT,
     )
 
+    report = None  # the hardware probed for the answer
     if engine is Engine.LLAMA_CPP_PYTHON:
         answer.tune = TuneState.NOT_AVAILABLE
         notes.append(f"{name}: llama-cpp-python has no tune path yet; it runs the caller's default settings.")
     else:
-        _from_store(answer, (engine, build, libraries), legacy_path, notes)
+        report = _from_store(answer, (engine, build, libraries), legacy_path, notes)
 
     if pin is not None:
         # the store's problem note, if any, follows the identity notes and still holds when pinned
         _pin(answer, pin, notes, identity_notes + (answer.store is not StoreState.OK))
     # the tune is decided after the pin, which wants none; a tune is submitted from here, never before
-    if answer.tune_plan:
+    if answer.tune_plan and report is not None:
         answer.tune = TuneState.NOT_NEEDED
-        if note := _decide_tune(answer, answer.tune_plan, recipe, retune, explicit, build):
+        if note := _decide_tune(answer, answer.tune_plan, (recipe, retune, explicit, build), report):
             notes.append(f"A {answer.tune_plan.value} tune is wanted; {note}.")
     if explicit:
         answer.settings, answer.overridden = _apply_explicit(answer.settings, explicit)
@@ -745,12 +748,16 @@ def _from_store(
     asked: tuple[Engine, str | None, Mapping[str, str] | None],
     legacy_path: Path | None,
     notes: list[str],
-) -> None:
-    """The record for this machine (the store's, else ``legacy_path``'s), else the rule or the default."""
+) -> HardwareReport:
+    """The record for this machine (the store's, else ``legacy_path``'s), else the rule or the default.
+
+    Returns the hardware it probed, for the tune decision.
+    """
     engine, build, libraries = asked
     model, kind = answer.model, answer.kind
     name = f"{model.repository} ({kind.value})"
-    hardware = hardware_key(inspect_hardware())
+    report = inspect_hardware()
+    hardware = hardware_key(report)
     path = record_path(model, kind)
     store = read_store(path)
     record = _pick(store.records, hardware, build, engine)
@@ -763,12 +770,13 @@ def _from_store(
         notes.append(f"Settings records for {name} unusable, treated as absent: {store.problem}")
     if record is None:
         _from_rule(answer, notes, hardware)
-        return
+        return report
     compared = build if engine is Engine.LLAMA_CPP else None
     if engine is Engine.LLAMA_CPP and build is None and record.build:
         compared = _current_build()
         notes.append(f"{name}: no llama.cpp build named; the record's build is compared with {compared}.")
     _from_record(answer, record, path, (compared, libraries), notes)
+    return report
 
 
 def _apply_explicit(chosen: Settings, explicit: Mapping[str, Any]) -> tuple[Settings, list[str]]:
@@ -801,18 +809,23 @@ def _refused_tune(
 ) -> tuple[TuneState, str] | None:
     """Why no tune is queued, checked in the order of design 5.1: (state, reason); None: nothing rules it out.
 
-    Under pytest a tune is queued only if ``LOCALMODELS_RETUNE=on``: a test that loads a model would otherwise
-    submit a real job wherever slurm's ``submit.py`` exists. ``off`` (or ``retune=OFF``) wins over ``on``.
+    ``retune`` is compared by value, so a plain ``"off"`` works. ``LOCALMODELS_RETUNE`` set to anything but
+    ``on`` turns the re-tune off (a switch meant to stop GPU jobs fails closed). Under pytest (the variable it
+    sets while a test runs, or its module already imported, as while it collects) a tune is queued only if
+    that variable is ``on``: a test that loads a model would otherwise submit a real job wherever slurm's
+    ``submit.py`` exists.
     """
     fields = _TUNED_FIELDS.get(answer.engine)
-    env = os.environ.get(RETUNE_ENV, "").strip().lower()
+    env = os.environ.get(RETUNE_ENV)
+    env_on = env is not None and env.strip().lower() == RETUNE_ON
+    switched_off = env is not None and not env_on
+    under_pytest = (PYTEST_ENV in os.environ or "_pytest" in sys.modules) and not env_on
+    why_off = "the automatic re-tune is off"
+    if switched_off and env is not None and env.strip().lower() != RetunePolicy.OFF:
+        why_off = f"{RETUNE_ENV}={env!r} is not 'on', so the automatic re-tune is off"
     checks = (
         (os.environ.get(TUNING_ENV) == TUNING_ON, TuneState.NOT_NEEDED, ""),  # a tune job's own load
-        (
-            retune is RetunePolicy.OFF or env == RetunePolicy.OFF,
-            TuneState.DISABLED,
-            "the automatic re-tune is off",
-        ),
+        (retune == RetunePolicy.OFF or switched_off, TuneState.DISABLED, why_off),
         (
             bool(fields and explicit and fields <= set(explicit)),
             TuneState.NOTHING_TO_TUNE,
@@ -830,7 +843,7 @@ def _refused_tune(
             "a tune job runs on the GPU; its record is one this CPU lookup never finds",
         ),
         (
-            PYTEST_ENV in os.environ and env != RETUNE_ON,
+            under_pytest,
             TuneState.DISABLED,
             f"automatic re-tune is off under pytest; set {RETUNE_ENV}={RETUNE_ON} to test it",
         ),
@@ -841,41 +854,38 @@ def _refused_tune(
 def _decide_tune(
     answer: SettingsAnswer,
     plan: TunePlan,
-    recipe: TuneRecipe | None,
-    retune: RetunePolicy,
-    explicit: Mapping[str, Any] | None,
-    build: str | None,
+    asked: tuple[TuneRecipe | None, RetunePolicy, Mapping[str, Any] | None, str | None],
+    report: HardwareReport,
 ) -> str:
     """Set ``answer.tune`` and ``tune_detail`` for the tune ``plan`` calls for; the sentence for the notes.
 
-    Queues the job (``retune.request``, imported only here) when nothing in ``_refused_tune`` rules it out.
+    ``asked`` is the lookup's recipe, retune policy, explicit settings and build; ``report`` the hardware
+    probed for the answer. Queues the job (``retune.request``, imported only here) when nothing in
+    ``_refused_tune`` rules it out. Never raises: anything that goes wrong is ``FAILED_BEFORE``.
     """
-    report = inspect_hardware()
+    recipe, retune, explicit, build = asked
     refused = _refused_tune(answer, recipe, retune, explicit, report.device)
-    value = os.environ.get(RETUNE_ENV, "").strip().lower()
-    ignored = (
-        f" ({RETUNE_ENV}={value!r} is neither 'on' nor 'off' and was ignored)"
-        if value not in ("", RetunePolicy.OFF, RETUNE_ON)
-        else ""
-    )
     if refused is not None:
         answer.tune = refused[0]
-        return refused[1] + ignored if refused[1] else ""
+        return refused[1]
     assert recipe is not None  # noqa: S101 - narrowing for mypy: no recipe was refused above
     from localmodels import retune as retune_module  # noqa: PLC0415 - only a lookup that queues a tune
 
-    outcome = retune_module.request(
-        answer.model,
-        answer.kind,
-        hardware=hardware_key(report),
-        build=build,
-        plan=plan,
-        stale=answer.stale,
-        recipe=recipe,
-        measured_at=answer.record.measured_at.timestamp() if answer.record else None,
-    )
+    try:
+        outcome = retune_module.request(
+            answer.model,
+            answer.kind,
+            hardware=hardware_key(report),
+            build=build,
+            plan=plan,
+            stale=answer.stale,
+            recipe=recipe,
+        )
+    except Exception as exc:  # noqa: BLE001 - the re-tune must never fail a model load
+        answer.tune, answer.tune_detail = TuneState.FAILED_BEFORE, f"{type(exc).__name__}: {exc}"
+        return f"the re-tune failed: {answer.tune_detail}"
     answer.tune, answer.tune_detail = outcome.state, outcome.detail
-    return outcome.note + ignored
+    return outcome.note
 
 
 def _from_record(
@@ -1045,18 +1055,22 @@ def adopt(record: SettingsRecord) -> SettingsRecord:
         stored = _adopt(record)
     except AdoptError as exc:
         if change:
-            _tell_retune(change, str(exc))
+            _tell_retune(change, record, str(exc))
         raise
     if change:
-        _tell_retune(change, None)
+        _tell_retune(change, stored, None)
     return stored
 
 
-def _tell_retune(change: str, refusal: str | None) -> None:
-    """In a tune job (``LOCALMODELS_TUNE_CHANGE``): tell the change's pending file how the adopt went."""
+def _tell_retune(change: str, record: SettingsRecord, refusal: str | None) -> None:
+    """In a tune job (``LOCALMODELS_TUNE_CHANGE``): tell the change's pending file how the adopt went.
+
+    The file acts only if it was made for this record's model and kind.
+    """
     from localmodels import retune  # noqa: PLC0415 - only in a tune job
 
-    retune.job_finished(change, refusal)
+    adopted = f"{_label(record)} measured {record.measured_at.isoformat()}"
+    retune.job_finished(change, key=record.model.key, kind=record.kind, refusal=refusal, record=adopted)
 
 
 def _adopt(record: SettingsRecord) -> SettingsRecord:

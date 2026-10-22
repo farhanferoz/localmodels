@@ -697,10 +697,16 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
 def test_an_adopt_in_a_tune_job_tells_the_pending_file_how_it_went(monkeypatch: pytest.MonkeyPatch) -> None:
     pending = retune.pending_dir() / "0123abcd.json"
     pending.parent.mkdir(parents=True)
-    pending.write_text(json.dumps({"state": "queued", "at": 1.0, "job": "7"}))
+    pending.write_text(
+        json.dumps({"state": "queued", "at": 1.0, "job": "7", "key": MEDGEMMA.key, "kind": "K5"})
+    )
     adopt(adoptable())  # not in a tune job: the file is none of its business
-    assert pending.exists()
+    assert json.loads(pending.read_text())["state"] == "queued"
     monkeypatch.setenv(settings.TUNE_CHANGE_ENV, "0123abcd")
+    adopt(adoptable(model=QWEN))  # another model's record, adopted by the same job
+    with pytest.raises(AdoptError, match="quality check"):
+        adopt(adoptable(model=QWEN, quality=""))
+    assert json.loads(pending.read_text())["state"] == "queued"
     with pytest.raises(AdoptError, match="quality check"):
         adopt(adoptable(quality=""))
     held = json.loads(pending.read_text())
@@ -709,8 +715,9 @@ def test_an_adopt_in_a_tune_job_tells_the_pending_file_how_it_went(monkeypatch: 
         "7",
         True,
     )
-    adopt(adoptable())
-    assert not pending.exists()
+    adopt(adoptable())  # the file stays, so the same change is never queued again
+    held = json.loads(pending.read_text())
+    assert (held["state"], "bfloat16 measured 2026-10-22" in held["record"]) == ("adopted", True)
 
 
 def test_two_adopts_racing_lose_nothing() -> None:
