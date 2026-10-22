@@ -125,6 +125,34 @@ def _smi_query(fields: str, gpu: str) -> list[str] | None:
     return [part.strip() for part in out.split(",")]
 
 
+def gpu_process_memory_mib() -> dict[int, int] | None:
+    """The GPU memory each process holds now, in MiB by process id (``nvidia-smi --query-compute-apps``).
+
+    A process on several GPUs counts once, the sum of its rows; a row without a number (``[N/A]``) is left
+    out. None when nvidia-smi is missing or fails, an empty dict when no process uses the GPU. Per-process, so
+    other jobs on the card do not move the figure, which ``MemAvailable`` cannot say.
+    """
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603 — smi is a shutil.which() result, not a literal
+            [smi, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    held: dict[int, int] = {}
+    for line in out.splitlines():
+        pid, _, used = (part.strip() for part in line.partition(","))
+        if pid.isdigit() and used.isdigit():
+            held[int(pid)] = held.get(int(pid), 0) + int(used)
+    return held
+
+
 def _cuda_memory_gb() -> tuple[str, float | None] | None:
     gpu = _cuda_gpu(0)
     if gpu is None:
