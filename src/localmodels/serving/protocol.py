@@ -67,6 +67,9 @@ class LoadedMessage(_Message):
     seconds: float
     torch_allocated_gib: float
     torch_reserved_gib: float
+    #: Library versions the server runs (``server.LIBRARIES``); here, not in ``ready``, so that a client of
+    #: an older localmodels still reads ``ready`` and refuses by version before it meets this field.
+    libraries: dict[str, str] = Field(default_factory=dict)
 
 
 class InferMessage(_Message):

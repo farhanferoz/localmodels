@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from localmodels.lease import QuietCard
 
 GIB: Final = 1024**3
+DEADLINE_ERROR: Final = "not measured: the tune's deadline passed"
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class TuneMeasurement(BaseModel):
     load_s: float | None = None
     infer_s: list[float] = Field(default_factory=list)
     infer_s_median: float | None = None
+    pass_s: list[float] = Field(default_factory=list)  # the total seconds of each timed pass over the inputs
     peak_gib: float | None = None
     agreement: Agreement | None = None
     fits: bool = False
@@ -93,6 +95,8 @@ class TuneRecord(BaseModel):
     measurements: list[TuneMeasurement]
     #: The host stack (``stack.fingerprint()``) it was measured on; None for a record made before stamps.
     stack: dict[str, str] | None = None
+    #: The library versions the reference's model server reported (empty from a server that reports none).
+    libraries: dict[str, str] = Field(default_factory=dict)
 
 
 def _ranks(values: Sequence[float]) -> list[float]:
@@ -203,13 +207,17 @@ def _measure(
     inputs: Sequence[InferMessage],
     repeats: int,
     cancel_check: Callable[[], bool],
-) -> tuple[TuneMeasurement, list[ResultMessage]]:
-    """Load and time one candidate on a fresh server; its last pass's outputs come back with the numbers."""
+) -> tuple[TuneMeasurement, list[ResultMessage], dict[str, str]]:
+    """Load and time one candidate on a fresh server.
+
+    Its last pass's outputs and the library versions its server reported come back with the numbers.
+    """
     server = ModelServerProcess(argv, env, candidate.name)
     request = load.model_copy(
         update={"dtype": candidate.dtype, "options": {**load.options, **candidate.options}}
     )
     times: list[float] = []
+    passes: list[float] = []
     outputs: list[ResultMessage] = []
     try:
         server.start()
@@ -219,12 +227,14 @@ def _measure(
         ).peak_allocated_gib  # warm-up, unmeasured
         for _ in range(repeats):
             outputs = []
+            first = len(times)
             for message in inputs:
                 started = time.perf_counter()
                 result = server.infer(message, cancel_check, lambda _p: None)
                 times.append(time.perf_counter() - started)
                 peak = max(peak, result.peak_allocated_gib)
                 outputs.append(result)
+            passes.append(sum(times[first:]))
     finally:
         server.stop()
     measurement = TuneMeasurement(
@@ -232,9 +242,10 @@ def _measure(
         load_s=loaded.seconds,
         infer_s=times,
         infer_s_median=statistics.median(times),
+        pass_s=passes,
         peak_gib=peak,
     )
-    return measurement, outputs
+    return measurement, outputs, loaded.libraries
 
 
 def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are the whole contract
@@ -251,11 +262,14 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     cancel_check: Callable[[], bool] = lambda: False,
     hardware: HardwareReport | None = None,
     quiet_card: QuietCard | None = None,
+    deadline: float | None = None,
 ) -> TuneRecord:
     """Measure every candidate and choose the fastest that agrees with ``candidates[0]`` and fits in memory.
 
     ``quiet_card``, when given, is held around the measurements so that stay-up services have unloaded
-    (``lease.QuietCard``); without it nothing changes.
+    (``lease.QuietCard``); without it nothing changes. ``deadline`` is a ``time.monotonic()`` instant checked
+    only before each candidate after the reference (which always runs): once passed, the rest are not started
+    and are recorded with ``DEADLINE_ERROR``, and the choice is made among those measured.
 
     Raises:
         TuneError: the reference candidate failed, or no candidate is eligible.
@@ -265,11 +279,15 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     report = hardware or inspect_hardware()
     measurements: list[TuneMeasurement] = []
     reference_outputs: list[ResultMessage] = []
+    libraries: dict[str, str] = {}
     with quiet_card if quiet_card is not None else contextlib.nullcontext():
         for position, candidate in enumerate(candidates):
+            if position and deadline is not None and time.monotonic() >= deadline:
+                measurements.append(TuneMeasurement(candidate=candidate, error=DEADLINE_ERROR))
+                continue
             free = available_memory(report.device.value)
             try:
-                measurement, outputs = _measure(
+                measurement, outputs, reported = _measure(
                     candidate,
                     argv=argv,
                     env=env,
@@ -290,7 +308,7 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
             assert measurement.peak_gib is not None  # noqa: S101 - narrowing for mypy
             measurement.fits = free is None or measurement.peak_gib + headroom_gib <= free.bytes / GIB
             if position == 0:
-                reference_outputs = outputs
+                reference_outputs, libraries = outputs, reported
                 measurement.agreement = Agreement(score=1.0, passed=True, detail="reference")
             else:
                 measurement.agreement = quality(reference_outputs, outputs)
@@ -315,6 +333,7 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
         chosen=best.candidate,
         measurements=measurements,
         stack=fingerprint(),
+        libraries=libraries,
     )
 
 
