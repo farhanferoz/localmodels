@@ -24,6 +24,7 @@ from pydantic import TypeAdapter
 
 from .catalogue import ModelSpec
 from .digest import register as register_digest
+from .enums import WorkloadKind
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .llama_builds import register as register_llama
 from .rules import register as register_rules
@@ -37,6 +38,7 @@ from .setup import (
     record_setup,
     run_setup,
 )
+from .stack import Engine
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -179,6 +181,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return _cmd_serve(Path(args.config))
 
 
+def cmd_settings_show(args: argparse.Namespace) -> int:
+    """`localmodels settings show`: print one settings answer without loading or queueing anything."""
+    from .settings import cmd_settings_show as run  # noqa: PLC0415 - only this command loads the lookup
+
+    return run(args)
+
+
+def cmd_settings_check(args: argparse.Namespace) -> int:
+    """`localmodels settings check`: list the stored records that are stale on this host."""
+    from .settings import cmd_settings_check as run  # noqa: PLC0415 - only this command loads the lookup
+
+    return run(args)
+
+
 def _add_lease_common_args(parser: argparse.ArgumentParser, *, with_pid: bool) -> None:
     parser.add_argument("--project", required=True, help="this project's name, e.g. 'service_a'")
     parser.add_argument("--lease-dir", default=str(DEFAULT_LEASE_DIR), help="shared GPU lease directory")
@@ -263,8 +279,31 @@ def _build_serve_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     p.set_defaults(fn=cmd_serve)
 
 
+def _build_settings_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    settings_p = subparsers.add_parser("settings", help="the measured settings a model should load with")
+    commands = settings_p.add_subparsers(dest="settings_command", required=True)
+    show_p = commands.add_parser("show", help="print the settings answer for one model; loads nothing")
+    show_p.add_argument("--model", required=True, help="Hugging Face repository id")
+    show_p.add_argument("--revision", default=None, help="pinned revision (40-character commit)")
+    show_p.add_argument(
+        "--file",
+        action="append",
+        help="a GGUF file of the model in the Hub cache (repeat for split parts); needs --revision",
+    )
+    show_p.add_argument("--kind", required=True, choices=[k.value for k in WorkloadKind])
+    show_p.add_argument("--engine", default=Engine.PYTORCH.value, choices=[e.value for e in Engine])
+    show_p.add_argument("--build", default=None, help="the llama.cpp build the caller will run")
+    show_p.add_argument(
+        "--legacy", default=None, help="the caller's own tune file, read when the store has none"
+    )
+    show_p.set_defaults(fn=cmd_settings_show)
+    check_p = commands.add_parser("check", help="list stored records stale on this host; exit 1 when any")
+    check_p.add_argument("--home", default=None, help="llama home, where the `current` build is")
+    check_p.set_defaults(fn=cmd_settings_check)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """Build the `localmodels` argparse parser: `setup`, `serve`, `lease ...`, `rules ...`."""
+    """Build the `localmodels` argparse parser: `setup`, `serve`, `lease ...`, `rules ...`, `settings ...`."""
     parser = argparse.ArgumentParser(prog="localmodels")
     subparsers = parser.add_subparsers(dest="command")
     _build_setup_parser(subparsers)
@@ -273,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_digest(subparsers)
     register_rules(subparsers)
     register_llama(subparsers)
+    _build_settings_parser(subparsers)
     return parser
 
 
