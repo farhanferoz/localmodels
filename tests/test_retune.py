@@ -264,4 +264,7 @@ def test_a_tune_that_measured_but_was_refused_is_not_queued_again(
     assert len(slurm.submissions()) == 1
     retune.job_finished(change, None)  # an adopted record removes the file
     assert not pending_file().exists()
+    outside = retune.pending_dir().parent / "escape.json"
+    outside.write_text("{}")
     retune.job_finished("../escape", None)  # an id from the environment is never a path
+    assert outside.exists()
