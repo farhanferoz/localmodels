@@ -195,7 +195,13 @@ never by hand on the card). It measures the reference first, then `-ub` (`llama-
 against 512 with a restart control; only for prompts of at least 512 tokens), the speculation candidates you declare and, with your own
 `--quality-command`, other quantised files, each with the server's own peak memory from `nvidia-smi`. It keeps to `--soft-limit-s` by
 starting the most valuable candidate first and skipping what would not fit, adopts a candidate only past a 5 % speed margin with every check
-passed, and writes `record.json` and its measurements to `--run-dir` (which holds a base file of about 16 GiB while it runs). The quality
+passed, and writes `record.json` and its measurements to `--run-dir` (a local folder outside `~/dev`, which holds a base file of about
+16 GiB while it runs; the vocabulary is not read, so 16 GiB covers models up to about 299k tokens). `--draft-file NAME` names the file
+`draft-mtp` (a model whose head is a separate file, as Flash-Next's) or `draft-simple` loads with `-md`, in the Hub cache snapshot of
+`--repository` at `--revision` (or of `--draft-repository` at `--draft-revision`); `--alternative FILE[,FILE...]` names a quantised file
+set of the same repository and revision. The soft limit stops new candidates; a hard limit of 840 s stops every step, and a tune that
+is stopped or that measured nothing but the reference leaves its measurements in `record.json` and adopts nothing. The teacher-forced
+text is llama.cpp's own `docs/*.md` (MIT), shipped as `localmodels/data/kl-text.txt`. The quality
 command gets the live server in `LLAMA_TUNE_SERVER_URL` and the file in `LLAMA_TUNE_MODEL_FILE`, and ends by printing
 `{"score": 0.93, "passed": true}`; it exits 0 when it passes. The module is imported on demand.
 

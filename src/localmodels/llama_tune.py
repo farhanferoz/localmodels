@@ -30,6 +30,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -51,7 +52,12 @@ from pydantic import BaseModel, Field
 
 from localmodels.bench import BenchError, run_bench
 from localmodels.enums import ServingRole, WorkloadKind
-from localmodels.hardware import available_memory, gpu_process_memory_mib, inspect_hardware
+from localmodels.hardware import (
+    available_memory,
+    gpu_process_memory_mib,
+    inspect_hardware,
+    network_filesystem,
+)
 from localmodels.launcher import LocalServerManager, MemoryGuards
 from localmodels.lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
 from localmodels.llama_builds import current_server, llama_home
@@ -98,15 +104,18 @@ PROJECT: Final = "localmodels-tune"  # the name on the private lease and the qui
 UB_REFERENCE: Final = 512  # llama.cpp's own default
 UB_CANDIDATES: Final = (1024, 2048)
 UB_FIRST: Final = 2048  # the one tried first when time is short (design 6.7)
-KL_CHUNK: Final = (
-    2048  # the chunk the limits were calibrated at (HL2c; at 4,096 the same -ub moved three times as much)
-)
+# the chunk the limits were calibrated at (HL2c; at 4,096 the same -ub moved three times as much)
+KL_CHUNK: Final = 2048
+KL_CHUNKS: Final = 28  # HL2c's text: llama-perplexity is told to read no more, so disk and time stay bounded
 BYTES_PER_TOKEN: Final = 3.5  # E: HL2c's text, 199,173 bytes, was 28 chunks of 2,048 tokens
-KL_BASE_GIB: Final = (
-    16.0  # E: the base file of HL2d (4B model, 248k vocabulary) was about 13 GB; deleted after use
-)
+# E: the base file holds every position of every chunk over the whole vocabulary as 16-bit values: about
+# 14.2 GB for 28 chunks and a 248k vocabulary (HL2d: "about 13 GB"). The vocabulary is not read from the
+# model, so this covers vocabularies up to about 299k; deleted after use.
+KL_BASE_GIB: Final = 16.0
+# The teacher-forced text: llama.cpp's docs/*.md at ccc3646 (MIT licence), sorted by name and concatenated
+# (HL2c). Checked by SHA-256 at use.
 PINNED_TEXT_SHA256: Final = "29fc9436e8c142cadea8dc00e48400fe59fbac7361e40ccf3ae1d833d0064d2c"
-PINNED_TEXT: Final = Path("~/cache/localmodels/spikes-2026-10-22/hl2c/text.txt")
+PINNED_TEXT: Final = Path(__file__).parent / "data" / "kl-text.txt"
 
 # speculation (design 6.4)
 SPEC_MIN_SIMILARITY: Final = 0.65  # a tripwire for a broken draft setup, not a quality measure
@@ -125,9 +134,13 @@ CHECK_TIMEOUT_FACTOR: Final = 2.0
 CHECK_TIMEOUT_MIN_S: Final = 60.0
 
 # time (design 5.4, 6.7)
-SOFT_LIMIT_S: Final = 600.0
+SOFT_LIMIT_S: Final = 600.0  # no further candidate is started past it
+HARD_LIMIT_S: Final = (
+    840.0  # no step runs past it: `timeout --kill-after=30 900`, less 30 s to finish and write
+)
 BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
+OUT_OF_TIME: Final = "not measured: out of time"  # a step the hard limit cut short
 SIGTERM_EXIT: Final = 128 + signal.SIGTERM
 
 # exit codes of the command
@@ -234,7 +247,9 @@ def parse_check(output: str, returncode: int) -> Agreement:
     lines = [line for line in output.splitlines() if line.strip()]
     try:
         verdict = json.loads(lines[-1])
-        score, passed = float(verdict["score"]), bool(verdict["passed"])
+        score, passed = float(verdict["score"]), verdict["passed"] is True  # a string "false" is not a pass
+        if not math.isfinite(score):
+            raise ValueError(score)  # noqa: TRY301 - a NaN or infinite score is no score
     except (IndexError, ValueError, KeyError, TypeError):
         return Agreement(score=0.0, passed=False, detail="task-quality check printed no score and verdict")
     ok = passed and returncode == 0
@@ -392,6 +407,7 @@ class ArmResult(BaseModel):
     settings: Settings
     start_s: float | None = None
     run_s: float | None = None
+    stop_s: float | None = None
     request_s: float | None = None  # the median server time per request: reading the prompt plus writing
     prompt_per_second: float | None = None  # the median of the server's own ``timings``
     predicted_per_second: float | None = None
@@ -496,9 +512,20 @@ class TuneSpec:
     check_s: float = 60.0  # what the project's check is expected to take, for the time estimate
     headroom_gib: float = DEFAULT_HEADROOM_GIB
     soft_limit_s: float = SOFT_LIMIT_S
+    hard_limit_s: float = HARD_LIMIT_S
     max_tokens: int = DEFAULT_MAX_TOKENS
     project: str | None = None
     guards: MemoryGuards = field(default_factory=MemoryGuards)
+
+
+def base_file_gib(text_bytes: int) -> float:
+    """The disk the teacher-forced base file needs for a text of ``text_bytes``.
+
+    Whole chunks, at most ``KL_CHUNKS`` (llama-perplexity is told to read no more). Scaled from
+    ``KL_BASE_GIB``, which holds for the pinned text's 28 chunks and a vocabulary up to about 299k.
+    """
+    chunks = min(KL_CHUNKS, max(1, math.ceil(text_bytes / BYTES_PER_TOKEN / KL_CHUNK)))
+    return KL_BASE_GIB * chunks / KL_CHUNKS
 
 
 def load_prompts(path: Path, limit: int) -> list[str]:
@@ -530,10 +557,16 @@ class LlamaTune:
     and memory are the ones a test replaces.
     """
 
-    def __init__(self, spec: TuneSpec, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        spec: TuneSpec,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        started: float | None = None,
+    ) -> None:
         self.spec = spec
         self._clock = clock
-        self._started = clock()
+        self._started = clock() if started is None else started  # the command's own start, before any wait
         self.measurements: list[BaseModel] = []
         self.arms: list[ArmResult] = []  # the first run of each arm; a restart is only kept in the record
         self.bench: dict[int, BenchRow] = {}
@@ -541,6 +574,7 @@ class LlamaTune:
         self.ub_star: int | None = None  # the larger -ub that passed, once one has
         self.start_s = 0.0  # the reference's start (t0), measured once
         self.run_s = 0.0  # the reference's run over the prompts
+        self.stop_s = 0.0  # the reference's stop
         self.check_s = spec.check_s
         self.spread = 0.0  # how far the reference's own timings differ
         self.ppl_s: float | None = None  # a teacher-forced run's measured time
@@ -556,6 +590,10 @@ class LlamaTune:
         """Seconds since the tune began."""
         return self._clock() - self._started
 
+    def left(self) -> float:
+        """Seconds before the hard limit; no step is allowed to run past it."""
+        return max(self.spec.hard_limit_s - self.elapsed(), 0.0)
+
     def _skip(self, name: str, reason: str) -> None:
         log.info("%s: %s", name, reason)
         self.measurements.append(NotMeasured(name=name, reason=reason))
@@ -565,9 +603,16 @@ class LlamaTune:
         """The reference arm (measured first)."""
         return self.arms[0]
 
-    def _arm_cost(self, *, checked: bool = False) -> float:
-        """What one more server start is estimated at: the reference's start and run (design 6.7)."""
-        return self.start_s + self.run_s + (self.check_s if checked else 0.0)
+    def _arm_cost(self, arm: ArmResult | None = None, *, checked: bool = False) -> float:
+        """What one more server start is estimated at: its start, run and stop (design 6.7).
+
+        From ``arm``'s own figures when it ran before (a restart), else from the reference's.
+        """
+        if arm is not None and arm.start_s is not None and arm.run_s is not None:
+            start, run, stop = arm.start_s, arm.run_s, arm.stop_s or 0.0
+        else:
+            start, run, stop = self.start_s, self.run_s, self.stop_s
+        return start + run + stop + (self.check_s if checked else 0.0)
 
     def _ppl_cost(self) -> float:
         """What a teacher-forced run is estimated at.
@@ -577,7 +622,7 @@ class LlamaTune:
         if self.ppl_s is not None:
             return self.ppl_s
         speed = self.reference.prompt_per_second
-        tokens = self.text.stat().st_size / BYTES_PER_TOKEN if self.text else 0.0
+        tokens = min(self.text.stat().st_size / BYTES_PER_TOKEN, KL_CHUNKS * KL_CHUNK) if self.text else 0.0
         return self.start_s + (tokens / speed if speed else 0.0)
 
     def _ub_cost(self) -> float:
@@ -651,11 +696,12 @@ class LlamaTune:
         if self.text is None:
             self._skip("-ub", "`-ub` not measured: no text for the teacher-forced check")
             return False
+        need_gib = base_file_gib(self.text.stat().st_size)
         free_gib = shutil.disk_usage(self.spec.run_dir).free / GIB
-        if free_gib < KL_BASE_GIB:
+        if free_gib < need_gib:
             self._skip(
                 "-ub",
-                f"`-ub` not measured: the base file needs about {KL_BASE_GIB:g} GiB, {free_gib:.0f} free",
+                f"`-ub` not measured: the base file needs about {need_gib:.0f} GiB, {free_gib:.0f} free",
             )
             return False
         return True
@@ -680,6 +726,8 @@ class LlamaTune:
             LlamaTuneError: the reference could not be measured.
         """
         self.spec.run_dir.mkdir(parents=True, exist_ok=True)
+        base = self.spec.run_dir / "base.kld"
+        base.unlink(missing_ok=True)  # one a killed run left would count as used space
         try:
             await self._measure_reference()
             for step in self._plan():
@@ -689,14 +737,47 @@ class LlamaTune:
                     continue
                 await step.run()
             chosen = await self._decide()
+        except (asyncio.CancelledError, LlamaTuneError) as exc:
+            self.write_partial("stopped by a signal" if isinstance(exc, asyncio.CancelledError) else str(exc))
+            raise
         finally:
-            (self.spec.run_dir / "base.kld").unlink(missing_ok=True)
+            base.unlink(missing_ok=True)
         return self._record(chosen)
+
+    @property
+    def candidates_measured(self) -> bool:
+        """Whether anything but the reference was measured (a server that ran, or a teacher-forced run)."""
+        return any(arm.request_s for arm in self.arms[1:]) or any(r.stats for r in self.kl.values())
+
+    def _layout(self) -> Layout:
+        params = self.spec.params
+        return Layout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+
+    def write_partial(self, reason: str) -> None:
+        """Keep what was measured in ``record.json`` when the tune ends without a record (not adopted)."""
+        everything = [self._layout(), *self.measurements, *self.arms]
+        partial = {
+            "partial": True,
+            "reason": reason,
+            "llama_measurements": [m.model_dump(mode="json") for m in everything],
+        }
+        (self.spec.run_dir / "record.json").write_text(json.dumps(partial, indent=2), encoding="utf-8")
+
+    def _wants_candidates(self) -> bool:
+        """Whether any candidate may be measured, so that the reference is worth timing twice (design 5.5)."""
+        spec = self.spec
+        speculating = self.writes and any(c.spec is not SpecType.NONE for c in spec.speculation)
+        return (
+            speculating
+            or bool(spec.alternatives and spec.quality_command)
+            or spec.prompt_tokens >= UB_REFERENCE
+        )
 
     async def _measure_reference(self) -> None:
         """Start the reference first: it gives t0, the run time, the memory and the outputs to judge by.
 
-        With speculation declared it is started a second time, for design 6.4 (a) and its own timing spread.
+        With any candidate to measure it is started a second time: for design 6.4 (a) and for the timing
+        spread that the speed margin of design 5.5 needs.
         """
         reference = await self._serve(Settings(), self.spec.reference, checked=False)
         self.arms.append(reference)
@@ -705,7 +786,8 @@ class LlamaTune:
             raise LlamaTuneError(msg)
         self.start_s, self.run_s = reference.start_s or 0.0, reference.run_s or 0.0
         reference.eligible = True
-        if not (self.writes and any(c.spec is not SpecType.NONE for c in self.spec.speculation)):
+        self.stop_s = reference.stop_s or 0.0
+        if not self._wants_candidates():
             return
         if not fits_budget(self.elapsed(), self._arm_cost(), self.spec.soft_limit_s):
             self._skip("reference restart", OUT_OF_BUDGET)
@@ -728,7 +810,8 @@ class LlamaTune:
                 if self.reference.repeats is False
                 else "was not restarted"
             )
-            self._skip(arm_name(Settings(spec=candidate.spec)), f"not measured: the reference {why}")
+            name = arm_name(Settings(spec=candidate.spec, spec_draft_file=candidate.draft_file))
+            self._skip(name, f"not measured: the reference {why}")
             return
         settings = Settings(n_ubatch=self.ub_star, spec=candidate.spec, spec_draft_file=candidate.draft_file)
         await self._run_arm(settings, self.spec.reference, checked=bool(self.spec.quality_command))
@@ -792,14 +875,15 @@ class LlamaTune:
         """One ``llama-bench`` run for every -ub (it reloads the model only when its parameters change)."""
         bench_bin = self.spec.server_bin.with_name("llama-bench")
         ubatches = ",".join(str(u) for u in (UB_REFERENCE, *UB_CANDIDATES))
-        remaining = max(self.spec.soft_limit_s - self.elapsed(), 60.0)
         try:
             result = await asyncio.to_thread(
                 run_bench, bench_bin, self.spec.reference.path, n_prompt=self.spec.prompt_tokens, n_gen=0,
-                repetitions=BENCH_REPETITIONS, timeout_s=remaining, extra_flags=("-ub", ubatches),
+                repetitions=BENCH_REPETITIONS, timeout_s=max(self.left(), 1.0), extra_flags=("-ub", ubatches),
             )  # fmt: skip
         except BenchError as exc:
-            self._skip("-ub", f"not measured: llama-bench failed ({exc})")
+            self._skip(
+                "-ub", OUT_OF_TIME if self.left() <= 0 else f"not measured: llama-bench failed ({exc})"
+            )
             return
         self.bench = bench_rows(result.raw_rows, self.spec.prompt_tokens)
         self.measurements.extend(self.bench.values())
@@ -825,15 +909,19 @@ class LlamaTune:
             return False
         return True
 
+    @staticmethod
+    def _failed(what: str, error: str | None) -> str:
+        return error if error == OUT_OF_TIME else f"not measured: {what} failed ({error})"
+
     async def _kl_base(self) -> bool:
         """Save the reference's probabilities and run the restart control. False if either failed."""
         base = await self._perplexity(UB_REFERENCE, base=True)
         if base.error:
-            self._skip("-ub", f"not measured: the base run failed ({base.error})")
+            self._skip("-ub", self._failed("the base run", base.error))
             return False
         control = await self._perplexity(UB_REFERENCE, base=False)
         if control.stats is None:
-            self._skip("-ub", f"not measured: the restart control failed ({control.error})")
+            self._skip("-ub", self._failed("the restart control", control.error))
             return False
         self.control = control.stats
         return True
@@ -868,7 +956,7 @@ class LlamaTune:
         assert self.text is not None  # noqa: S101 - narrowing for mypy; stage A needs the text
         kld = self.spec.run_dir / "base.kld"
         mode = (
-            ["-f", str(self.text), "--kl-divergence-base", str(kld)]
+            ["-f", str(self.text), "--chunks", str(KL_CHUNKS), "--kl-divergence-base", str(kld)]
             if base
             else ["--kl-divergence-base", str(kld), "--kl-divergence"]
         )
@@ -883,12 +971,14 @@ class LlamaTune:
         )
         started = self._clock()
         try:
-            output = await self._run_tool(cmd, max(self.spec.soft_limit_s, 60.0))
+            output = await self._run_tool(cmd, self.left())
             result.seconds = self._clock() - started
             self.ppl_s = result.seconds
             if not base:
                 result.stats = parse_kl(output)
-        except (LlamaTuneError, TimeoutError, OSError, ValueError) as exc:
+        except TimeoutError:
+            result.error = OUT_OF_TIME
+        except (LlamaTuneError, OSError, ValueError) as exc:
             result.error = f"{type(exc).__name__}: {exc}"
         self.measurements.append(result)
         return result
@@ -941,23 +1031,30 @@ class LlamaTune:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as http:
             manager = self._manager(settings, files, http)
             try:
-                started = self._clock()
-                handle = await manager.start()
-                arm.start_s = self._clock() - started
-                sampler = asyncio.create_task(self._sample(handle.pid, peaks))
-                started = self._clock()
-                await self._send_prompts(http, manager, arm)
-                arm.run_s = self._clock() - started
-                if checked and self.spec.quality_command:
-                    arm.check = await self._check(manager.spec.port, files)
-            except (LocalModelsError, httpx.HTTPError, OSError, KeyError, ValueError, TimeoutError) as exc:
+                async with asyncio.timeout(self.left()):  # no step runs past the hard limit
+                    started = self._clock()
+                    handle = await manager.start()
+                    arm.start_s = self._clock() - started
+                    sampler = asyncio.create_task(self._sample(handle.pid, peaks))
+                    started = self._clock()
+                    await self._send_prompts(http, manager, arm)
+                    arm.run_s = self._clock() - started
+                    if checked and self.spec.quality_command:
+                        arm.check = await self._check(manager.spec.port, files)
+                        if arm.check is None:
+                            arm.error = OUT_OF_TIME  # the check did not finish: not measured, not failed
+            except TimeoutError:
+                arm.error = OUT_OF_TIME
+            except (LocalModelsError, httpx.HTTPError, OSError, KeyError, ValueError) as exc:
                 arm.error = f"{type(exc).__name__}: {exc}"
             finally:
                 if sampler is not None:
                     sampler.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await sampler
+                stopping = self._clock()
                 await manager.stop()
+                arm.stop_s = self._clock() - stopping
         if peaks:
             arm.peak_gib = max(peaks) / MIB_PER_GIB
         arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.spec.headroom_gib)
@@ -1008,8 +1105,12 @@ class LlamaTune:
         if log_path.exists():
             arm.acceptance = parse_acceptance(log_path.read_bytes()[mark:].decode(errors="replace"))
 
-    async def _check(self, port: int, files: FileSet) -> Agreement:
-        """The project's task-quality check, run against the live server; its time counts inside the limit."""
+    async def _check(self, port: int, files: FileSet) -> Agreement | None:
+        """The project's task-quality check, run against the live server; its time counts inside the limit.
+
+        None when it did not finish in time: ``check_s`` then becomes the time waited, so the shrinking rule
+        skips what is left.
+        """
         env = {**os.environ, CHECK_URL_ENV: f"http://{HOST}:{port}", CHECK_FILE_ENV: str(files.path)}
         started = self._clock()
         proc = await asyncio.create_subprocess_exec(
@@ -1018,13 +1119,12 @@ class LlamaTune:
             stderr=asyncio.subprocess.STDOUT,
             env=env,
         )
-        timeout = max(self.spec.check_s * CHECK_TIMEOUT_FACTOR, CHECK_TIMEOUT_MIN_S)
+        timeout = min(max(self.spec.check_s * CHECK_TIMEOUT_FACTOR, CHECK_TIMEOUT_MIN_S), self.left())
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
-            return Agreement(
-                score=0.0, passed=False, detail=f"task-quality check not finished in {timeout:g} s"
-            )
+            self.check_s = self._clock() - started
+            return None
         finally:
             if proc.returncode is None:
                 proc.kill()
@@ -1107,7 +1207,7 @@ class LlamaTune:
             speculates = settings_key(best.settings)[1] != SpecType.NONE
             if best is self.reference or not speculates or best.repeats is not None:
                 break
-            if not fits_budget(self.elapsed(), self._arm_cost(), self.spec.soft_limit_s):
+            if not fits_budget(self.elapsed(), self._arm_cost(best), self.spec.soft_limit_s):
                 self._skip(f"{best.name} restart", OUT_OF_BUDGET)
                 unverified.add(best.name)
                 continue
@@ -1136,12 +1236,10 @@ class LlamaTune:
             ("speculation tripwires", settings_key(settings)[1] != SpecType.NONE),
             (spec.quality_name or "task-quality check", chosen.check is not None),
         ) if present]  # fmt: skip
-        quality = "llama.cpp tune: " + (
-            ", ".join(checks) if checks else "reference kept; no candidate passed"
-        )
+        none = "reference kept; no candidate " + ("passed" if self.candidates_measured else "measured")
+        quality = "llama.cpp tune: " + (", ".join(checks) if checks else none)
         self.measurements.extend(self.arms)
-        params = spec.params
-        layout = Layout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+        layout = self._layout()
         return SettingsRecord(
             model=spec.reference.identity,
             kind=spec.kind,
@@ -1169,13 +1267,15 @@ async def run_guarded[T](work: Awaitable[T]) -> T:
     """Await ``work``; SIGTERM and SIGINT cancel it through the loop's own handler.
 
     ``timeout`` sends SIGTERM when the hard limit passes. Cancelling the task unwinds ``_serve``'s finally,
-    which stops the server; a handler that raised inside the running loop could leave one loaded.
+    which stops the server; a handler that raised inside the running loop could leave one loaded. The task is
+    cancelled once: a second signal (``timeout`` signals its child and then its whole group) must not cut the
+    cleanup short.
     """
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     assert task is not None  # noqa: S101 - narrowing for mypy; asyncio.run runs this as a task
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, task.cancel)
+        loop.add_signal_handler(sig, lambda: task.cancelling() or task.cancel())
     try:
         return await work
     finally:
@@ -1183,8 +1283,13 @@ async def run_guarded[T](work: Awaitable[T]) -> T:
             loop.remove_signal_handler(sig)
 
 
-async def tune_and_adopt(spec: TuneSpec) -> int:
-    """Hold the card quiet, tune, write ``record.json`` in the run folder and adopt it; the exit code."""
+async def tune_and_adopt(spec: TuneSpec, started: float | None = None) -> int:
+    """Hold the card quiet, tune, write ``record.json`` in the run folder and adopt it; the exit code.
+
+    ``started`` is the command's own start (``time.monotonic()``), so the quiet card's wait counts against
+    the limits. A tune that measured nothing but the reference adopts nothing (exit 2): D3's revisit
+    condition when the time budget was the reason.
+    """
     card = QuietCard(
         GpuLease(DEFAULT_LEASE_DIR, PROJECT), reason=f"llama.cpp tune of {spec.reference.identity.repository}"
     )
@@ -1193,14 +1298,27 @@ async def tune_and_adopt(spec: TuneSpec) -> int:
     except QuietCardTimeoutError as exc:
         log.error("%s", exc)  # noqa: TRY400 - the message is the whole story
         return EXIT_FAILED
+    tune = LlamaTune(spec, started=started)
     try:
-        record = await LlamaTune(spec).tune()
+        record = await tune.tune()
     except LlamaTuneError as exc:
         log.error("%s", exc)  # noqa: TRY400 - the message is the whole story
         return EXIT_FAILED
     finally:
         card.__exit__(None, None, None)
     (spec.run_dir / "record.json").write_text(record.model_dump_json(indent=2), encoding="utf-8")
+    if not tune.candidates_measured:
+        why = (
+            OUT_OF_BUDGET
+            if any(isinstance(m, NotMeasured) and m.reason == OUT_OF_BUDGET for m in tune.measurements)
+            else ""
+        )
+        log.warning(
+            "measured, not adopted: no candidate was measured%s; llama.cpp tunes cost more GPU time than the "
+            "limit allows (design D3's revisit condition)",
+            f" ({why})" if why else "",
+        )
+        return EXIT_NOT_ADOPTED
     try:
         adopt(record)
     except AdoptError as exc:
@@ -1209,111 +1327,157 @@ async def tune_and_adopt(spec: TuneSpec) -> int:
     return EXIT_ADOPTED
 
 
+def _snapshot_file(repository: str, revision: str, name: str) -> Path:
+    """Where the Hub cache keeps ``name`` of ``repository`` at ``revision``; it must be there already."""
+    path = snapshot_dir(repository, revision, _default_hub_cache()) / name
+    if not path.is_file():
+        msg = f"{path} is not in the Hub cache; pull it first (a tune never downloads)"
+        raise SystemExit(msg)
+    return path
+
+
 def _file_set(repository: str, revision: str, names: list[str]) -> FileSet:
-    identity = ModelIdentity.from_hub_files(repository, revision, names)
-    return FileSet(identity, snapshot_dir(repository, revision, _default_hub_cache()) / names[0])
+    paths = [_snapshot_file(repository, revision, name) for name in names]
+    try:
+        identity = ModelIdentity.from_hub_files(repository, revision, names)
+    except ValueError as exc:  # a file the Hub holds outside LFS has no SHA-256 to key a record on
+        raise SystemExit(str(exc)) from exc
+    return FileSet(identity, paths[0])
 
 
-def _alternative(text: str) -> FileSet:
-    """``REPOSITORY@REVISION:FILE[,FILE...]`` as a file set."""
-    repository, _, rest = text.partition("@")
-    revision, _, names = rest.partition(":")
-    if not (repository and revision and names):
-        msg = f"{text!r}: expected REPOSITORY@REVISION:FILE[,FILE...]"
-        raise argparse.ArgumentTypeError(msg)
-    return _file_set(repository, revision, names.split(","))
+def run_dir_problem(run_dir: Path) -> str | None:
+    """Why ``run_dir`` is no place for a tune's files, in plain words; None when it is fine.
+
+    The teacher-forced base file is some 14 GB: under ~/dev Syncthing would copy it to every machine, and a
+    write that size to an NFS share can stall the host.
+    """
+    target = run_dir.expanduser().resolve()
+    if target.is_relative_to((Path.home() / "dev").resolve()):
+        return f"{target} is under ~/dev, which Syncthing copies to every machine; use ~/cache/<project>/"
+    if (kind := network_filesystem(target)) is not None:
+        return f"{target} is on a network filesystem ({kind}); write locally and copy at the end"
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
     """The command's arguments (design 5.4: the recipe command for llama.cpp)."""
+    doc = __doc__ or ""
     parser = argparse.ArgumentParser(
-        prog="python -m localmodels.llama_tune", description=__doc__.split("\n\n")[0]
+        prog="python -m localmodels.llama_tune", description=doc.split("\n\n")[0]
     )
-    parser.add_argument("--repository", required=True, help="the model's Hub repository")
-    parser.add_argument("--revision", required=True, help="its 40-character commit")
-    parser.add_argument(
+    add = parser.add_argument
+    add("--repository", required=True, help="the model's Hub repository")
+    add("--revision", required=True, help="its 40-character commit")
+    add(
         "--file",
         action="append",
         required=True,
         dest="files",
         help="a file of the reference set (the first is loaded); repeat",
     )
-    parser.add_argument(
+    add(
         "--alternative",
         action="append",
         default=[],
-        type=_alternative,
-        help="a quantised file set for stage C, REPOSITORY@REVISION:FILE[,FILE...]",
+        help="a quantised file set of the same repository and revision, for stage C: FILE[,FILE...]; repeat",
     )
-    parser.add_argument(
+    add(
         "--kind",
         required=True,
         choices=[k.value for k in (WorkloadKind.K1, WorkloadKind.K2, WorkloadKind.K3)],
     )
-    parser.add_argument(
+    add(
         "--role",
         required=True,
         choices=[r.value for r in ServingRole],
         help="the serving layout; its slot count is never tuned",
     )
-    parser.add_argument(
+    add(
         "--prompts",
         required=True,
         type=Path,
         help="the project's real inputs: a JSON array or JSON lines of strings",
     )
-    parser.add_argument("--prompt-tokens", required=True, type=int, help="their typical length in tokens")
-    parser.add_argument(
-        "--text", type=Path, help="a text for the teacher-forced check (default: the pinned one)"
-    )
-    parser.add_argument(
+    add("--prompt-tokens", required=True, type=int, help="their typical length in tokens")
+    add("--text", type=Path, help="a text for the teacher-forced check (default: the pinned one)")
+    add(
         "--speculation",
         action="append",
         default=[],
         choices=[s.value for s in SpecType],
         help="a candidate to measure; repeat",
     )
-    parser.add_argument("--draft-file", type=Path, help="the draft file for draft-simple")
-    parser.add_argument(
+    add(
+        "--draft-file",
+        help="the file draft-mtp or draft-simple loads with -md, by name in the Hub cache snapshot of "
+        "--repository at --revision (or of --draft-repository at --draft-revision)",
+    )
+    add("--draft-repository", help="where --draft-file is, when not the reference's repository")
+    add("--draft-revision", help="and its 40-character commit")
+    add(
         "--quality-command",
-        help="the project's task-quality check, run against a live server (see the module docstring)",
+        help="the project's task-quality check, run against a live server (see the README)",
     )
-    parser.add_argument("--quality-name", default="", help="its name, for the record")
-    parser.add_argument(
-        "--check-seconds", type=float, default=60.0, help="how long the check is expected to take"
+    add("--quality-name", default="", help="its name, for the record")
+    add(
+        "--check-seconds",
+        type=float,
+        default=60.0,
+        help="how long the check really takes: it is the estimate for the time limit",
     )
-    parser.add_argument("--headroom-gib", type=float, default=DEFAULT_HEADROOM_GIB)
-    parser.add_argument(
+    add("--headroom-gib", type=float, default=DEFAULT_HEADROOM_GIB)
+    add(
         "--run-dir",
         required=True,
         type=Path,
-        help="a folder for logs and the teacher-forced base file (about 16 GiB while it runs)",
+        help="a local folder outside ~/dev for logs and the base file (about 16 GiB while it runs)",
     )
-    parser.add_argument("--soft-limit-s", type=float, default=SOFT_LIMIT_S)
-    parser.add_argument("--max-prompts", type=int, default=DEFAULT_MAX_PROMPTS)
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    parser.add_argument("--project", help="the project asking, for the record")
+    add(
+        "--soft-limit-s",
+        type=float,
+        default=SOFT_LIMIT_S,
+        help="no candidate is started that would end after this",
+    )
+    add("--max-prompts", type=int, default=DEFAULT_MAX_PROMPTS)
+    add("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    add("--project", help="the project asking, for the record")
     return parser
+
+
+def _draft_path(args: argparse.Namespace) -> str | None:
+    """The path in the Hub cache of ``--draft-file`` (for draft-mtp and draft-simple), or None without one."""
+    takers = [s for s in args.speculation if s in (SpecType.DRAFT_MTP, SpecType.DRAFT_SIMPLE)]
+    if args.draft_file is None:
+        if SpecType.DRAFT_SIMPLE in args.speculation:
+            msg = "--speculation draft-simple needs --draft-file"
+            raise SystemExit(msg)
+        return None
+    if not takers:
+        msg = "--draft-file is for --speculation draft-mtp or draft-simple"
+        raise SystemExit(msg)
+    if bool(args.draft_repository) != bool(args.draft_revision):
+        msg = "--draft-repository and --draft-revision go together"
+        raise SystemExit(msg)
+    repository = args.draft_repository or args.repository
+    revision = args.draft_revision or args.revision
+    return str(_snapshot_file(repository, revision, args.draft_file).absolute())
 
 
 def spec_from_args(args: argparse.Namespace) -> TuneSpec:
     """Resolve the arguments: the files in the Hub cache, the binaries, the layout of the role."""
+    if problem := run_dir_problem(args.run_dir):
+        raise SystemExit(problem)
+    draft = _draft_path(args)
     candidates = tuple(
-        SpecCandidate(SpecType(s), str(args.draft_file) if s == SpecType.DRAFT_SIMPLE else None)
+        SpecCandidate(SpecType(s), draft if s in (SpecType.DRAFT_MTP, SpecType.DRAFT_SIMPLE) else None)
         for s in args.speculation
     )
-    if any(c.spec is SpecType.DRAFT_SIMPLE and c.draft_file is None for c in candidates):
-        msg = "--speculation draft-simple needs --draft-file"
-        raise SystemExit(msg)
     report = inspect_hardware()
     reference = _file_set(args.repository, args.revision, args.files)
-    if not reference.path.is_file():
-        msg = f"{reference.path} is not in the Hub cache; pull it first (a tune never downloads)"
-        raise SystemExit(msg)
     server = resolve_llama_server_bin(explicit=current_server(llama_home()))
     return TuneSpec(
         reference=reference,
-        alternatives=tuple(args.alternative),
+        alternatives=tuple(_file_set(args.repository, args.revision, a.split(",")) for a in args.alternative),
         kind=WorkloadKind(args.kind),
         params=derive_serving_params(report.device, report.total_memory_gb, role=ServingRole(args.role)),
         hardware=hardware_key(report),
@@ -1335,10 +1499,11 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the tune. Exit 0 adopted, 1 no reference, 2 measured but not adopted, 143 stopped by SIGTERM."""
+    started = time.monotonic()  # the limits count from here, the quiet card's wait included
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     spec = spec_from_args(build_parser().parse_args(argv))
     try:
-        return asyncio.run(run_guarded(tune_and_adopt(spec)))
+        return asyncio.run(run_guarded(tune_and_adopt(spec, started)))
     except asyncio.CancelledError:
         return SIGTERM_EXIT
 
