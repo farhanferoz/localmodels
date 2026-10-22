@@ -1,5 +1,8 @@
 """What a result was made with: the host's software stack and the stamp of a started model server. Torch-free.
 
+Also the settings types (``Settings`` and the statuses of an answer) that ``settings.py`` and a stamp share,
+so that ``stack`` never imports ``settings``.
+
 ``fingerprint`` reads the host without starting CUDA (driver, CUDA, kernel, DGX OS, this package).
 ``llama_cpp_build`` reads the commit llama.cpp embeds in its own library without running it. ``ServerStamp``
 joins them with what a server was started with, so a result can say how it was made; a tune record keeps the
@@ -22,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from localmodels.enums import Precision  # noqa: TC001 - pydantic needs it at runtime
 from localmodels.hardware import _nvml_read
+from localmodels.pinned import PinnedFile  # noqa: TC001 - pydantic needs it at runtime
 from localmodels.version import package_version
 
 if TYPE_CHECKING:
@@ -56,6 +60,70 @@ class Engine(StrEnum):
         "llama-cpp-python"  # carries its own llama.cpp: a llama-server record never applies to it
     )
     PYTORCH = "pytorch"
+
+
+class SpecType(StrEnum):
+    """llama.cpp speculative decoding (``--spec-type``)."""
+
+    NONE = "none"
+    DRAFT_MTP = "draft-mtp"
+    DRAFT_SIMPLE = "draft-simple"
+    NGRAM_MOD = "ngram-mod"
+
+
+class SettingsStatus(StrEnum):
+    """How far an answer can be trusted."""
+
+    TUNED = "tuned"  # a record made on this machine and the current stack
+    STALE = "stale"  # a record exists but a stamped part of the stack changed since
+    RULE = "rule"  # no record; the rule was measured on this model, but not on this file and machine
+    RULE_OTHER_MODEL = "rule-other-model"  # no record; the rule was measured on other models only
+    UNTUNED = "untuned"  # nothing measured applies
+
+
+class SettingsSource(StrEnum):
+    """Where the settings of an answer came from."""
+
+    RECORD = "record"
+    RULE = "rule"
+    DEFAULT = "default"
+
+
+class TuneState(StrEnum):
+    """What the lookup did about a tune."""
+
+    NOT_NEEDED = "not-needed"
+    NOT_AVAILABLE = "not-available"  # a tune is wanted and a recipe is given; automatic re-tune is not built
+    NO_RECIPE = "no-recipe"  # a tune is wanted and the caller gave no recipe
+
+
+class TunePlan(StrEnum):
+    """The tune an answer calls for: every candidate (first use) or the reference and the current choice."""
+
+    FULL = "full"
+    CONFIRM = "confirm"
+
+
+class StoreState(StrEnum):
+    """The state of the files the answer was read from."""
+
+    OK = "ok"
+    UNREADABLE = "unreadable"
+    NEWER_SCHEMA = "newer-schema"
+
+
+class Settings(BaseModel):
+    """What to load a model with. A missing field is "no opinion": the caller keeps its own."""
+
+    model_config = ConfigDict(frozen=True)
+
+    dtype: Precision | None = None
+    options: dict[str, Any] = Field(default_factory=dict)  # token_budget, matmul_precision, batch_size
+    n_ubatch: int | None = None
+    spec: SpecType | None = None
+    spec_draft_file: str | None = None
+    # the quantised file set to load, when the tune chose another than the reference
+    model_file: tuple[PinnedFile, ...] | None = None
 
 
 class LlamaLayout(BaseModel):

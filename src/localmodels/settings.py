@@ -19,19 +19,31 @@ import os
 import re
 import sys
 from datetime import datetime  # noqa: TC003 - pydantic needs it at runtime
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from localmodels.enums import Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
-from localmodels.pinned import PinnedFile, snapshot_dir
+from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
 from localmodels.pull import _default_hub_cache, _repo_blob_name
 from localmodels.rules import EXIT_STALE, StampKey, rules_text, stamps
 from localmodels.serving.tune import TuneRecord, _read_records, hardware_key, untuned_message
-from localmodels.stack import UNKNOWN, Engine, fingerprint, stale_components
+from localmodels.stack import (
+    UNKNOWN,
+    Engine,
+    Settings,
+    SettingsSource,
+    SettingsStatus,
+    StoreState,
+    TunePlan,
+    TuneState,
+    fingerprint,
+    llama_cpp_build,
+    stale_components,
+)
+from localmodels.stack import SpecType as SpecType  # noqa: PLC0414 - re-exported: the types live in stack.py
 
 if TYPE_CHECKING:
     import argparse
@@ -43,84 +55,19 @@ SCHEMA_VERSION: Final = 1
 NO_STACK_STAMP: Final = "recorded without a stack stamp"
 _KEY_CHARS: Final = 16
 _SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+_BAD_FILE: Final = (OSError, ValueError, KeyError, TypeError, RecursionError)  # what a damaged file raises
 _ANY_MODEL: Final = "any"  # a rules.md stamp's model= for a training method
 
 log = logging.getLogger(__name__)
-
-
-class SpecType(StrEnum):
-    """llama.cpp speculative decoding (``--spec-type``)."""
-
-    NONE = "none"
-    DRAFT_MTP = "draft-mtp"
-    DRAFT_SIMPLE = "draft-simple"
-    NGRAM_MOD = "ngram-mod"
-
-
-class SettingsStatus(StrEnum):
-    """How far an answer can be trusted."""
-
-    TUNED = "tuned"  # a record made on this machine and the current stack
-    STALE = "stale"  # a record exists but a stamped part of the stack changed since
-    RULE = "rule"  # no record; the rule was measured on this model, but not on this file and machine
-    RULE_OTHER_MODEL = "rule-other-model"  # no record; the rule was measured on other models only
-    UNTUNED = "untuned"  # nothing measured applies
-
-
-class SettingsSource(StrEnum):
-    """Where the settings of an answer came from."""
-
-    RECORD = "record"
-    RULE = "rule"
-    DEFAULT = "default"
-
-
-class TuneState(StrEnum):
-    """What the lookup did about a tune."""
-
-    NOT_NEEDED = "not-needed"
-    NOT_AVAILABLE = (
-        "not-available"  # a tune is wanted and a recipe is given, but automatic re-tune is not built
-    )
-    NO_RECIPE = "no-recipe"  # a tune is wanted and the caller gave no recipe
-
-
-class TunePlan(StrEnum):
-    """The tune an answer calls for: every candidate (first use) or the reference and the current choice."""
-
-    FULL = "full"
-    CONFIRM = "confirm"
-
-
-class StoreState(StrEnum):
-    """The state of the files the answer was read from."""
-
-    OK = "ok"
-    UNREADABLE = "unreadable"
-    NEWER_SCHEMA = "newer-schema"
-
-
-class Settings(BaseModel):
-    """What to load a model with. A missing field is "no opinion": the caller keeps its own."""
-
-    model_config = ConfigDict(frozen=True)
-
-    dtype: Precision | None = None
-    options: dict[str, Any] = Field(
-        default_factory=dict
-    )  # free-form: token_budget, matmul_precision, batch_size
-    n_ubatch: int | None = None
-    spec: SpecType | None = None
-    spec_draft_file: str | None = None
-    model_file: str | None = None  # the quantised file to load, by SHA-256, when the tune chose another
 
 
 class ModelIdentity(BaseModel):
     """What a model is: its repository plus the files loaded, so two quantisations never share a record.
 
     A GGUF model is its file set (names and SHA-256 per file, from the Hub cache's blob names, never hashed
-    on demand). A PyTorch snapshot loaded whole is its repository and revision. ``unpinned`` marks the
-    fallback for a bare path with no content identity.
+    on demand). A PyTorch snapshot loaded whole is its repository and a 40-character revision. ``unpinned``
+    marks the fallback for a bare path with no content identity. Nothing else is an identity: a repository
+    alone would give every revision and quantisation of it one shared record.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -129,6 +76,16 @@ class ModelIdentity(BaseModel):
     revision: str = ""
     files: tuple[PinnedFile, ...] = ()
     unpinned: str = ""
+
+    @model_validator(mode="after")
+    def _identifies_content(self) -> Self:
+        if self.revision and not _REVISION_RE.match(self.revision):
+            msg = f"revision must be a 40-character commit sha, not {self.revision!r}"
+            raise ValueError(msg)
+        if not (self.files or self.revision or self.unpinned):
+            msg = f"{self.repository}: a model needs its files, a 40-character revision or an unpinned path"
+            raise ValueError(msg)
+        return self
 
     @classmethod
     def from_hub_files(
@@ -174,6 +131,21 @@ class SettingsRecord(BaseModel):
     build: str | None = None  # the llama.cpp build it was measured on
     libraries: dict[str, str] = Field(default_factory=dict)
     recipe_project: str | None = None
+    engine: Engine | None = None  # a record made through another engine is not used
+
+
+class TuneRecipe(BaseModel):
+    """How a project's tune is run (design 5.4). Data only: the re-tune that would run it is not built."""
+
+    model_config = ConfigDict(frozen=True)
+
+    project: str
+    command: tuple[str, ...]  # run by slurm in the project's own environment; ends by adopting its record
+    workdir: Path | None = None
+    reference: str = ""  # the name of the reference candidate (listed first)
+    quality: str = ""  # the name of the quality check; a recipe without one adopts nothing
+    prompt_tokens: int | None = None  # llama.cpp: the typical prompt length of the project's inputs
+    text: Path | None = None  # llama.cpp: a text for the teacher-forced check
 
 
 class RecordRef(BaseModel):
@@ -282,10 +254,23 @@ def settings_dir() -> Path:
     return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / "settings"
 
 
+def _slug(repository: str) -> str:
+    return _SLUG_UNSAFE.sub("_", repository.replace("/", "--"))
+
+
 def record_path(model: ModelIdentity, kind: WorkloadKind) -> Path:
     """The file holding the records of one model and kind: ``records/<repository>--<key>/<kind>.json``."""
-    folder = f"{_SLUG_UNSAFE.sub('_', model.repository.replace('/', '--'))}--{model.key}"
-    return settings_dir() / "records" / folder / f"{kind.value}.json"
+    return settings_dir() / "records" / f"{_slug(model.repository)}--{model.key}" / f"{kind.value}.json"
+
+
+def stored_identities(repository: str, kind: WorkloadKind) -> list[tuple[Path, ModelIdentity]]:
+    """Every identity of ``repository`` with a stored file for ``kind``: (the file, the identity it holds)."""
+    found = []
+    for path in sorted((settings_dir() / "records").glob(f"{_slug(repository)}--*/{kind.value}.json")):
+        records = read_store(path).records
+        if records and records[0].model.repository == repository:
+            found.append((path, records[0].model))
+    return found
 
 
 class StoreRead(NamedTuple):
@@ -303,15 +288,15 @@ def _first_error(exc: ValidationError) -> str:
 
 def read_store(path: Path) -> StoreRead:
     """Read one store file; never raises. A bad file, a newer schema or an invalid record is absent."""
-    if not path.is_file():
-        return StoreRead([], StoreState.OK, "")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         schema, items = payload["schema"], payload["records"]
         if not isinstance(schema, int) or not isinstance(items, list):
             msg = "schema is not a number or records is not a list"
-            raise TypeError(msg)  # noqa: TRY301 - one handler for every shape of a bad file
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise TypeError(msg)
+    except FileNotFoundError:
+        return StoreRead([], StoreState.OK, "")
+    except _BAD_FILE as exc:
         return StoreRead([], StoreState.UNREADABLE, f"{path}: {exc!r}")
     if schema > SCHEMA_VERSION:
         return StoreRead(
@@ -329,11 +314,9 @@ def read_store(path: Path) -> StoreRead:
 
 def _read_legacy(path: Path, model: ModelIdentity, kind: WorkloadKind) -> StoreRead:
     """A caller's own tune file (``serving.tune``'s layout) as records of this model and kind; no raise."""
-    if not path.is_file():
-        return StoreRead([], StoreState.OK, "")
     try:
-        legacy: list[TuneRecord] = _read_records(path)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        legacy: list[TuneRecord] = _read_records(path)  # no records when the file is absent
+    except _BAD_FILE as exc:
         return StoreRead([], StoreState.UNREADABLE, f"{path}: {exc!r}")
     records = [
         SettingsRecord(
@@ -351,20 +334,34 @@ def _read_legacy(path: Path, model: ModelIdentity, kind: WorkloadKind) -> StoreR
     return StoreRead(records, StoreState.OK, "")
 
 
-def _stale_lines(record: SettingsRecord, host: Mapping[str, str], build: str | None) -> list[str]:
-    """What changed since ``record`` was made: stamped host components, and the llama.cpp ``build`` if named.
+def _stale_lines(
+    record: SettingsRecord,
+    host: Mapping[str, str],
+    build: str | None,
+    libraries: Mapping[str, str] | None = None,
+) -> list[str]:
+    """What changed since ``record`` was made.
 
-    localmodels' own version is recorded, not compared (``stale_components``).
+    Stamped host components, the llama.cpp ``build`` if named, and the caller's ``libraries`` that the record
+    also names (one it does not name is not a reason). localmodels' own version is recorded, not compared
+    (``stale_components``).
     """
     lines = [NO_STACK_STAMP] if record.stack is None else stale_components(record.stack, host)
     if build is not None and record.build != build:
         lines.insert(0, f"{StampKey.LLAMA_CPP}: {record.build or UNKNOWN} -> {build}")
+    lines.extend(
+        f"{name}: {record.libraries[name]} -> {version}"
+        for name, version in (libraries or {}).items()
+        if name in record.libraries and record.libraries[name] != version
+    )
     return lines
 
 
-def _pick(records: list[SettingsRecord], hardware: str, build: str | None) -> SettingsRecord | None:
-    """This machine's newest record, preferring the one made on the caller's llama.cpp ``build``."""
-    mine = [r for r in records if r.hardware == hardware]
+def _pick(
+    records: list[SettingsRecord], hardware: str, build: str | None, engine: Engine
+) -> SettingsRecord | None:
+    """This machine's newest record for ``engine``, preferring the one made on the caller's ``build``."""
+    mine = [r for r in records if r.hardware == hardware and r.engine in (None, engine)]
     return max(
         [r for r in mine if build is None or r.build == build] or mine,
         key=lambda r: r.measured_at.timestamp(),
@@ -384,7 +381,7 @@ def _rule(kind: WorkloadKind, repository: str) -> RuleRef | None:
     )
 
 
-def lookup(
+def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     model: ModelIdentity,
     kind: WorkloadKind,
     *,
@@ -392,19 +389,24 @@ def lookup(
     build: str | None = None,
     explicit: Mapping[str, Any] | None = None,
     default: Settings | None = None,
-    recipe: object | None = None,
+    libraries: Mapping[str, str] | None = None,
+    recipe: TuneRecipe | None = None,
     legacy_path: Path | None = None,
 ) -> SettingsAnswer:
     """What to load ``model`` with for ``kind`` work on this machine; it never fails a load.
 
     ``build`` is the llama.cpp build the caller will run (``Engine.LLAMA_CPP``): a record made on another
-    build is stale. ``explicit`` holds settings the caller has decided; they replace the answer's for those
-    fields and are listed in ``overridden``, so the status still shows that a measured alternative exists.
-    ``default`` is what the caller runs when nothing measured applies. ``recipe`` is how a tune is run (the
-    automatic re-tune is not built: a tune the answer calls for reports ``NOT_AVAILABLE``). ``legacy_path`` is
-    the caller's own tune file, read when the store has no record. A record made through llama-server is never
-    applied to ``Engine.LLAMA_CPP_PYTHON``, which has no tune path yet. ``ValueError`` for an ``explicit`` key
-    that is not a settings field (a caller's bug, not a store problem).
+    build is stale; without it the record's build is compared with the current one. ``explicit`` holds
+    settings the caller has decided; they replace the answer's for those fields (``options`` key by key) and
+    are listed in ``overridden``, so the status still shows that a measured alternative exists. ``default``
+    is what the caller runs when nothing measured applies. ``libraries`` are the versions of the caller's own
+    libraries (``{"torch": torch.__version__}``): a record that names one at another version is stale; one it
+    does not name is reported, not a reason. ``recipe`` is how a tune is run (the automatic re-tune is not
+    built: a tune the answer calls for reports ``NOT_AVAILABLE``). ``legacy_path`` is the caller's own tune
+    file, read when the store has no record. A record made through llama-server is never applied to
+    ``Engine.LLAMA_CPP_PYTHON``, which has no tune path yet. ``ValueError`` (pydantic's included) for an
+    ``explicit`` key that is not a settings field or a value that is not valid: a caller's bug, not a store
+    problem.
     """
     unknown = set(explicit or ()) - set(Settings.model_fields)
     if unknown:
@@ -415,6 +417,8 @@ def lookup(
     notes: list[str] = []
     if model.unpinned:
         notes.append(f"{name} is identified by its path, size and modification time, not its content.")
+    if engine is Engine.LLAMA_CPP and not model.files:
+        notes.append(f"{name} is identified by revision only: every file of this revision shares a record.")
     answer = SettingsAnswer(
         model=model, kind=kind, settings=default, status=SettingsStatus.UNTUNED, source=SettingsSource.DEFAULT
     )
@@ -423,33 +427,70 @@ def lookup(
         answer.tune = TuneState.NOT_AVAILABLE
         notes.append(f"{name}: llama-cpp-python has no tune path yet; it runs the caller's default settings.")
     else:
-        hardware = hardware_key(inspect_hardware())
-        path = record_path(model, kind)
-        store = read_store(path)
-        record = _pick(store.records, hardware, build)
-        if record is None and legacy_path is not None:
-            legacy = _read_legacy(legacy_path, model, kind)
-            record, path = _pick(legacy.records, hardware, build), legacy_path
-            store = store if store.state is not StoreState.OK else legacy
-        answer.store = store.state
-        if store.problem:
-            notes.append(f"Settings records for {name} unusable, treated as absent: {store.problem}")
-        if record is not None:
-            _from_record(answer, record, path, build if engine is Engine.LLAMA_CPP else None, notes)
-        else:
-            _from_rule(answer, notes, hardware)
+        _from_store(answer, (engine, build, libraries), legacy_path, notes)
         answer.tune = _tune_state(answer.tune_plan, recipe)
         if answer.tune_plan:
             notes.append(f"A {answer.tune_plan.value} tune is wanted; {_TUNE_REASON[answer.tune]}.")
 
     if explicit:
-        answer.settings = Settings.model_validate({**answer.settings.model_dump(), **explicit})
-        answer.overridden = list(explicit)
+        answer.settings, answer.overridden = _apply_explicit(answer.settings, explicit)
         notes.append(
             f"{name}: explicit settings replace the measured ones for {', '.join(answer.overridden)}."
         )
     answer.notes = notes
     return answer
+
+
+def _from_store(
+    answer: SettingsAnswer,
+    asked: tuple[Engine, str | None, Mapping[str, str] | None],
+    legacy_path: Path | None,
+    notes: list[str],
+) -> None:
+    """The record for this machine (the store's, else ``legacy_path``'s), else the rule or the default."""
+    engine, build, libraries = asked
+    model, kind = answer.model, answer.kind
+    name = f"{model.repository} ({kind.value})"
+    hardware = hardware_key(inspect_hardware())
+    path = record_path(model, kind)
+    store = read_store(path)
+    record = _pick(store.records, hardware, build, engine)
+    if record is None and legacy_path is not None:
+        legacy = _read_legacy(legacy_path, model, kind)
+        record, path = _pick(legacy.records, hardware, build, engine), legacy_path
+        store = store if store.state is not StoreState.OK else legacy
+    answer.store = store.state
+    if store.problem:
+        notes.append(f"Settings records for {name} unusable, treated as absent: {store.problem}")
+    if record is None:
+        _from_rule(answer, notes, hardware)
+        return
+    compared = build if engine is Engine.LLAMA_CPP else None
+    if engine is Engine.LLAMA_CPP and build is None and record.build:
+        compared = _current_build()
+        notes.append(f"{name}: no llama.cpp build named; the record's build is compared with {compared}.")
+    _from_record(answer, record, path, (compared, libraries), notes)
+
+
+def _apply_explicit(chosen: Settings, explicit: Mapping[str, Any]) -> tuple[Settings, list[str]]:
+    """``chosen`` with the caller's fields on top (``options`` key by key), and the names it replaced."""
+    fields = {**chosen.model_dump(), **{name: value for name, value in explicit.items() if name != "options"}}
+    overridden = [name for name in explicit if name != "options"]
+    if "options" in explicit:
+        options = Settings.model_validate({"options": explicit["options"]}).options
+        fields["options"] = {**chosen.options, **options}
+        overridden.extend(f"options.{key}" for key in options)
+    return Settings.model_validate(fields), overridden
+
+
+def _current_build(home: str | None = None) -> str:
+    """The commit of the ``current`` llama.cpp build, read from its library (never run)."""
+    from localmodels.llama_builds import (  # noqa: PLC0415 - only a lookup that needs it
+        current_server,
+        llama_home,
+    )
+
+    return llama_cpp_build(current_server(llama_home(home)))
 
 
 def _tune_state(plan: TunePlan | None, recipe: object | None) -> TuneState:
@@ -459,7 +500,11 @@ def _tune_state(plan: TunePlan | None, recipe: object | None) -> TuneState:
 
 
 def _from_record(
-    answer: SettingsAnswer, record: SettingsRecord, path: Path, build: str | None, notes: list[str]
+    answer: SettingsAnswer,
+    record: SettingsRecord,
+    path: Path,
+    compared: tuple[str | None, Mapping[str, str] | None],
+    notes: list[str],
 ) -> None:
     answer.settings, answer.source = record.chosen, SettingsSource.RECORD
     answer.record = RecordRef(
@@ -472,8 +517,14 @@ def _from_record(
         build=record.build,
         recipe_project=record.recipe_project,
     )
-    answer.stale = _stale_lines(record, fingerprint(), build)
+    build, libraries = compared
+    answer.stale = _stale_lines(record, fingerprint(), build, libraries)
     name = f"{answer.model.repository} ({answer.kind.value})"
+    notes.extend(
+        f"{name}: {lib} not recorded; not compared."
+        for lib in (libraries or {})
+        if lib not in record.libraries
+    )
     made = f"{record.candidate or _describe(record.chosen)} on {record.measured_at:%Y-%m-%d}"
     if answer.stale:
         answer.status, answer.tune_plan = SettingsStatus.STALE, TunePlan.CONFIRM
@@ -533,23 +584,25 @@ def cmd_settings_show(args: argparse.Namespace) -> int:
             if args.file
             else ModelIdentity(repository=args.model, revision=args.revision or "")
         )
-    except ValueError as exc:
-        sys.stderr.write(f"cannot identify the model files: {exc}\n")
+    except ValueError as exc:  # no --revision or --file, or a file whose blob is not a hash
+        sys.stderr.write(f"cannot identify the model (give --revision or --file): {exc}\n")
         return 1
     answer = lookup(
         model, kind, engine=engine, build=args.build, legacy_path=Path(args.legacy) if args.legacy else None
     )
     sys.stdout.writelines(f"{line}\n" for line in answer.lines())
+    for path, other in stored_identities(model.repository, kind):
+        if other.key != model.key:
+            names = ", ".join(f.path for f in other.files) or other.revision or other.unpinned
+            sys.stdout.write(
+                f"note: records exist for another identity of this repository: {names} [{path}]\n"
+            )
     return 0
 
 
 def cmd_settings_check(args: argparse.Namespace) -> int:
     """`localmodels settings check`: list the stored records that are stale on this host; exit 1 if any."""
-    from localmodels.llama_builds import current_server, llama_home  # noqa: PLC0415 - read only for `check`
-    from localmodels.stack import llama_cpp_build  # noqa: PLC0415
-
-    build = llama_cpp_build(current_server(llama_home(args.home)))
-    stale, problems, total = stale_records(fingerprint(), build)
+    stale, problems, total = stale_records(fingerprint(), _current_build(args.home))
     out = sys.stdout
     out.writelines(f"{line}\n" for line in stale)
     out.writelines(f"unusable: {line}\n" for line in problems)

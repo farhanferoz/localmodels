@@ -284,7 +284,9 @@ def _build_settings_parser(subparsers: argparse._SubParsersAction[argparse.Argum
     commands = settings_p.add_subparsers(dest="settings_command", required=True)
     show_p = commands.add_parser("show", help="print the settings answer for one model; loads nothing")
     show_p.add_argument("--model", required=True, help="Hugging Face repository id")
-    show_p.add_argument("--revision", default=None, help="pinned revision (40-character commit)")
+    show_p.add_argument(
+        "--revision", default=None, help="pinned revision (40-character commit); or give --file"
+    )
     show_p.add_argument(
         "--file",
         action="append",

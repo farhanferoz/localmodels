@@ -118,7 +118,7 @@ localmodels setup [--role chat] [--models-dir DIR] [--catalogue FILE] [--yes]
 localmodels serve --config <toml>
 localmodels lease {status,acquire,wait,begin-wait,admitted,release} --project NAME ...
 localmodels rules {show KIND,check}
-localmodels settings {show --model REPO --kind KIND,check}
+localmodels settings {show --model REPO (--revision REV | --file NAME) --kind KIND,check}
 localmodels llama {build --commit SHA,list,switch COMMIT,prune}
 localmodels digest run
 ```
@@ -172,10 +172,11 @@ prune` deletes builds that are neither current nor named.
 it, from a tune record in `~/.local/state/localmodels/settings` (`$LOCALMODELS_STATE_DIR` moves it), else the written
 rule of the kind, else the caller's default. Only a record is `tuned`; a record whose stack or llama.cpp build changed
 is `stale` and stays in use; a rule measured on this model is `rule`; a rule measured on other models only is
-`rule-other-model` and changes nothing (the caller's default stays). `explicit=` settings are never overridden. The
-store is never a reason for a load to fail: a bad or newer file is treated as absent and announced
+`rule-other-model` and changes nothing (the caller's default stays). `explicit=` settings are never overridden (`options` key by key). A model is identified by its files, or a 40-character revision,
+or an announced path; a repository alone is refused. The caller's `libraries={"torch": ...}` are compared with the
+ones the record names. The store is never a reason for a load to fail: a bad or newer file is treated as absent and announced
 (`answer.announce(log)`). The module is imported on demand; `import localmodels` does not load it.
-`localmodels settings show --model REPO --kind K6` prints one answer and loads nothing; `settings check` lists the
+`localmodels settings show --model REPO --revision REV --kind K6` (or `--file NAME`) prints one answer and loads nothing; `settings check` lists the
 stored records that are stale on this host and exits 1 when any is. Automatic re-tuning is not built yet: an answer
 that calls for a tune reports `tune: not-available`.
 
