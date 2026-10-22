@@ -14,6 +14,7 @@ import socket
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 
 from pydantic import BaseModel, ValidationError
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
 ProgressEmitter = Callable[[ProgressMessage], None]
 
 NETWORK_BLOCKED: Final = "network access is blocked in the model server"
+#: Distributions whose versions every ``loaded`` reply reports (read from metadata; nothing is imported).
+LIBRARIES: Final = ("torch", "transformers")
 
 
 class ModelServer(ABC):
@@ -55,6 +58,17 @@ class ModelServer(ABC):
         Raises:
             ServingError: a known failure (its code becomes the ``error`` message's code).
         """
+
+
+def library_versions() -> dict[str, str]:
+    """The installed version of each of ``LIBRARIES``; one that is not installed is left out."""
+    found = {}
+    for name in LIBRARIES:
+        try:
+            found[name] = version(name)
+        except PackageNotFoundError:
+            continue
+    return found
 
 
 def reply_stream() -> BinaryIO:
@@ -87,7 +101,9 @@ def serve(server: ModelServer, stdin: BinaryIO, out: BinaryIO) -> None:
             if isinstance(msg, ShutdownMessage):
                 return
             if isinstance(msg, LoadMessage):
-                out.write(encode(server.load(msg)))
+                loaded = server.load(msg)
+                libraries = {**library_versions(), **loaded.libraries}
+                out.write(encode(loaded.model_copy(update={"libraries": libraries})))
             elif isinstance(msg, InferMessage):
                 request_id = msg.request_id
                 out.write(encode(server.infer(msg, lambda progress: _emit(out, progress))))

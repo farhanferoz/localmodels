@@ -40,7 +40,9 @@ different accelerator; only a model server's own process imports PyTorch.
   when asked for, so each environment needs only its own model's libraries; `ModelHost` keeps one
   server warm on a shared GPU, holding the lease only while a model is loaded, unloading after an
   idle time and at once when another project waits. A server announces its localmodels version first and the
-  manager refuses another version with a plain message (rebuild that model's environment); `require_device`
+  manager refuses another version with a plain message (rebuild that model's environment; update the
+  managing process before the model environments, because a newer server's `loaded` reply carries library versions that
+  an older manager reads only if the version number differs, which 0.7.0 does); `require_device`
   refuses, in plain words, a model the machine's hardware cannot run, before anything starts. A model file on a
   network filesystem (NFS, SMB) is reported, since every cold start then reads it at network speed.
 - `localmodels.serving.tune` — tuning a model: `run_tune` loads one fresh model server per candidate (a

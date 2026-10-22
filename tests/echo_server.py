@@ -5,7 +5,8 @@
 text must not reach the manager) and ``exit`` (the process dies mid-request).
 Load options shape every inference after them: ``sleep_s`` (each
 inference sleeps that long), ``text`` (``raw_text`` is that, not the input directory), ``peak_gib`` (reported
-as ``peak_allocated_gib``) and ``fail_dtype`` (a load in that dtype is refused as not implemented).
+as ``peak_allocated_gib``), ``fail_dtype`` (a load in that dtype is refused as not implemented) and
+``libraries`` (added to the versions the ``loaded`` reply reports).
 """
 
 from __future__ import annotations
@@ -44,7 +45,12 @@ class EchoServer(ModelServer):
         if msg.options.get("fail_dtype") == msg.dtype:
             raise ServingError(ServingErrorCode.NOT_IMPLEMENTED, f"{msg.dtype} is not supported")
         self.options = msg.options
-        return LoadedMessage(seconds=0.0, torch_allocated_gib=0.0, torch_reserved_gib=0.0)
+        return LoadedMessage(
+            seconds=0.0,
+            torch_allocated_gib=0.0,
+            torch_reserved_gib=0.0,
+            libraries=msg.options.get("libraries", {}),
+        )
 
     def infer(self, msg: InferMessage, emit_progress: ProgressEmitter) -> ResultMessage:
         params = msg.params
