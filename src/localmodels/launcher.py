@@ -29,6 +29,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from .hardware import available_memory, network_filesystem
 from .lease import GpuLease, GpuLeaseClient, LeaseRecord, ResidentRecord
 from .process import (
+    DRAFT_MODEL_ENV,
+    DRAFT_MODEL_FLAGS,
+    SPEC_TYPE_FLAG,
+    UBATCH_ENV,
+    UBATCH_FLAGS,
     LocalModelsError,
     ServerHandle,
     ServerSpec,
@@ -37,7 +42,10 @@ from .process import (
     _process_args,
     auth_headers,
     build_args,
+    llama_flags,
+    llama_option,
     require_key_off_loopback,
+    speculates,
 )
 from .stack import Engine, LlamaLayout, ServerStamp, Settings, fingerprint, llama_cpp_build
 
@@ -252,6 +260,7 @@ class LocalServerManager:
         guards: MemoryGuards | None = None,
         resident_allowance_gib: float | None = None,
         available_gib: Callable[[bool], float | None] = _available_gib,
+        settings: SettingsAnswer | None = None,
     ) -> None:
         self.guards = guards or MemoryGuards()
         if contention is Contention.STAY_UP and (
@@ -275,6 +284,8 @@ class LocalServerManager:
         self.min_slot_tokens = min_slot_tokens
         self.resident_allowance_gib = resident_allowance_gib
         self._available_gib = available_gib
+        #: The settings answer this server starts with; None starts it exactly as it always was.
+        self.settings = settings
         self._watchdog: asyncio.Task[None] | None = None
         self._ready = False
         #: Why the watchdog killed the last server it started, in plain words; None if it did not.
@@ -319,13 +330,46 @@ class LocalServerManager:
     def _pidfile(self) -> Path:
         return self.pid_dir / f"{self.spec.port}.pid"
 
+    @property
+    def effective_flags(self) -> tuple[str, ...]:
+        """The caller's ``extra_flags`` plus what the settings answer adds (see ``llama_flags``)."""
+        if self.settings is None:
+            return self.extra_flags
+        return (*self.extra_flags, *llama_flags(self.settings.settings, self.extra_flags, self.extra_env))
+
+    def _applied(self) -> tuple[Settings, list[str]]:
+        """The settings ``llama_flags`` passed, and the groups the caller's own flags or env kept out."""
+        if self.settings is None:
+            return Settings(), []
+        chosen = self.settings.settings
+        added = llama_flags(chosen, self.extra_flags, self.extra_env)
+        ubatch, speculation = UBATCH_FLAGS[0] in added, SPEC_TYPE_FLAG in added
+        applied = Settings(
+            n_ubatch=chosen.n_ubatch if ubatch else None,
+            spec=chosen.spec if speculation else None,
+            spec_draft_file=chosen.spec_draft_file if speculation else None,
+        )
+        wanted = (
+            ("n_ubatch", chosen.n_ubatch is not None, ubatch),
+            ("spec", speculates(chosen), speculation),
+        )
+        return applied, [name for name, asked, passed in wanted if asked and not passed]
+
     def stamp(self, model_sha256: str | None = None, settings: SettingsAnswer | None = None) -> ServerStamp:
         """How this server is made: llama.cpp's build, the model file, its layout and the host.
 
         ``model_sha256`` is the file's hash when the caller knows it (a ``PinnedFile``); never computed here.
-        ``settings`` is the lookup answer the caller took its settings from; its stamp is attached with no
-        settings applied, because this manager passes none of them to llama-server yet.
+        ``settings`` is the lookup answer the caller took its settings from, by default this manager's own.
+        The stamp's ``applied`` is what ``llama_flags`` passed to llama-server (nothing if this manager has no
+        answer), and a group the caller's own flags kept out is added to its ``overridden``.
         """
+        answer = settings or self.settings
+        settings_stamp = None
+        if answer is not None:
+            applied, kept_out = self._applied()
+            stamped = answer.stamp(applied)
+            kept_out = [name for name in kept_out if name not in stamped.overridden]
+            settings_stamp = stamped.model_copy(update={"overridden": [*stamped.overridden, *kept_out]})
         return ServerStamp(
             engine=Engine.LLAMA_CPP,
             build=llama_cpp_build(Path(self.binary)),
@@ -335,10 +379,10 @@ class LocalServerManager:
                 n_ctx=self.params.n_ctx,
                 n_parallel=self.params.n_parallel,
                 kv_unified=self.params.kv_unified,
-                extra_flags=self.extra_flags,
+                extra_flags=self.effective_flags,
             ),
             host=fingerprint(),
-            settings=settings.stamp(Settings()) if settings else None,
+            settings=settings_stamp,
         )
 
     def free_gib(self) -> float | None:
@@ -346,16 +390,33 @@ class LocalServerManager:
         return self._available_gib(self.params.n_gpu_layers != 0)
 
     async def _projected_gib(self) -> float:
-        """llama.cpp's projection of the server's memory (weights, context, compute); raises if none."""
+        """llama.cpp's projection of the server's memory (weights, context, compute); raises if none.
+
+        With a settings answer it is projected at the effective ``-ub`` and, when a draft model is among the
+        effective flags, the draft file's own projection is added: ``llama-fit-params`` fits one model only.
+        """
+        ubatch = draft = None
+        if self.settings is not None:
+            flags = self.effective_flags
+            ubatch = llama_option(flags, self.extra_env, UBATCH_FLAGS, UBATCH_ENV)
+            draft = llama_option(flags, self.extra_env, DRAFT_MODEL_FLAGS, DRAFT_MODEL_ENV)
+        total = await self._fit_gib(self.spec.model_path, ubatch)
+        if draft is not None:
+            total += await self._fit_gib(Path(draft), ubatch)
+        return total
+
+    async def _fit_gib(self, model_path: Path, ubatch: str | None) -> float:
+        """One ``llama-fit-params`` projection of ``model_path`` at this server's context, in GiB."""
         fit = self.guards.fit_params_binary or Path(self.binary).with_name("llama-fit-params")
         cmd = [
             str(fit),
             "-m",
-            str(self.spec.model_path),
+            str(model_path),
             "-c",
             str(self.params.n_ctx),
             "-np",
             str(self.params.n_parallel),
+            *([UBATCH_FLAGS[0], ubatch] if ubatch is not None else []),
             "-lv",
             "4",
         ]
@@ -370,7 +431,7 @@ class LocalServerManager:
         match = _PROJECTION_RE.search(out.decode(errors="replace"))
         if match is None:
             msg = (
-                f"llama-fit-params printed no projection for {self.spec.model_path.name} "
+                f"llama-fit-params printed no projection for {model_path.name} "
                 f"(exit {proc.returncode}); not loading a model it has not projected"
             )
             raise ServerStartError(msg)
@@ -450,8 +511,17 @@ class LocalServerManager:
             if resp.status_code == _HTTP_OK:
                 data = resp.json()
                 if Path(data.get("model_path", "")).name == self.spec.model_path.name:
+                    if self.settings is not None and not self._runs_as_started_now(args):
+                        # a server with other flags would run the old settings under the new answer's stamp
+                        await self.stop()
+                        return None
                     return ServerHandle(pid=pid, port=self.spec.port, model_path=self.spec.model_path)
         return None
+
+    def _runs_as_started_now(self, args: list[str]) -> bool:
+        """Whether a running server's arguments are those this manager would start it with (binary aside)."""
+        wanted = build_args(self.binary, self.spec, self.params, self.effective_flags)
+        return args[len(args) - len(wanted) + 1 :] == wanted[1:]
 
     def _check_port_free(self) -> None:
         try:
@@ -609,7 +679,7 @@ class LocalServerManager:
                 self.spec.model_path,
                 kind,
             )
-        args = build_args(self.binary, self.spec, self.params, self.extra_flags)
+        args = build_args(self.binary, self.spec, self.params, self.effective_flags)
         if self.guards.server_oom_score_adj is not None:
             args = ["sh", "-c", _OOM_WRAPPER.format(score=self.guards.server_oom_score_adj), *args]
         await self._check_fits()
