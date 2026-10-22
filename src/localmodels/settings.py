@@ -791,6 +791,7 @@ def _from_record(
         stack=record.stack,
         build=record.build,
         recipe_project=record.recipe_project,
+        changed_from=record.previous,
     )
     build, libraries = compared
     answer.stale = _stale_lines(record, fingerprint(), build, libraries)

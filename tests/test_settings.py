@@ -664,6 +664,7 @@ def test_an_adopt_replaces_only_its_own_entry_and_keeps_five_replaced_records(
             adopt(adoptable(dtype=dtype))
         again = adopt(adoptable(dtype=Precision.FLOAT32))
     assert again.previous == "bfloat16"  # unchanged: it keeps the change before it, not its own candidate
+    assert lookup(MEDGEMMA, K5).stamp().changed_from == "bfloat16"  # every later stamp shows the last change
     records = json.loads(path.read_text())["records"]
     assert [records[0], records[1]] == [future, other]  # entries it does not own stay exactly as they were
     assert [r["candidate"] for r in records[2:]] == ["float32"]  # one entry for this slot, replaced
