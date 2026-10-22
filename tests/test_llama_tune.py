@@ -734,7 +734,12 @@ def test_the_arguments_resolve_the_models_head_file_and_alternatives_from_the_hu
     )
     assert spec.alternatives[0].path == root / "Q4" / "m.gguf"  # the reference's own repository and revision
     assert spec.alternatives[0].identity.revision == MODEL.revision
+    assert spec.params.n_parallel == 4  # the interactive role's slots
+    one_at_a_time = llama_tune.spec_from_args(parse([*base, "--parallel", "1"]))
+    assert one_at_a_time.params.n_parallel == 1
     for bad in (
+        ["--parallel", "0"],
+        ["--parallel", "5"],  # more slots than the role's
         ["--speculation", "draft-simple"],  # a draft model needs its file
         ["--speculation", "ngram-mod", "--draft-file", "MTP/mtp.gguf"],  # nothing takes the file
         ["--speculation", "draft-mtp", "--draft-file", "MTP/missing.gguf"],  # a tune never downloads
