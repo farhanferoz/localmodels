@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from localmodels.enums import ModelSizeClass, QuantLevel
+from localmodels.enums import ModelSizeClass, QuantLevel, WorkloadKind
 from localmodels.launcher import (
     Contention,
     LeaseConflictError,
@@ -31,7 +31,10 @@ from localmodels.launcher import (
 )
 from localmodels.lease import GpuLease, QuietRequest
 from localmodels.params import ServingParams
-from localmodels.process import ApiKeyRequiredError, ServerSpec
+from localmodels.pinned import PinnedFile
+from localmodels.process import ApiKeyRequiredError, ServerSpec, _is_pid_alive, _process_args
+from localmodels.settings import ModelIdentity, SettingsAnswer
+from localmodels.stack import Settings, SettingsSource, SettingsStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -146,6 +149,7 @@ def _manager(
     guards: MemoryGuards | None = None,
     resident_allowance_gib: float | None = None,
     available_gib: Callable[[bool], float | None] | None = None,
+    settings: SettingsAnswer | None = None,
 ) -> LocalServerManager:
     spec = ServerSpec(host=host, port=port, model_path=model_file)
     return LocalServerManager(
@@ -165,7 +169,20 @@ def _manager(
         extra_env=extra_env,
         guards=guards,
         resident_allowance_gib=resident_allowance_gib,
+        settings=settings,
         **({} if available_gib is None else {"available_gib": available_gib}),
+    )
+
+
+def _answer(**chosen: object) -> SettingsAnswer:
+    """A tuned settings answer holding ``chosen`` (``Settings`` fields), for a manager's ``settings=``."""
+    files = (PinnedFile(path="m.gguf", sha256="cd" * 32),)
+    return SettingsAnswer(
+        model=ModelIdentity(repository="org/model", files=files),
+        kind=WorkloadKind.K5,
+        settings=Settings(**chosen),  # type: ignore[arg-type]
+        status=SettingsStatus.TUNED,
+        source=SettingsSource.RECORD,
     )
 
 
@@ -568,6 +585,29 @@ async def test_adopted_gpu_server_writes_a_lease(tmp_path: Path) -> None:
         assert adopted.pid == handle.pid
         assert lease.lease_path().exists()
         await manager.stop()
+
+
+async def test_a_running_server_with_other_flags_is_restarted_for_a_settings_answer(tmp_path: Path) -> None:
+    """Adopting by model name alone would run `-ub` 512 under a stamp that says 2048."""
+    model_file = tmp_path / "test.gguf"
+    model_file.touch()
+    bin_path = _make_fake_server(tmp_path, 1)
+    async with httpx.AsyncClient() as http:
+
+        def manager(ubatch: int) -> LocalServerManager:
+            return _manager(
+                tmp_path=tmp_path, http=http, bin_path=bin_path, port=8184,
+                model_file=model_file, params=_gpu_params(), settings=_answer(n_ubatch=ubatch),
+            )  # fmt: skip
+
+        old = await manager(512).start()
+        assert (await manager(512).start()).pid == old.pid  # the same flags: adopted
+        asked = manager(2048)
+        fresh = await asked.start()
+        assert fresh.pid != old.pid
+        assert not _is_pid_alive(old.pid)
+        assert _process_args(fresh.pid)[-2:] == ["-ub", "2048"]
+        await asked.stop()
 
 
 async def test_adopted_cpu_server_writes_no_lease(tmp_path: Path) -> None:

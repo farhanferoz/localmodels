@@ -16,9 +16,11 @@ import os
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
+from localmodels.enums import WorkloadKind
 from localmodels.launcher import (
     Contention,
     LeaseConflictError,
@@ -29,7 +31,8 @@ from localmodels.launcher import (
 )
 from localmodels.lease import GpuLease, QuietRequest
 from localmodels.process import ServerHandle
-from localmodels.service import ServeConfig, load_serve_config, run_serve
+from localmodels.service import ServeConfig, _build_manager, load_serve_config, run_serve
+from localmodels.stack import Engine
 
 _OTHER_LEASE_HELD_S = 0.3
 
@@ -351,3 +354,35 @@ def test_stay_up_refused_for_memory_waits_and_retries_instead_of_exiting(tmp_pat
     assert asyncio.run(asyncio.wait_for(serve, timeout=5)) is SupervisorExit.STOPPED
     assert len(starts) == 3
     assert min(b - a for a, b in itertools.pairwise(starts)) >= config.poll_s  # paced, never a tight loop
+
+
+def test_a_settings_request_is_looked_up_for_the_manager_and_only_when_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "llama-server"
+    request = {
+        "model": {"repository": "org/model", "unpinned": "/m.gguf|1|2"},
+        "kind": "K5",
+        "build": "abc1234",
+    }
+    asked: list[dict[str, object]] = []
+
+    def lookup(model: object, kind: object, **kwargs: object) -> str:
+        asked.append({"model": model, "kind": kind, **kwargs})
+        return "the answer"
+
+    monkeypatch.setattr("localmodels.settings.lookup", lookup)
+    config = ServeConfig(
+        port=8091, model_path=Path("/m.gguf"), project="p", binary=binary, device_override="cpu"
+    )
+    assert _build_manager(config, httpx.AsyncClient()).settings is None
+    assert asked == []
+
+    config = ServeConfig(**{**config.model_dump(), "settings_request": request})
+    manager = _build_manager(config, httpx.AsyncClient())
+    assert manager.settings == "the answer"
+    (call,) = asked
+    assert (call["kind"], call["engine"], call["build"], call["recipe"]) == (
+        WorkloadKind.K5, Engine.LLAMA_CPP, "abc1234", None,
+    )  # fmt: skip
+    assert call["model"].repository == "org/model"  # type: ignore[attr-defined]

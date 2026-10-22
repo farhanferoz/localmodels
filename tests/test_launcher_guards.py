@@ -5,15 +5,16 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
 
 from localmodels.launcher import LocalServerManager, MemoryGuards, ServerStartError
 from localmodels.lease import GpuLease
-from localmodels.process import ServerSpec
-from tests.test_launcher import _gpu_params, _make_fake_server
+from localmodels.process import ServerSpec, build_args
+from localmodels.stack import Settings, SpecType
+from tests.test_launcher import _answer, _gpu_params, _make_fake_server
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -36,6 +37,7 @@ def _manager(
     readings: Iterator[float],
     *,
     health: int = 3,
+    **extra: Any,
 ) -> LocalServerManager:
     model = tmp_path / "test.gguf"
     model.touch()
@@ -58,6 +60,7 @@ def _manager(
         ready_timeout_s=10.0,
         guards=guards,
         available_gib=available,
+        **extra,
     )
 
 
@@ -136,3 +139,60 @@ async def test_server_oom_score_adj_is_set_on_the_server_alone(tmp_path: Path) -
             assert os.getpgid(handle.pid) != os.getpgid(0)
         finally:
             await manager.stop()
+
+
+async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []  # every process started: llama-fit-params runs, then the llama-server
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        calls.append([str(a) for a in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    chosen = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file="/models/draft.gguf")
+    guards, model = MemoryGuards(host_reserve_gib=12), str(tmp_path / "test.gguf")
+    async with httpx.AsyncClient() as http:
+        # no answer: the argument lists it always had
+        plain = _manager(tmp_path, http, guards, _steady(100), health=1)
+        await plain.start()
+        await plain.stop()
+        fit, server = calls
+        assert fit[1:] == ["-m", model, "-c", "8192", "-np", "1", "-lv", "4"]
+        assert server == build_args(plain.binary, plain.spec, plain.params)
+        assert plain.stamp().settings is None
+
+        # an answer: its flags, and a draft model's own projection beside the model's, at the same `-ub`
+        calls.clear()
+        asked = _manager(
+            tmp_path, http, guards, _steady(100), health=1, settings=_answer(**chosen.model_dump())
+        )
+        await asked.start()
+        await asked.stop()
+        added = ("-ub", "2048", "--spec-type", "draft-mtp", "--spec-draft-model", "/models/draft.gguf")
+        assert [c[2] for c in calls[:2]] == [model, "/models/draft.gguf"]
+        assert all(c[-4:] == ["-ub", "2048", "-lv", "4"] for c in calls[:2])
+        assert calls[2] == build_args(asked.binary, asked.spec, asked.params, added)
+        stamped = asked.stamp()
+        assert stamped.layout is not None
+        assert stamped.layout.extra_flags == added
+        assert stamped.settings is not None
+        assert (stamped.settings.applied, stamped.settings.overridden) == (chosen, [])
+
+        # the caller's own flags and environment win, group by group, and the fit check follows them
+        calls.clear()
+        theirs = ("--spec-type", "ngram-mod")
+        kept = _manager(
+            tmp_path, http, guards, _steady(100), health=1, settings=_answer(**chosen.model_dump()),
+            extra_flags=theirs, extra_env={"LLAMA_ARG_UBATCH": "256"},
+        )  # fmt: skip
+        await kept.start()
+        await kept.stop()
+        assert len(calls) == 2
+        assert calls[0][-4:] == ["-ub", "256", "-lv", "4"]
+        assert calls[1] == build_args(kept.binary, kept.spec, kept.params, theirs)
+        stamped = kept.stamp()
+        assert stamped.settings is not None
+        assert (stamped.settings.applied, stamped.settings.overridden) == (Settings(), ["n_ubatch", "spec"])
