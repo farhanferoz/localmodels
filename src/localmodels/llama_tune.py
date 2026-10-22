@@ -1393,6 +1393,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="the serving layout; its slot count is never tuned",
     )
     add(
+        "--parallel",
+        type=int,
+        help="fewer slots than the role's, when the caller lays its server out so (1: one request at a "
+        "time); recorded in the layout, never tuned",
+    )
+    add(
         "--prompts",
         required=True,
         type=Path,
@@ -1475,11 +1481,19 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
     report = inspect_hardware()
     reference = _file_set(args.repository, args.revision, args.files)
     server = resolve_llama_server_bin(explicit=current_server(llama_home()))
+    params = derive_serving_params(report.device, report.total_memory_gb, role=ServingRole(args.role))
+    if args.parallel is not None:
+        if not 1 <= args.parallel <= params.n_parallel:
+            msg = (
+                f"--parallel {args.parallel}: between 1 and the {args.role} role's {params.n_parallel} slots"
+            )
+            raise SystemExit(msg)
+        params = params.model_copy(update={"n_parallel": args.parallel})
     return TuneSpec(
         reference=reference,
         alternatives=tuple(_file_set(args.repository, args.revision, a.split(",")) for a in args.alternative),
         kind=WorkloadKind(args.kind),
-        params=derive_serving_params(report.device, report.total_memory_gb, role=ServingRole(args.role)),
+        params=params,
         hardware=hardware_key(report),
         server_bin=server,
         prompts=load_prompts(args.prompts, args.max_prompts),
