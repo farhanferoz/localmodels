@@ -10,22 +10,31 @@ from localmodels.enums import DeviceTier, DeviceType
 from localmodels.hardware import inspect_hardware, network_filesystem, resolve_device
 
 
+@pytest.fixture(autouse=True)
+def _every_gpu_visible(monkeypatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
 def test_inspect_hardware_never_raises() -> None:
     report = inspect_hardware()
     assert report.total_memory_gb > 0
 
 
-def _fake_cuda(monkeypatch, stdout: str, *, run_raises: bool = False) -> None:
+def _fake_cuda(monkeypatch, stdout: str, *, run_raises: bool = False) -> list[str]:
+    """Fake nvidia-smi; returns the list of GPUs (``-i``) it is asked about."""
     monkeypatch.setitem(sys.modules, "pynvml", None)
     monkeypatch.setattr(hw_mod.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
     monkeypatch.setattr(hw_mod.platform, "system", lambda: "Linux")
+    asked: list[str] = []
 
-    def _run(*_a, **_k):
+    def _run(argv, *_a, **_k):
+        asked.append(argv[argv.index("-i") + 1])
         if run_raises:
             raise subprocess.CalledProcessError(1, "nvidia-smi")
         return type("R", (), {"stdout": stdout})()
 
     monkeypatch.setattr(hw_mod.subprocess, "run", _run)
+    return asked
 
 
 def test_unified_memory_smi_uses_system_ram(monkeypatch) -> None:
@@ -98,6 +107,38 @@ def test_device_override_unknown_raises() -> None:
 
 def test_resolve_device_with_override_preserves_index() -> None:
     assert resolve_device("cuda:0") == "cuda:0"
+
+
+_UUID = "GPU-d58339d6-8445-9785-5864-0815072c0f9a"
+
+
+@pytest.mark.parametrize(
+    ("visible", "probed"),
+    [
+        ("", None),
+        ("-1", None),
+        ("NoDevFiles", None),
+        ("0,0", None),
+        ("0abc", "0"),
+        ("2,-1", "2"),
+        (_UUID, _UUID),
+    ],
+)
+def test_cuda_visible_devices_picks_the_gpu_probed_and_hiding_it_means_cpu(
+    monkeypatch, tmp_path, visible: str, probed: str | None
+) -> None:
+    asked = _fake_cuda(monkeypatch, "NVIDIA GB10, [N/A]\n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    report = inspect_hardware()
+    if probed is None:  # NVML and nvidia-smi still see the GPU; CUDA, and so torch, does not
+        assert report.device is DeviceType.CPU
+        assert any("leaves this process no CUDA GPU" in a for a in report.assumptions)
+        assert resolve_device() == "cpu"
+        assert hw_mod.available_memory("cuda", _meminfo(tmp_path)) is None
+        assert asked == []
+    else:
+        assert report.device is DeviceType.CUDA
+        assert set(asked) == {probed}
 
 
 # --- available_memory: what an allocation can get, not the driver's free count
