@@ -30,10 +30,11 @@ EXIT_STALE: Final = 1
 
 
 class StampKey(StrEnum):
-    """The engine entries of a stamp line (the other keys are the host's ``stack.Component`` names)."""
+    """The entries of a stamp line that are not the host's ``stack.Component`` names."""
 
     LLAMA_CPP = "llama_cpp"
     TORCH = "torch"
+    MODEL = "model"  # repository ids the rule was measured on, comma-separated; "any" for a training method
 
 
 def rules_text() -> str:
@@ -132,6 +133,12 @@ def cmd_rules_check(args: argparse.Namespace) -> int:
     torch_kinds = [kind for kind, stamp in stamps(text) if StampKey.TORCH in stamp]
     if torch_kinds:
         out.write(f"torch stamps ({', '.join(torch_kinds)}): not checked here, localmodels has no PyTorch.\n")
+    unnamed = [kind for kind, stamp in stamps(text) if StampKey.MODEL not in stamp]
+    if unnamed:
+        out.write(
+            f"stamps naming no model ({', '.join(unnamed)}): add model=<repository id>, or model=any for a "
+            "training method.\n"
+        )
     out.write(f"llama.cpp build read from {binary}\n")
     out.write(
         f"{len(stale)} of {len(stamps(text))} stamped rules changed.\n" if stale else "No stamp differs.\n"

@@ -156,7 +156,8 @@ its own it waits for every other live lease, as before.
 `localmodels rules show K2` prints the measured rule for one kind of workload (K1 interactive text generation to K10
 fine-tuning; `src/localmodels/rules.md`): the rule, its evidence, the stack it was measured on (a `stamp:` line) and
 a benchmark recipe, then the newest digest lines for that kind. `localmodels rules check` compares every stamp with
-this host and the current llama.cpp build and exits 1 when a stamped component changed, naming the rules to re-measure.
+this host and the current llama.cpp build and exits 1 when a stamped component changed, naming the rules to re-measure;
+it also lists stamps that do not name the models they were measured on (`model=`).
 
 `localmodels llama build --commit SHA` compiles one llama.cpp commit on the CPU into `~/cache/llama.cpp/builds/<commit>`
 (`LOCALMODELS_LLAMA_HOME` moves it), with the CMake options of the build in `~/dev/llama.cpp/build`. `llama list` shows
