@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -16,6 +17,7 @@ import pytest
 
 from localmodels import launcher, llama_tune
 from localmodels.enums import DeviceType, ServingRole, WorkloadKind
+from localmodels.hardware import AvailableMemory
 from localmodels.lease import GpuLease
 from localmodels.llama_tune import (
     ArmResult,
@@ -199,7 +201,7 @@ class FakeTune(LlamaTune):
         if name == self.flaky and self.calls.count(name) > 1:
             fields["outputs"] = [*TEXTS[:-1], "a restart gave different words"]
         arm = ArmResult(name=name, settings=settings, start_s=10.0, run_s=10.0, free_gib=100.0, **fields)
-        arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.spec.headroom_gib)
+        arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.margin_gib)
         self.clock.now += 20.0
         return arm
 
@@ -374,6 +376,36 @@ async def test_a_speculative_arm_that_does_not_repeat_across_a_restart_is_not_ad
     ]  # restarted once each, nothing more
 
 
+async def test_a_draft_that_cannot_fit_beside_the_reference_is_not_started(tmp_path: Path) -> None:
+    draft = tmp_path / "mtp.gguf"
+    with draft.open("wb") as fh:
+        fh.truncate(3 * GIB)  # sparse
+    candidate = SpecCandidate(SpecType.DRAFT_MTP, str(draft))
+    spec = make_spec(tmp_path, speculation=(candidate,), prompt_tokens=300)
+    script = arm_script()
+    script["draft-mtp:mtp.gguf"] = script.pop("draft-mtp")
+    # 88 GiB measured, 3 GiB of draft and 10 GiB kept free (the kill floor) pass the 100 GiB available
+    script["reference"] = {**script["reference"], "peak_gib": 88.0}
+    tune = FakeTune(spec, script)
+    await tune.tune()
+    assert tune.calls == ["reference", "reference"]
+    skipped = {m.name: m.reason for m in tune.measurements if isinstance(m, NotMeasured)}
+    assert skipped["draft-mtp:mtp.gguf"].startswith("not tried: about 91.0 GiB with its draft")
+
+    # a larger -ub: the reference's peak plus what llama.cpp projects it to add over the default
+    async def screen(ubatch: int) -> float:
+        return {512: 10.0, 2048: 13.0}[ubatch]
+
+    tune._screen = screen  # type: ignore[method-assign]
+    assert not await tune._fits_screen(2048)
+    assert tune.measurements[-1].reason.startswith("not tried: about 91.0 GiB at -ub 2048")
+    # 86 GiB leave room: the draft is started
+    script["reference"] = {**script["reference"], "peak_gib": 86.0}
+    tune = FakeTune(spec, script)
+    await tune.tune()
+    assert "draft-mtp:mtp.gguf" in tune.calls
+
+
 async def test_a_short_budget_starts_the_models_own_speculation_first_and_skips_the_rest(
     tmp_path: Path,
 ) -> None:
@@ -525,7 +557,7 @@ def fake_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         (bin_dir / name).chmod(0o755)
     monkeypatch.setenv("FAKE_SERVER_NOTES", str(tmp_path / "notes.json"))
     monkeypatch.setenv("FAKE_PERPLEXITY_NOTES", str(tmp_path / "perplexity.json"))
-    plenty = SimpleNamespace(bytes=100 * 1024**3)
+    plenty = AvailableMemory(bytes=100 * GIB, device=DeviceType.CUDA, unified=False, source="test")
     monkeypatch.setattr(llama_tune, "available_memory", lambda _device: plenty)
     monkeypatch.setattr(launcher, "available_memory", lambda _device: plenty)
     return bin_dir / "llama-server"
@@ -547,6 +579,10 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
             return 1
 
     monkeypatch.setattr(llama_tune, "gpu_process_memory_mib", AnyPid)
+    # a GPU that shares the host's RAM: the server's host memory counts in its peak (2 GiB here)
+    unified = AvailableMemory(bytes=100 * GIB, device=DeviceType.CUDA, unified=True, source="test")
+    monkeypatch.setattr(llama_tune, "available_memory", lambda _device: unified)
+    monkeypatch.setattr(llama_tune, "process_anon_mib", lambda _pid: 2048)
     monkeypatch.setattr(llama_tune, "SAMPLE_INTERVAL_S", 0.05)
     monkeypatch.setenv("FAKE_SERVER_DELAY", "0.1")  # three waves of requests: the samples see the peak
     monkeypatch.setenv("FAKE_CHECK_NOTES", str(tmp_path / "check.txt"))
@@ -561,7 +597,16 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     assert arm.prompt_per_second == 1000.0
     assert arm.predicted_per_second == 50.0
     assert arm.acceptance == pytest.approx(0.6)  # the warm-up's line is left out
-    assert arm.peak_gib == pytest.approx(4468 / 1024)  # the largest sample, not the last
+    assert arm.peak_gib == pytest.approx((4468 + 2048) / 1024)  # the largest sample, not the last
+    # a GPU with its own memory: the host side is not added
+    tune._unified, peaks = False, []
+    sampler = asyncio.create_task(tune._sample(4242, peaks))
+    await asyncio.sleep(0.12)
+    sampler.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await sampler
+    assert peaks
+    assert max(peaks) <= 4468
     assert arm.fits is True
     assert arm.outputs == [f"words {text[:6]}" for text in TEXTS]
     assert arm.check is not None
