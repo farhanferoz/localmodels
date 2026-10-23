@@ -135,7 +135,7 @@ CHECK_TIMEOUT_FACTOR: Final = 2.0
 CHECK_TIMEOUT_MIN_S: Final = 60.0
 
 # time (design 5.4, 6.7)
-SOFT_LIMIT_S: Final = 600.0  # no further candidate is started past it
+SOFT_LIMIT_S: Final = 780.0  # no candidate starts past it; owner 2026-10-23: two big-model rounds fill 600 s
 HARD_LIMIT_S: Final = (
     840.0  # no step runs past it: `timeout --kill-after=30 900`, less 30 s to finish and write
 )
