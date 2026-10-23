@@ -57,6 +57,7 @@ from localmodels.hardware import (
     gpu_process_memory_mib,
     inspect_hardware,
     network_filesystem,
+    process_anon_mib,
 )
 from localmodels.launcher import LocalServerManager, MemoryGuards
 from localmodels.lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
@@ -582,6 +583,7 @@ class LlamaTune:
         self.control: KlStats | None = None
         self.lease = GpuLease(spec.run_dir / "lease", PROJECT)
         self._servers = 0
+        self._unified = False  # whether the GPU shares the host's RAM, read with the available memory
         self.writes = spec.kind is not WorkloadKind.K3
 
     # -- the clock and the plan ---------------------------------------------------------------------------
@@ -814,7 +816,30 @@ class LlamaTune:
             self._skip(name, f"not measured: the reference {why}")
             return
         settings = Settings(n_ubatch=self.ub_star, spec=candidate.spec, spec_draft_file=candidate.draft_file)
-        await self._run_arm(settings, self.spec.reference, checked=bool(self.spec.quality_command))
+        if self._draft_fits(arm_name(settings), candidate.draft_file):
+            await self._run_arm(settings, self.spec.reference, checked=bool(self.spec.quality_command))
+
+    def _draft_fits(self, name: str, draft_file: str | None) -> bool:
+        """Whether the reference's measured peak plus the draft file leaves the margin available; else skip.
+
+        From the reference's own peak, the figure for this model at this layout, so a draft that cannot fit
+        costs no server start. Nothing to estimate (no draft file, or no figure) lets the arm run.
+        """
+        peak, free = self.reference.peak_gib, self._free_gib()
+        if peak is None or free is None or draft_file is None:
+            return True
+        try:
+            need = peak + Path(draft_file).stat().st_size / GIB
+        except OSError:
+            return True  # the server's own start reports a missing draft
+        if need + self.margin_gib <= free:
+            return True
+        self._skip(
+            name,
+            f"not tried: about {need:.1f} GiB with its draft (the reference's peak and the file) plus "
+            f"{self.margin_gib:g} kept free, {free:.1f} GiB available",
+        )
+        return False
 
     async def _file_arm(self, alternative: FileSet) -> None:
         """A quantised file at the reference's settings; other stages' settings are not combined with it."""
@@ -889,22 +914,34 @@ class LlamaTune:
         self.measurements.extend(self.bench.values())
 
     async def _fits_screen(self, ubatch: int) -> bool:
-        """``llama-fit-params`` at this ``-ub``: it keeps what cannot fit from starting, never picks."""
+        """Whether a server at this ``-ub`` leaves the margin free: it keeps what cannot fit from starting.
+
+        The reference's measured peak, the figure for this model as it runs, plus what ``llama-fit-params``
+        projects this ``-ub`` to add over the default; the projection alone without a measured reference.
+        """
         name = f"-ub {ubatch}"
         free = self._free_gib()
         if free is None:
             self._skip(name, "not measured: memory not measured (available memory cannot be read)")
             return False
+        peak = self.reference.peak_gib if self.arms else None
         try:
-            projected = await self._screen(ubatch)
+            need = await self._screen(ubatch)
+            if peak is not None:
+                need = peak + max(0.0, need - await self._screen(UB_REFERENCE))
         except LocalModelsError as exc:
             self._skip(name, f"not measured: llama-fit-params gave no projection ({exc})")
             return False
-        if projected + self.spec.headroom_gib > free:
+        if need + self.margin_gib > free:
+            source = (
+                "the reference's peak and llama.cpp's projected difference"
+                if peak is not None
+                else "projected"
+            )
             self._skip(
                 name,
-                f"not tried: llama.cpp projects {projected:.1f} GiB plus {self.spec.headroom_gib:g} "
-                f"headroom, {free:.1f} free",
+                f"not tried: about {need:.1f} GiB at -ub {ubatch} ({source}) plus {self.margin_gib:g} "
+                f"kept free, {free:.1f} GiB available",
             )
             return False
         return True
@@ -991,7 +1028,14 @@ class LlamaTune:
 
     def _free_gib(self) -> float | None:
         reading = available_memory("cuda")
+        if reading is not None:
+            self._unified = reading.unified
         return None if reading is None else reading.bytes / GIB
+
+    @property
+    def margin_gib(self) -> float:
+        """What a server must leave available: the headroom, never less than the floor its guard kills at."""
+        return max(self.spec.headroom_gib, KILL_BELOW_GIB)
 
     # -- a server arm ----------------------------------------------------------------------------------
 
@@ -1006,7 +1050,7 @@ class LlamaTune:
             )  # fmt: skip
         guards = self.spec.guards.model_copy(
             update={
-                "host_reserve_gib": self.spec.headroom_gib,
+                "host_reserve_gib": self.margin_gib,
                 "kill_below_gib": KILL_BELOW_GIB,
                 "server_oom_score_adj": OOM_SCORE_ADJ,
             }
@@ -1057,15 +1101,20 @@ class LlamaTune:
                 arm.stop_s = self._clock() - stopping
         if peaks:
             arm.peak_gib = max(peaks) / MIB_PER_GIB
-        arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.spec.headroom_gib)
+        arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.margin_gib)
         return arm
 
     async def _sample(self, pid: int, peaks: list[int]) -> None:
-        """Note the server process's GPU memory every half second until cancelled."""
+        """Note the server process's memory every half second until cancelled.
+
+        Its GPU memory, and on a GPU that shares the host's RAM its host memory too, which comes out of the
+        same available figure.
+        """
         while True:
             held = await asyncio.to_thread(gpu_process_memory_mib)
             if held and pid in held:
-                peaks.append(held[pid])
+                host = (process_anon_mib(pid) or 0) if self._unified else 0
+                peaks.append(held[pid] + host)
             await asyncio.sleep(SAMPLE_INTERVAL_S)
 
     async def _complete(
@@ -1179,7 +1228,7 @@ class LlamaTune:
         if arm.fits is None:
             return Agreement(score=0.0, passed=False, detail="memory not measured")
         figures = (
-            f"peak {arm.peak_gib:.1f} GiB plus {self.spec.headroom_gib:g} headroom, "
+            f"peak {arm.peak_gib:.1f} GiB plus {self.margin_gib:g} kept free, "
             f"{arm.free_gib:.1f} GiB available"
         )
         return Agreement(

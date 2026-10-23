@@ -153,6 +153,20 @@ def gpu_process_memory_mib() -> dict[int, int] | None:
     return held
 
 
+def process_anon_mib(pid: int) -> int | None:
+    """A process's anonymous resident memory in MiB (``RssAnon`` in ``/proc/<pid>/status``), None unreadable.
+
+    On a GPU that shares the host's RAM (a GB10) a server holds this beside what nvidia-smi counts: llama.cpp
+    kept 31 GiB of an 87 GiB model there, 61 GiB on the GPU (measured 2026-10-23).
+    """
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"^RssAnon:\s+(\d+) kB$", status, re.MULTILINE)
+    return None if match is None else int(match[1]) // 1024
+
+
 def _cuda_memory_gb() -> tuple[str, float | None] | None:
     gpu = _cuda_gpu(0)
     if gpu is None:

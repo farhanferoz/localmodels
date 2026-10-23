@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import types
@@ -263,3 +264,8 @@ def test_gpu_process_memory_is_per_process_and_none_without_a_reading(monkeypatc
     assert hw_mod.gpu_process_memory_mib() is None
     monkeypatch.setattr(hw_mod.shutil, "which", lambda _: None)
     assert hw_mod.gpu_process_memory_mib() is None
+    # the host side a process holds beside it, from /proc: this process has some, a gone one has no reading
+    hog = bytearray(64 * 1024 * 1024)  # 64 MiB of anonymous memory, touched so it is resident
+    assert (hw_mod.process_anon_mib(os.getpid()) or 0) >= 64
+    del hog
+    assert hw_mod.process_anon_mib(2**22 + 1) is None  # above the kernel's pid limit
