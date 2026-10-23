@@ -164,6 +164,7 @@ UBATCH_ENV: Final = "LLAMA_ARG_UBATCH"
 DRAFT_MODEL_FLAGS: Final = ("--spec-draft-model", "-md", "--model-draft")
 DRAFT_MODEL_ENV: Final = "LLAMA_ARG_SPEC_DRAFT_MODEL"
 SPEC_TYPE_FLAG: Final = "--spec-type"
+SPEC_TYPE_ENV: Final = "LLAMA_ARG_SPEC_TYPE"
 SPEC_FLAGS: Final = (
     *DRAFT_MODEL_FLAGS,
     SPEC_TYPE_FLAG,
@@ -216,21 +217,33 @@ def _split_flag(token: str) -> tuple[str, str, str]:
     return (name.replace("_", "-") if name.startswith("--") else name), equals, value
 
 
+def llama_values(
+    flags: tuple[str, ...], env: Mapping[str, str] | None, names: tuple[str, ...], env_name: str
+) -> list[str]:
+    """Every value an option is given, in the order llama.cpp reads them: the environment's, then each flag's.
+
+    ``--flag value`` and ``--flag=value`` both count. Most options keep the last; ``--spec-type`` keeps them
+    all (arg.cpp:4270-4272).
+    """
+    values = [value] if (value := (env or {}).get(env_name)) is not None else []
+    for i, token in enumerate(flags):
+        name, equals, tail = _split_flag(token)
+        if name in names and equals:
+            values.append(tail)
+        elif name in names and i + 1 < len(flags):
+            values.append(flags[i + 1])
+    return values
+
+
 def llama_option(
     flags: tuple[str, ...], env: Mapping[str, str] | None, names: tuple[str, ...], env_name: str
 ) -> str | None:
     """The value a caller's flags (the last one wins, as in llama.cpp) or else its environment give an option.
 
-    ``--flag value`` and ``--flag=value`` both count; None when neither the flags nor the environment name it.
+    None when neither the flags nor the environment name it.
     """
-    value = (env or {}).get(env_name)
-    for i, token in enumerate(flags):
-        name, equals, tail = _split_flag(token)
-        if name in names and equals:
-            value = tail
-        elif name in names and i + 1 < len(flags):
-            value = flags[i + 1]
-    return value
+    values = llama_values(flags, env, names, env_name)
+    return values[-1] if values else None
 
 
 def _carries(flags: tuple[str, ...], names: tuple[str, ...]) -> bool:

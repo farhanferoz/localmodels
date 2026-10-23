@@ -31,6 +31,8 @@ from .lease import GpuLease, GpuLeaseClient, LeaseRecord, ResidentRecord
 from .process import (
     DRAFT_MODEL_ENV,
     DRAFT_MODEL_FLAGS,
+    SPEC_TYPE_ENV,
+    SPEC_TYPE_FLAG,
     UBATCH_ENV,
     UBATCH_FLAGS,
     LocalModelsError,
@@ -45,10 +47,11 @@ from .process import (
     carries_speculation,
     llama_flags,
     llama_option,
+    llama_values,
     require_key_off_loopback,
     speculates,
 )
-from .stack import Engine, LlamaLayout, ServerStamp, Settings, fingerprint, llama_cpp_build
+from .stack import Engine, LlamaLayout, ServerStamp, Settings, SpecType, fingerprint, llama_cpp_build
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -420,14 +423,25 @@ class LocalServerManager:
 
         With a settings answer it is projected at the effective ``-ub`` and, when a draft model is among the
         effective flags, the draft file's own projection is added: ``llama-fit-params`` fits one model only.
+        An MTP head (``draft-mtp``) is no model it can load alone (it crashed on one, 2026-10-23), so that
+        file counts as its size: its weights, with its cache and compute left to the reserve. A head passed
+        with ``-md`` and no ``--spec-type`` (llama.cpp then infers the type from the file) still goes to
+        ``llama-fit-params``, which refuses the start: a caller's own unusual flags, failing closed.
         """
-        ubatch = draft = None
+        ubatch = draft = kinds = None
         if self.settings is not None:
             flags = self.effective_flags
             ubatch = llama_option(flags, self.extra_env, UBATCH_FLAGS, UBATCH_ENV)
             draft = llama_option(flags, self.extra_env, DRAFT_MODEL_FLAGS, DRAFT_MODEL_ENV)
+            kinds = ",".join(llama_values(flags, self.extra_env, (SPEC_TYPE_FLAG,), SPEC_TYPE_ENV))
         total = await self._fit_gib(self.spec.model_path, ubatch)
-        if draft is not None:
+        if draft is not None and SpecType.DRAFT_MTP in (kinds or "").split(","):
+            try:
+                total += (await asyncio.to_thread(Path(draft).stat)).st_size / _GIB
+            except OSError as exc:
+                msg = f"the draft file cannot be read ({exc}); not loading a model it has not projected"
+                raise ServerStartError(msg) from exc
+        elif draft is not None:
             total += await self._fit_gib(Path(draft), ubatch)
         return total
 
