@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,25 @@ def test_a_stuck_crashed_or_cancelled_server_is_stopped(
         assert isinstance(raised.value, ServingError)
         assert raised.value.code == code
     assert not server.alive
+
+
+def test_time_this_process_spent_frozen_does_not_count_against_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _started()
+    jump = [0.0]
+    real = time.monotonic
+    monkeypatch.setattr("localmodels.serving.client.time.monotonic", lambda: real() + jump[0])
+
+    def frozen_once() -> bool:  # the first poll comes back after a 100-s freeze (D10), as the clock sees it
+        jump[0] = 100.0
+        return False
+
+    try:
+        request = InferMessage(request_id="j", input_dir="/", params={"sleep_s": 0.5})
+        server.infer(request, frozen_once, lambda _progress: None, 3.0)  # answers; does not time out
+    finally:
+        server.stop()
 
 
 def test_the_registry_imports_on_first_use_keeps_one_instance_and_refuses_an_unknown_key(

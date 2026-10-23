@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping, Sequence
 
 POLL_S: Final = 1.0
+#: A pause between two polls longer than this beyond ``POLL_S`` is time this process spent frozen.
+FROZEN_GAP_S: Final = 5.0
 GRACE_S: Final = 10.0
 DEFAULT_INFER_TIMEOUT_S: Final = 900.0
 DEFAULT_LOAD_TIMEOUT_S: Final = 1800.0
@@ -54,6 +56,12 @@ MODEL_SERVER_ENV: Final = {
 R = TypeVar("R", bound=Message)
 
 log = logging.getLogger(__name__)
+
+
+def _frozen_s(last: float, now: float) -> float:
+    """Time this process spent frozen (D10), or the host asleep, between two polls: not the server's time."""
+    gap = now - last - POLL_S
+    return gap if gap > FROZEN_GAP_S else 0.0
 
 
 class ModelServerProcess:
@@ -165,15 +173,19 @@ class ModelServerProcess:
         timeout_s: float,
         on_progress: Callable[[ProgressMessage], None],
     ) -> R:
-        deadline = time.monotonic() + timeout_s
+        last = time.monotonic()
+        deadline = last + timeout_s
         while True:
             if cancel_check():
                 self._terminate()
                 raise ServingCancelled
-            if time.monotonic() >= deadline:
+            now = time.monotonic()  # one reading: a freeze since the last lands in the gap
+            deadline += _frozen_s(last, now)
+            last = now
+            if now >= deadline:
                 self._terminate()
                 raise ServingError(ServingErrorCode.TIMEOUT, "The model server did not answer in time.")
-            msg = self._next_message(min(POLL_S, max(deadline - time.monotonic(), 0.0)))
+            msg = self._next_message(min(POLL_S, max(deadline - now, 0.0)))
             if msg is None:
                 continue
             if isinstance(msg, ReadyMessage):

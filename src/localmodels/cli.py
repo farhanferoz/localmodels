@@ -68,6 +68,10 @@ def cmd_lease_status(args: argparse.Namespace) -> int:
         report["residents"] = [r.model_dump() for r in residents]
     if quiet := lease.quiet_requests():
         report["quiet"] = [q.model_dump() for q in quiet]
+    if freezable := lease.freezables():
+        report["freezable"] = [f.model_dump() for f in freezable]
+    if frozen := lease.freezes():
+        report["frozen"] = [f.model_dump() for _, f in frozen]
     text = json.dumps(report, indent=2)
     if args.json_out:
         Path(args.json_out).write_text(text)

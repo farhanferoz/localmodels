@@ -19,7 +19,14 @@ from pathlib import Path
 
 import pytest
 
+from localmodels import lease as lease_module
+from localmodels.hardware import AvailableMemory, DeviceType
 from localmodels.lease import (
+    MAX_FROZEN_S,
+    FreezableRecord,
+    FreezeCard,
+    FreezeError,
+    FreezeRecord,
     GpuLease,
     GpuLeaseClient,
     LeaseRecord,
@@ -386,3 +393,213 @@ def test_two_services_or_cards_of_one_project_keep_their_own_records(tmp_path: P
             assert sorted(q.reason for q in bench.quiet_requests()) == ["inner", "outer"]
         assert [q.reason for q in bench.quiet_requests()] == ["outer"]  # the inner card withdrew only its own
     assert bench.quiet_requests() == []
+
+
+class _FakeSystemd:
+    """systemctl --user freeze/thaw/show over a table of unit states; a unit not in it has stopped."""
+
+    def __init__(self, *units: str) -> None:
+        self.frozen = dict.fromkeys(units, False)
+        self.stuck: set[str] = set()  # thaw fails and the unit stays frozen
+        self.no_bus = False  # every call fails with nothing on stdout, as with no user bus
+
+    def __call__(self, verb: str, unit: str) -> subprocess.CompletedProcess[str]:
+        if self.no_bus:
+            return subprocess.CompletedProcess([], 1, "", "Failed to connect to bus")
+        if unit not in self.frozen:  # stopped: show still answers, freeze and thaw refuse
+            return subprocess.CompletedProcess(
+                [], int(verb != "show"), "FreezerState=running\n", "Unit is inactive."
+            )
+        if verb == "show":
+            return subprocess.CompletedProcess(
+                [], 0, f"FreezerState={'frozen' if self.frozen[unit] else 'running'}\n", ""
+            )
+        if verb == "thaw" and unit in self.stuck:
+            return subprocess.CompletedProcess([], 1, "", "dbus timeout")
+        self.frozen[unit] = verb == "freeze"
+        return subprocess.CompletedProcess([], 0, "", "")
+
+
+def _memory(monkeypatch: pytest.MonkeyPatch, gib: float | None) -> None:
+    free = (
+        None
+        if gib is None
+        else AvailableMemory(bytes=int(gib * 2**30), device=DeviceType.CUDA, unified=True, source="t")
+    )
+    monkeypatch.setattr("localmodels.hardware.available_memory", lambda _device: free)
+
+
+def test_freeze_card_fits_first_freezes_and_wakes_and_its_holder_stops_blocking_only_its_requester(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    systemd = _FakeSystemd("nq.service")
+    monkeypatch.setattr("localmodels.lease._systemctl", systemd)
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        service_b = GpuLease(tmp_path, project="service_b")
+        service_b.write(LeaseRecord(pid=sub.pid, project="service_b", started_at=1))  # holds the GPU
+        service_b.write_freezable(FreezableRecord(pid=sub.pid, project="service_b", unit="nq.service"))
+        (service,) = GpuLease(tmp_path, project="service_c").freezables()
+        service_c = GpuLease(tmp_path, project="service_c")
+
+        _memory(
+            monkeypatch, 8.0
+        )  # freezing frees nothing, so a requester that does not fit beside it is refused
+        with (
+            pytest.raises(FreezeError, match="9 GiB needed"),
+            FreezeCard(service_c, service, need_gib=9, reason="t"),
+        ):
+            pass
+        _memory(monkeypatch, None)  # unknown memory is refused too
+        with (
+            pytest.raises(FreezeError, match="unknown"),
+            FreezeCard(service_c, service, need_gib=9, reason="t"),
+        ):
+            pass
+        assert service_c.freezes() == []
+        assert systemd.frozen["nq.service"] is False
+
+        _memory(monkeypatch, 40.0)
+
+        def check_then_fail() -> None:
+            with FreezeCard(service_c, service, need_gib=9, reason="check"):
+                assert systemd.frozen["nq.service"] is True
+                assert service_c.blockers(None)[0] == []  # the requester's own wait goes through
+                others_see = GpuLease(tmp_path, project="slurm").blockers(None)[0]
+                assert [r.project for r in others_see] == ["service_b"]
+                with FreezeCard(GpuLease(tmp_path, project="other"), service, need_gib=1, reason="second"):
+                    pass
+                assert systemd.frozen["nq.service"] is True  # the second card left; the first still holds it
+                raise RuntimeError  # the requester's work failed: the service is woken all the same
+
+        with pytest.raises(RuntimeError):
+            check_then_fail()
+        lapsed = service_c.write_freeze(
+            FreezeRecord(
+                pid=os.getpid(),
+                project="service_c",
+                target="service_b",
+                unit="nq.service",
+                frozen_at=int(time.time() - MAX_FROZEN_S) - 1,
+                reason="t",
+            )
+        )
+        assert [r.project for r in service_c.blockers(None)[0]] == [
+            "service_b"
+        ]  # a lapsed freeze exempts nothing
+        lapsed.unlink()
+        assert systemd.frozen["nq.service"] is False
+        assert service_c.freezes() == []
+    finally:
+        sub.kill()
+        sub.wait()
+
+
+def test_safety_net_wakes_a_dead_requesters_or_overdue_freeze_and_keeps_one_that_would_not_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    systemd = _FakeSystemd("a.service", "b.service", "c.service", "stuck.service")
+    monkeypatch.setattr("localmodels.lease._systemctl", systemd)
+    lease = GpuLease(tmp_path, project="slurm")
+    now = int(time.time())
+
+    def freeze(unit: str, pid: int, frozen_at: int) -> None:
+        if unit != "gone.service":
+            systemd.frozen[unit] = True
+        lease.write_freeze(
+            FreezeRecord(pid=pid, project="tc", target="nq", unit=unit, frozen_at=frozen_at, reason="t")
+        )
+
+    freeze("a.service", 99999999, now)  # its requester died
+    freeze("b.service", os.getpid(), now - int(MAX_FROZEN_S) - 1)  # held past the cap
+    freeze("c.service", os.getpid(), now)  # in force
+    freeze("gone.service", 99999999, now)  # stopped while frozen: nothing left to wake
+    assert {r.unit for r in lease.wake_abandoned_freezes()} == {"a.service", "b.service", "gone.service"}
+    assert systemd.frozen == {
+        "a.service": False,
+        "b.service": False,
+        "c.service": True,
+        "stuck.service": False,
+    }
+    assert [f.unit for _, f in lease.freezes()] == ["c.service"]
+
+    freeze("stuck.service", 99999999, now)
+    systemd.stuck.add("stuck.service")
+    with pytest.raises(FreezeError, match=r"stuck\.service"):
+        lease.wake_abandoned_freezes()
+    assert "stuck.service" in {f.unit for _, f in lease.freezes()}  # kept for the next loop to try again
+    systemd.stuck.clear()
+    systemd.no_bus = True  # a wake that cannot be checked is not a wake
+    with pytest.raises(FreezeError):
+        lease.wake_abandoned_freezes()
+    assert "stuck.service" in {f.unit for _, f in lease.freezes()}
+
+
+def test_two_cards_waking_one_unit_at_once_still_wake_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    systemd = _FakeSystemd("nq.service")
+    systemd.frozen["nq.service"] = True
+    monkeypatch.setattr("localmodels.lease._systemctl", systemd)
+    real_in_force = lease_module._in_force
+
+    def slow_in_force(
+        record: FreezeRecord, now: float
+    ) -> bool:  # widens the gap between the check and the unlink
+        time.sleep(0.2)
+        return real_in_force(record, now)
+
+    monkeypatch.setattr("localmodels.lease._in_force", slow_in_force)
+    lease = GpuLease(tmp_path, project="tc")
+    paths = [
+        lease.write_freeze(
+            FreezeRecord(
+                pid=os.getpid(),
+                project="tc",
+                target="nq",
+                unit="nq.service",
+                frozen_at=int(time.time()),
+                reason=r,
+            )
+        )
+        for r in ("a", "b")
+    ]
+    threads = [threading.Thread(target=lease.wake, args=(path, "nq.service")) for path in paths]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert lease.freezes() == []
+    assert systemd.frozen["nq.service"] is False
+
+
+@pytest.mark.skipif(
+    subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, check=False).returncode
+    > 1,
+    reason="no user systemd here",
+)
+def test_freeze_card_freezes_a_real_systemd_unit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    unit = f"localmodels-test-freeze-{os.getpid()}.service"
+    subprocess.run(  # noqa: S603 - fixed argv
+        ["systemd-run", "--user", f"--unit={unit}", "--collect", "sleep", "30"],
+        check=True,
+        capture_output=True,
+    )
+    _memory(monkeypatch, 40.0)
+
+    def state() -> str:
+        shown = subprocess.run(  # noqa: S603 - fixed argv
+            ["systemctl", "--user", "show", "-p", "FreezerState", "--value", unit],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return shown.stdout.strip()
+
+    try:
+        service = FreezableRecord(pid=os.getpid(), project="svc", unit=unit)
+        with FreezeCard(GpuLease(tmp_path, project="t"), service, need_gib=1, reason="t"):
+            assert state() == "frozen"
+        assert state() == "running"
+    finally:
+        subprocess.run(["systemctl", "--user", "stop", unit], check=False, capture_output=True)  # noqa: S603

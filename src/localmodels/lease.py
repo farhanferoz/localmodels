@@ -10,14 +10,20 @@ Stay-up mode (``Contention.STAY_UP``) keeps its records in two subfolders, ``res
 every reader of the top-level ``*.json`` files (this module's, service_c's, service_a's) never opens.
 One file per service (``resident/<project>-<port>.json``) and per quiet card
 (``quiet/<project>-<pid>-<token>.json``), so two of one project never overwrite each other's record.
+
+Freeze-and-resume (localmodels D10-D11) keeps its records the same way, in ``freezable/`` (a service that
+may be frozen through its systemd user unit, ``<project>-<unit>.json``) and ``frozen/`` (a freeze in force,
+``<project>-<pid>-<token>.json``).
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import secrets
+import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -28,7 +34,7 @@ from .atomic import write_text_atomically
 from .process import LocalModelsError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 #: The shared lease directory every project on a host uses unless told otherwise; ``GPU_LEASE_DIR``
 #: overrides it (slurm's tools on gpu-node-1 read the same variable).
@@ -38,6 +44,13 @@ _RESIDENT_SUBDIR = "resident"
 _QUIET_SUBDIR = "quiet"
 _QUIET_TIMEOUT_S = 120.0
 _QUIET_POLL_S = 0.5
+_FREEZABLE_SUBDIR = "freezable"
+_FROZEN_SUBDIR = "frozen"
+_SYSTEMCTL_TIMEOUT_S = 10.0  # a thaw is near instant; slurm's lease keeper waits on each
+_FROZEN_STATE = "frozen"
+
+#: Longest freeze: the safety net wakes a service frozen this long, even while its requester lives (D11).
+MAX_FROZEN_S = 600.0
 
 
 class LeaseRecord(BaseModel):
@@ -85,8 +98,35 @@ class QuietRequest(BaseModel):
     reason: str
 
 
+class FreezableRecord(BaseModel):
+    """A ``freezable/`` record: a service that another project may freeze, through its systemd user unit."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pid: int
+    project: str
+    unit: str
+
+
+class FreezeRecord(BaseModel):
+    """A ``frozen/`` record, written before the freeze: ``project`` froze ``target``'s ``unit``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pid: int
+    project: str
+    target: str
+    unit: str
+    frozen_at: int
+    reason: str
+
+
 class QuietCardTimeoutError(LocalModelsError):
     """Raised when residents are still loaded after a quiet card's timeout."""
+
+
+class FreezeError(LocalModelsError):
+    """Raised when a freeze is refused (no room beside the service, or systemd's refusal) or a wake failed."""
 
 
 def _read_lease_data(path: Path) -> dict[str, object] | None:
@@ -99,27 +139,36 @@ def _read_lease_data(path: Path) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _holder_is_live(pid: object, path: Path) -> bool:
-    """Whether `pid` names a live process; a dead one deletes `path` as stale.
+def _pid_alive(pid: object) -> bool | None:
+    """Whether `pid` names a live process; None when it is not a positive integer the OS accepts.
 
-    A pid that is not a positive integer the OS accepts is unparsable, so False and the file is
-    left in place: kill(0|-1, 0) would succeed and read as live forever, and it is not ours to judge.
+    kill(0|-1, 0) would succeed and read as live forever, so such a pid is not a process at all.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
+        return None
     try:
         os.kill(pid, 0)
     except OverflowError:
-        return False
+        return None
     except ProcessLookupError:
-        # Dead PID is stale; delete the file (contract: "stale leases ... ignore it and delete it")
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
         return False
     except PermissionError:
         # Live process owned by another user
         pass
     return True
+
+
+def _holder_is_live(pid: object, path: Path) -> bool:
+    """Whether `pid` names a live process; a dead one deletes `path` as stale.
+
+    An unparsable pid is False and the file is left in place: it is not ours to judge.
+    """
+    alive = _pid_alive(pid)
+    if alive is False:
+        # Dead PID is stale; delete the file (contract: "stale leases ... ignore it and delete it")
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+    return bool(alive)
 
 
 def _check_record_file[R: BaseModel](path: Path, model: type[R]) -> R | None:
@@ -161,6 +210,44 @@ def _written_before_boot(path: Path, booted_at: float | None) -> bool:
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
     return stale
+
+
+def _systemctl(verb: str, unit: str) -> subprocess.CompletedProcess[str]:
+    """Run ``systemctl --user VERB UNIT``; no answer at all (missing, or too slow) is a ``FreezeError``."""
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv; the unit is the service's own record
+            ["systemctl", "--user", verb, unit],  # noqa: S607 - systemctl from PATH, as the user units run
+            capture_output=True,
+            text=True,
+            timeout=_SYSTEMCTL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        msg = f"systemctl --user {verb} {unit} gave no answer: {exc}"
+        raise FreezeError(msg) from exc
+
+
+def _freeze_unit(unit: str) -> None:
+    done = _systemctl("freeze", unit)
+    if done.returncode != 0:
+        msg = f"systemd did not freeze {unit}: {done.stderr.strip()}"
+        raise FreezeError(msg)
+
+
+def _thaw_unit(unit: str) -> None:
+    """Wake ``unit``; a unit that has stopped or gone meanwhile is not frozen, so it counts as woken."""
+    done = _systemctl("thaw", unit)
+    if done.returncode == 0:
+        return
+    state = _systemctl("show", unit)  # FreezerState is among its properties; a gone unit still answers
+    if state.returncode != 0 or f"FreezerState={_FROZEN_STATE}" in state.stdout.splitlines():
+        msg = f"systemd did not wake {unit}, still frozen: {done.stderr.strip()}"
+        raise FreezeError(msg)
+
+
+def _in_force(record: FreezeRecord, now: float) -> bool:
+    """Whether a freeze still holds: its requester lives and it is younger than ``MAX_FROZEN_S``."""
+    return _pid_alive(record.pid) is True and now - record.frozen_at < MAX_FROZEN_S
 
 
 def _live_records[R: BaseModel](directory: Path, model: type[R]) -> list[R]:
@@ -253,6 +340,89 @@ class GpuLease:
         """Every quiet request whose holder is alive: a holder that died stops blocking the residents."""
         return _live_records(self.directory / _QUIET_SUBDIR, QuietRequest)
 
+    def write_freezable(self, record: FreezableRecord) -> Path:
+        """Sign this project's service on ``record.unit`` up as freezable, until ``record.pid`` dies."""
+        path = self.directory / _FREEZABLE_SUBDIR / f"{self.project}-{record.unit}.json"
+        return write_text_atomically(path, json.dumps(record.model_dump()))
+
+    def remove_freezable(self, unit: str) -> None:
+        """Withdraw this project's sign-up for ``unit`` if present."""
+        (self.directory / _FREEZABLE_SUBDIR / f"{self.project}-{unit}.json").unlink(missing_ok=True)
+
+    def freezables(self) -> list[FreezableRecord]:
+        """Every service signed up as freezable by a live process, this project's own included."""
+        return _live_records(self.directory / _FREEZABLE_SUBDIR, FreezableRecord)
+
+    def write_freeze(self, record: FreezeRecord) -> Path:
+        """Write a new ``frozen/`` record atomically, in a file of its own; its path withdraws it."""
+        name = f"{self.project}-{record.pid}-{secrets.token_hex(4)}.json"
+        return write_text_atomically(self.directory / _FROZEN_SUBDIR / name, json.dumps(record.model_dump()))
+
+    def freezes(self) -> list[tuple[Path, FreezeRecord]]:
+        """Every freeze record with its path, a dead requester's too: its service stays frozen until woken.
+
+        Only a record written before this boot is purged, as nothing stays frozen across a reboot.
+        """
+        directory = self.directory / _FROZEN_SUBDIR
+        if not directory.exists():
+            return []
+        booted_at = _boot_time()
+        found = []
+        for path in sorted(directory.glob("*.json")):
+            data = _read_lease_data(path)
+            if data is None or _written_before_boot(path, booted_at):
+                continue
+            with contextlib.suppress(ValidationError):
+                found.append((path, FreezeRecord(**data)))
+        return found
+
+    @contextlib.contextmanager
+    def freeze_lock(self) -> Iterator[None]:
+        """One freeze or wake at a time on this host, so two cards on one unit never both skip its wake."""
+        lock = self.directory / _FROZEN_SUBDIR / ".lock"  # not *.json: no reader of the records sees it
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with lock.open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+
+    def wake(self, path: Path, unit: str) -> None:
+        """End the freeze recorded at ``path``: wake ``unit`` unless another freeze in force holds it."""
+        with self.freeze_lock():
+            self.wake_locked(path, unit)
+
+    def wake_locked(self, path: Path, unit: str) -> None:
+        """``wake`` for a caller already holding ``freeze_lock``.
+
+        The record goes after the wake, so a crash in between leaves a record the safety net acts on, never a
+        frozen service with none. A failed wake raises ``FreezeError`` and keeps the record for another try.
+        """
+        now = time.time()
+        if not any(p != path and f.unit == unit and _in_force(f, now) for p, f in self.freezes()):
+            _thaw_unit(unit)
+        path.unlink(missing_ok=True)
+
+    def wake_abandoned_freezes(self) -> list[FreezeRecord]:
+        """Wake each service whose requester died or that was frozen ``MAX_FROZEN_S`` ago; return those.
+
+        Slurm's lease keeper calls this every loop (D11). Every such freeze is tried; ``FreezeError``
+        afterwards names those whose service would not wake.
+        """
+        now = time.time()
+        woken, failed = [], []
+        for path, record in self.freezes():
+            if _in_force(record, now):
+                continue
+            try:
+                self.wake(path, record.unit)
+            except FreezeError as exc:
+                failed.append(f"{record.unit} ({exc})")
+            else:
+                woken.append(record)
+        if failed:
+            msg = "could not wake: " + "; ".join(failed)
+            raise FreezeError(msg)
+        return woken
+
     def blockers(self, requested_at: int | None) -> tuple[list[LeaseRecord], bool]:
         """Other live leases this project must wait for, and whether any of them is itself only waiting.
 
@@ -261,12 +431,19 @@ class GpuLease:
         blocked by every other lease. A reader that treats every other lease as busy, as service_c's
         queue does, would deadlock with a second waiter doing the same; this order cannot. The caller
         withdraws its own request while an earlier waiter exists, so that waiter is not blocked by it.
-        Ported from service_b's GPU worker (``service_b/jobs/lease.py``, ``_blockers``).
+        Ported from service_b's GPU worker (``service_b/jobs/lease.py``, ``_blockers``). A project this one
+        has frozen (``FreezeCard``) does not block it.
         """
         mine = None if requested_at is None else (requested_at, self.project)
+        now = time.time()
+        frozen_by_me = {
+            f.target for _, f in self.freezes() if f.project == self.project and _in_force(f, now)
+        }
         blocking: list[LeaseRecord] = []
         earlier_waiter = False
         for record in self.live_others():
+            if record.project in frozen_by_me:
+                continue  # frozen for this project's turn: it can neither hand the card back nor use it
             if record.requested_at is None:
                 blocking.append(record)
             elif mine is None or (record.requested_at, record.project) < mine:
@@ -438,3 +615,53 @@ class QuietCard:
     def __exit__(self, *exc_info: object) -> None:
         """Withdraw this card's request (only its own: a card nested in another keeps the outer one's)."""
         self.lease.remove_quiet(self._path)
+
+
+class FreezeCard:
+    """While held, ``service`` is frozen, so this project can use the GPU now; leaving wakes it (D10-D11).
+
+    Freezing frees none of the service's memory (localmodels slurm 565), so entering first checks that
+    ``need_gib`` is available beside it, and refuses with ``FreezeError`` otherwise or when it cannot be
+    measured. The record is written before the freeze, so the safety net
+    (``GpuLease.wake_abandoned_freezes``) wakes the service if this process dies or holds it past
+    ``MAX_FROZEN_S``. While held, ``GpuLease.blockers`` no longer counts the frozen service against this
+    project, so its own wait for the GPU goes through.
+    """
+
+    _path: Path
+
+    def __init__(self, lease: GpuLease, service: FreezableRecord, *, need_gib: float, reason: str) -> None:
+        self.lease = lease
+        self.service = service
+        self.need_gib = need_gib
+        self.reason = reason
+
+    def __enter__(self) -> Self:
+        """Check this project fits beside the service, record the freeze, then freeze it."""
+        from .hardware import available_memory  # noqa: PLC0415 - lazy: the lease module stays light
+
+        with self.lease.freeze_lock():
+            available = available_memory("cuda")
+            if available is None or available.bytes < self.need_gib * 2**30:
+                have = "unknown" if available is None else f"{available.bytes / 2**30:.1f} GiB"
+                msg = f"not freezing {self.service.unit}: {self.need_gib:g} GiB needed beside it, {have} free"
+                raise FreezeError(msg)
+            record = FreezeRecord(
+                pid=os.getpid(),
+                project=self.lease.project,
+                target=self.service.project,
+                unit=self.service.unit,
+                frozen_at=int(time.time()),
+                reason=self.reason,
+            )
+            self._path = self.lease.write_freeze(record)
+            try:
+                _freeze_unit(self.service.unit)
+            except BaseException:
+                self.lease.wake_locked(self._path, self.service.unit)
+                raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Wake the service (unless another card still holds it), also when the work raised."""
+        self.lease.wake(self._path, self.service.unit)
