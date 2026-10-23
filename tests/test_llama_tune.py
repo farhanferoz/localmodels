@@ -553,6 +553,7 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     command = (sys.executable, "-c", TASK_CHECK)
     tune = LlamaTune(make_spec(tmp_path, server_bin=fake_bin, quality_command=command))
     head = tmp_path / "mtp.gguf"
+    head.touch()  # the launcher counts an MTP head as its size
     settings = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file=str(head))
     arm = await tune._serve(settings, tune.spec.reference, checked=True)
     assert arm.error is None

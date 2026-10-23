@@ -153,7 +153,10 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         return await real(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
-    chosen = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file="/models/draft.gguf")
+    draft = tmp_path / "draft.gguf"
+    with draft.open("wb") as fh:
+        fh.truncate(30 * 1024**3)  # sparse: 30 GiB by its size, none on disk
+    chosen = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file=str(draft))
     guards, model = MemoryGuards(host_reserve_gib=12), str(tmp_path / "test.gguf")
     async with httpx.AsyncClient() as http:
         # no answer: the argument lists it always had
@@ -174,17 +177,17 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         assert [c[1:] for c in calls[:-1]] == [fit[1:]]
         assert calls[-1] == build_args(owner.binary, owner.spec, owner.params, own)
 
-        # an answer: its flags, and a draft model's own projection beside the model's, at the same `-ub`
+        # an answer: its flags; an MTP head, which llama-fit-params cannot load alone, counts as its size
         calls.clear()
         asked = _manager(
             tmp_path, http, guards, _steady(100), health=1, settings=_answer(**chosen.model_dump())
         )
         await asked.start()
         await asked.stop()
-        added = ("-ub", "2048", "--spec-type", "draft-mtp", "--spec-draft-model", "/models/draft.gguf")
-        assert [c[2] for c in calls[:2]] == [model, "/models/draft.gguf"]
-        assert all(c[-4:] == ["-ub", "2048", "-lv", "4"] for c in calls[:2])
-        assert calls[2] == build_args(asked.binary, asked.spec, asked.params, added)
+        added = ("-ub", "2048", "--spec-type", "draft-mtp", "--spec-draft-model", str(draft))
+        fit, server = calls
+        assert (fit[2], fit[-4:]) == (model, ["-ub", "2048", "-lv", "4"])
+        assert server == build_args(asked.binary, asked.spec, asked.params, added)
         stamped = asked.stamp()
         assert stamped.layout is not None
         assert stamped.layout.extra_flags == added
@@ -206,6 +209,60 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         stamped = kept.stamp()
         assert stamped.settings is not None
         assert (stamped.settings.applied, stamped.settings.overridden) == (Settings(), ["n_ubatch", "spec"])
+
+
+async def test_a_draft_model_is_projected_on_its_own_and_an_mtp_head_counts_as_its_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        calls.append([str(a) for a in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    draft = tmp_path / "draft.gguf"
+    with draft.open("wb") as fh:
+        fh.truncate(30 * 1024**3)  # sparse: 30 GiB by its size, none on disk
+    head = Settings(n_ubatch=2048, spec=SpecType.DRAFT_MTP, spec_draft_file=str(draft))
+    simple = head.model_copy(update={"spec": SpecType.DRAFT_SIMPLE})
+    guards, model = MemoryGuards(host_reserve_gib=12), str(tmp_path / "test.gguf")
+    async with httpx.AsyncClient() as http:
+        # an MTP head: llama-fit-params projects the model alone, and the head's 30 GiB are added to it
+        short = _manager(
+            tmp_path, http, guards, _steady(PROJECTED_GIB + 30 + 11), settings=_answer(**head.model_dump())
+        )
+        with pytest.raises(ServerStartError, match=r"needs 62\.0 GiB"):
+            await short.start()
+        assert [c[2] for c in calls] == [model]
+
+        # the type from the environment and from the flags together, as llama.cpp keeps every value given
+        calls.clear()
+        mixed = _manager(
+            tmp_path, http, guards, _steady(PROJECTED_GIB + 30 + 11), settings=_answer(n_ubatch=2048),
+            extra_flags=("--spec-type", "ngram-mod", "-md", str(draft)),
+            extra_env={"LLAMA_ARG_SPEC_TYPE": "draft-mtp"},
+        )  # fmt: skip
+        with pytest.raises(ServerStartError, match=r"needs 62\.0 GiB"):
+            await mixed.start()
+        assert [c[2] for c in calls] == [model]
+
+        # a head that is not there gives no projection
+        gone = head.model_copy(update={"spec_draft_file": str(tmp_path / "gone.gguf")})
+        missing = _manager(tmp_path, http, guards, _steady(100), settings=_answer(**gone.model_dump()))
+        with pytest.raises(ServerStartError, match="the draft file cannot be read"):
+            await missing.start()
+
+        # a draft model of its own gets its own projection beside the model's, at the same `-ub`
+        calls.clear()
+        alone = _manager(
+            tmp_path, http, guards, _steady(100), health=1, settings=_answer(**simple.model_dump())
+        )
+        await alone.start()
+        await alone.stop()
+        assert [c[2] for c in calls[:2]] == [model, str(draft)]
+        assert all(c[-4:] == ["-ub", "2048", "-lv", "4"] for c in calls[:2])
 
 
 async def test_a_stamp_says_what_the_answer_gave_and_what_the_callers_flags_or_the_served_file_set_aside(
