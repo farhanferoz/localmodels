@@ -182,11 +182,12 @@ class FakeTune(LlamaTune):
         script: dict[str, dict[str, Any]],
         *,
         flaky: str = "",
+        cut: str = "",
         started: float | None = None,
     ) -> None:
         self.clock = Clock()
         super().__init__(spec, clock=self.clock, started=started)
-        self.script, self.flaky, self.calls, self.tools = script, flaky, [], []
+        self.script, self.flaky, self.cut, self.calls, self.tools = script, flaky, cut, [], []
 
     def _find_text(self) -> Path | None:
         return self.spec.text
@@ -200,6 +201,8 @@ class FakeTune(LlamaTune):
         fields = dict(self.script[name])
         if name == self.flaky and self.calls.count(name) > 1:
             fields["outputs"] = [*TEXTS[:-1], "a restart gave different words"]
+        if name == self.cut and self.calls.count(name) > 1:
+            fields["error"] = llama_tune.OUT_OF_TIME  # the hard limit cut the restart short
         arm = ArmResult(name=name, settings=settings, start_s=10.0, run_s=10.0, free_gib=100.0, **fields)
         arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.margin_gib)
         self.clock.now += 20.0
@@ -374,6 +377,10 @@ async def test_a_speculative_arm_that_does_not_repeat_across_a_restart_is_not_ad
         "draft-mtp",
         "draft-mtp",
     ]  # restarted once each, nothing more
+    # a restart the hard limit cut short leaves the arm unverified, not failed
+    tune = FakeTune(spec, arm_script(), cut="draft-mtp")
+    record = await tune.tune()
+    assert (record.candidate, tune.unverified) == ("reference", {"draft-mtp"})
 
 
 async def test_a_draft_that_cannot_fit_beside_the_reference_is_not_started(tmp_path: Path) -> None:
@@ -460,6 +467,8 @@ async def test_servers_lease_on_a_private_directory_not_the_one_slurm_holds(
         manager = tune._manager(Settings(n_ubatch=2048), tune.spec.reference, http)
     assert manager.lease.directory == tmp_path / "run" / "lease"
     assert manager.lease.live_others() == []
+    # the server must leave the kill floor free, not only the 4 GiB headroom: it is killed below the floor
+    assert manager.guards.host_reserve_gib == manager.guards.kill_below_gib == llama_tune.KILL_BELOW_GIB
 
 
 async def test_sigterm_cancels_once_through_the_loops_own_handler_so_the_servers_are_stopped() -> None:
@@ -580,7 +589,8 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
 
     monkeypatch.setattr(llama_tune, "gpu_process_memory_mib", AnyPid)
     # a GPU that shares the host's RAM: the server's host memory counts in its peak (2 GiB here)
-    unified = AvailableMemory(bytes=100 * GIB, device=DeviceType.CUDA, unified=True, source="test")
+    # 14 GiB available: the 6.4 GiB peak leaves the 4 GiB headroom but not the 10 GiB kill floor
+    unified = AvailableMemory(bytes=14 * GIB, device=DeviceType.CUDA, unified=True, source="test")
     monkeypatch.setattr(llama_tune, "available_memory", lambda _device: unified)
     monkeypatch.setattr(llama_tune, "process_anon_mib", lambda _pid: 2048)
     monkeypatch.setattr(llama_tune, "SAMPLE_INTERVAL_S", 0.05)
@@ -607,7 +617,7 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
         await sampler
     assert peaks
     assert max(peaks) <= 4468
-    assert arm.fits is True
+    assert arm.fits is False
     assert arm.outputs == [f"words {text[:6]}" for text in TEXTS]
     assert arm.check is not None
     assert arm.check.passed  # the project's check ran against the live server
@@ -695,6 +705,15 @@ def command_with(
         ({"reference": {"error": "the server would not start"}}, {}, 1, False),
         # no time for anything but the reference: not adopted, so the lookup does not read it as tuned
         ({}, {"speculation": MTP_ONLY, "soft_limit_s": 25.0}, 2, False),
+        # the speculative arm led but its restart did not fit: the reference is not adopted as tuned
+        ({}, {"speculation": MTP_ONLY, "soft_limit_s": 70.0, "prompt_tokens": 300}, 2, False),
+        # the arm ran but the hard limit cut its check short: neither passed nor failed, so the same
+        (
+            {"draft-mtp": {**arm_script()["draft-mtp"], "error": llama_tune.OUT_OF_TIME}},
+            {"speculation": MTP_ONLY, "prompt_tokens": 300},
+            2,
+            False,
+        ),
     ],
 )
 async def test_the_command_holds_the_card_writes_the_record_and_adopts_only_what_was_measured(
