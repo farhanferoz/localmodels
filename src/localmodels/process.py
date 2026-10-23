@@ -223,7 +223,7 @@ def llama_values(
     """Every value an option is given, in the order llama.cpp reads them: the environment's, then each flag's.
 
     ``--flag value`` and ``--flag=value`` both count. Most options keep the last; ``--spec-type`` keeps them
-    all (arg.cpp:4270-4272).
+    all (arg.cpp: the ``--spec-type`` handler appends; the environment is read before the flags).
     """
     values = [value] if (value := (env or {}).get(env_name)) is not None else []
     for i, token in enumerate(flags):

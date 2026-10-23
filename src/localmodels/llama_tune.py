@@ -135,7 +135,7 @@ CHECK_TIMEOUT_FACTOR: Final = 2.0
 CHECK_TIMEOUT_MIN_S: Final = 60.0
 
 # time (design 5.4, 6.7)
-SOFT_LIMIT_S: Final = 780.0  # no candidate starts past it; owner 2026-10-23: two big-model rounds fill 600 s
+SOFT_LIMIT_S: Final = 780.0  # no step starts that would end past it; owner 2026-10-23 (D8)
 HARD_LIMIT_S: Final = (
     840.0  # no step runs past it: `timeout --kill-after=30 900`, less 30 s to finish and write
 )
@@ -584,6 +584,7 @@ class LlamaTune:
         self.lease = GpuLease(spec.run_dir / "lease", PROJECT)
         self._servers = 0
         self._unified = False  # whether the GPU shares the host's RAM, read with the available memory
+        self.unverified: set[str] = set()  # arms neither passed nor failed: not restarted in time, or cut short
         self.writes = spec.kind is not WorkloadKind.K3
 
     # -- the clock and the plan ---------------------------------------------------------------------------
@@ -1250,7 +1251,9 @@ class LlamaTune:
 
     async def _decide(self) -> ArmResult:
         """Choose, restarting the leading speculative arm first: it is adopted only if its outputs repeat."""
-        unverified: set[str] = set()
+        unverified = self.unverified
+        # an arm whose check the hard limit cut short was neither passed nor failed
+        unverified.update(arm.name for arm in self.arms[1:] if arm.error == OUT_OF_TIME)
         while True:
             best = self._pick(assume_repeat=True, skip=frozenset(unverified))
             speculates = settings_key(best.settings)[1] != SpecType.NONE
@@ -1262,6 +1265,9 @@ class LlamaTune:
                 continue
             again = await self._serve(best.settings, self.spec.reference, checked=False)
             self.measurements.append(again.model_copy(update={"name": f"{best.name}#restart"}))
+            if again.error == OUT_OF_TIME:  # cut by the hard limit: its repeat is unknown, not failed
+                unverified.add(best.name)
+                continue
             best.repeats = again.error is None and again.outputs == best.outputs
         return self._pick(assume_repeat=False, skip=frozenset(unverified))
 
@@ -1366,6 +1372,13 @@ async def tune_and_adopt(spec: TuneSpec, started: float | None = None) -> int:
             "measured, not adopted: no candidate was measured%s; llama.cpp tunes cost more GPU time than the "
             "limit allows (design D3's revisit condition)",
             f" ({why})" if why else "",
+        )
+        return EXIT_NOT_ADOPTED
+    if tune.unverified and record.candidate == tune.reference.name:
+        log.warning(
+            "measured, not adopted: %s could not be checked within the time limit, so the reference "
+            "is not a tuned answer (design D3's revisit condition)",
+            ", ".join(sorted(tune.unverified)),
         )
         return EXIT_NOT_ADOPTED
     try:
