@@ -584,7 +584,7 @@ class LlamaTune:
         self.lease = GpuLease(spec.run_dir / "lease", PROJECT)
         self._servers = 0
         self._unified = False  # whether the GPU shares the host's RAM, read with the available memory
-        self.unverified: set[str] = set()  # arms neither passed nor failed: not restarted in time, or cut short
+        self.unverified: set[str] = set()  # neither passed nor failed: not restarted in time, or cut short
         self.writes = spec.kind is not WorkloadKind.K3
 
     # -- the clock and the plan ---------------------------------------------------------------------------
