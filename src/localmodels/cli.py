@@ -27,6 +27,7 @@ from .digest import register as register_digest
 from .enums import WorkloadKind
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .llama_builds import register as register_llama
+from .refresh import register as register_refresh
 from .rules import register as register_rules
 from .service import _cmd_serve
 from .setup import (
@@ -318,6 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_digest(subparsers)
     register_rules(subparsers)
     register_llama(subparsers)
+    register_refresh(subparsers)
     _build_settings_parser(subparsers)
     return parser
 

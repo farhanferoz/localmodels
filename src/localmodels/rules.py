@@ -185,11 +185,16 @@ def stale_rules(text: str, current: Mapping[str, str]) -> list[str]:
     return lines
 
 
-def records_dir() -> Path:
-    """Where the re-measurement records are kept: ``rules/`` under the state directory."""
+def state_dir() -> Path:
+    """The state directory: ``$LOCALMODELS_STATE_DIR``, else ``~/.local/state/localmodels``."""
     from .settings import DEFAULT_STATE_DIR, STATE_DIR_ENV  # noqa: PLC0415 - settings imports this module
 
-    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / RECORDS_DIRNAME
+    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser()
+
+
+def records_dir() -> Path:
+    """Where the re-measurement records are kept: ``rules/`` under the state directory."""
+    return state_dir() / RECORDS_DIRNAME
 
 
 def read_record(kind: str) -> RuleRecord | None:
