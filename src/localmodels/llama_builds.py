@@ -256,7 +256,7 @@ def comparison_passed(build: Path) -> str | None:
 
 
 def switch(home: Path, commit: str) -> str | None:
-    """Move the ``current`` link to a finished build whose comparison passed; None, or why it was not moved."""
+    """Move ``current`` to a finished build whose comparison passed; None, or why it was not moved."""
     build = builds_dir(home) / commit
     problem = (
         f"{build} is not a finished build" if not server_binary(build).is_file() else comparison_passed(build)
@@ -282,8 +282,10 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def prune_builds(home: Path, *, keep: Collection[str] = (), dry_run: bool = False) -> list[Path]:
-    """Delete, or with ``dry_run`` only list, the builds that are not ``current``, not in ``keep`` and that no
-    project names; the folders concerned."""
+    """The build folders that are not ``current``, not in ``keep`` and that no project names, deleted.
+
+    With ``dry_run`` they are only listed.
+    """
     current, users = current_commit(home), read_users(home)
     doomed = [
         folder

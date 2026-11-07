@@ -6,7 +6,7 @@ import json
 from typing import TYPE_CHECKING
 
 from localmodels.cli import main
-from localmodels.llama_builds import cmake_options
+from localmodels.llama_builds import cmake_options, prune_builds, switch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -78,6 +78,13 @@ def test_switch_is_refused_until_a_comparison_passed(
     assert "does not record passed: true" in capsys.readouterr().err
     assert not (tmp_path / "builds" / "current").exists()
     comparison.write_text(json.dumps({"passed": True}), encoding="utf-8")
+    comparison.rename(comparison.with_name("kept.json"))
+    problem = switch(
+        tmp_path, "abc1234"
+    )  # the function the refresh job calls: the gate, as a returned reason
+    assert problem is not None
+    assert "comparison.json does not exist" in problem
+    comparison.with_name("kept.json").rename(comparison)
     assert main(base) == 0
     assert (tmp_path / "builds" / "current").readlink().name == "abc1234"
 
@@ -92,6 +99,10 @@ def test_prune_keeps_current_and_the_builds_projects_name(tmp_path: Path) -> Non
     )
     assert main(["llama", "--home", str(tmp_path), "prune", "--dry-run"]) == 0
     assert (tmp_path / "builds" / "unused1").exists()
+    kept = prune_builds(
+        tmp_path, keep=["unused2"], dry_run=True
+    )  # the refresh job keeps the previous current
+    assert [folder.name for folder in kept] == ["unused1"]
     assert main(["llama", "--home", str(tmp_path), "prune"]) == 0
     assert sorted(p.name for p in (tmp_path / "builds").iterdir()) == [
         "cur0000",
