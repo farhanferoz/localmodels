@@ -172,7 +172,7 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due( 
     assert "--class resume --resume-ok --no-anywhere --cpus 8 --mem 8G" in build
     assert "--name refresh-build" in build
     assert f"refresh --home {world.home} build --run {run_dir} --commit b12" in build
-    assert "--class restart --gpu --mem 40G --after 101" in measure
+    assert "--class restart --gpu --mem 52G --after 101" in measure
     assert f"--workdir {run_dir}" in measure
     assert "timeout --kill-after=30 1200" in measure
     record = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
@@ -237,7 +237,7 @@ def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(
     assert not world.submitted.exists()  # no build job, and the measure job went to urgent.py
     urgent = urgent_log.read_text()
     assert "--name refresh-measure" in urgent
-    assert "--time 0:30:00 --gpu --mem 40G --wait" in urgent
+    assert "--time 0:30:00 --gpu --mem 52G --wait" in urgent
     assert "--after" not in urgent
     run_dir = refresh.newest_run()
     assert run_dir is not None

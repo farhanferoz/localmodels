@@ -81,7 +81,7 @@ LS_REMOTE_TIMEOUT_S: Final = 60
 # The slurm jobs (design 2.1).
 BUILD_CPUS: Final = 8
 BUILD_MEM: Final = "8G"  # measured: b12189 peaked at 5.2 GB on 8 cores (8 min 9 s), slurm advised 6G
-MEASURE_MEM: Final = "40G"  # estimate, includes GPU memory on this machine; the 30B model alone is 18.6 GB
+MEASURE_MEM: Final = "52G"  # measured: slurm 2157 peaked at 42.4 GB (GPU memory included) of 42.9 GB asked
 MEASURE_LIMIT_S: Final = 1200  # the hard stop of the whole measurement, by ``timeout``
 KILL_AFTER_S: Final = 30
 # `run --urgent`: the measure job goes through slurm's urgent.py (beside submit.py), which pauses what can be
