@@ -14,7 +14,8 @@ Syncthing copies to every machine):
   baseline, and read by ``llama switch``. Fields: ``passed`` (bool: no quality failure and no slowdown),
   ``quality_failures`` (list of the failed checks, empty when none), ``slowdown`` (worst relative slowdown
   against the baseline, 0.03 is 3 % slower; 0 or less when none), ``baseline_commit`` (the build compared
-  with), ``measured_at`` (ISO 8601 time of the comparison). Only ``passed`` decides.
+  with), ``measured_at`` (ISO 8601 time of the comparison). Only ``passed`` decides. ``localmodels refresh``
+  writes more fields beside these (the figures and the reasons); only these five are part of the contract.
 
 ``llama build`` compiles only: it never starts a GPU program, and nothing here runs a llama.cpp binary.
 """
@@ -34,7 +35,7 @@ from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     import argparse
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -145,31 +146,47 @@ def _short_commit(src: Path) -> str:
     return out.stdout.strip()
 
 
+def build_jobs() -> int:
+    """The CPU cores this process may use: what slurm gave the job, not the machine's ``os.cpu_count()``."""
+    return len(os.sched_getaffinity(0))
+
+
+def compile_commit(home: Path, commit: str, reference: Path) -> Path:
+    """Fetch ``commit`` and compile it unless its folder already holds a ``llama-server``; the build folder.
+
+    Raises:
+        subprocess.CalledProcessError: a git or cmake step failed.
+        OSError: a step could not be started, or the folders could not be made.
+    """
+    src = home / "src"
+    options = cmake_options(reference / "CMakeCache.txt")
+    src.parent.mkdir(parents=True, exist_ok=True)
+    for step in git_commands(commit, src):
+        _run(step)
+    build = builds_dir(home) / _short_commit(src)
+    if not server_binary(build).is_file():
+        for step in cmake_commands(src, build, options, build_jobs()):
+            _run(step)
+    return build
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     """Fetch and compile one commit into its build folder, then print the path of its ``llama-server``."""
     home = llama_home(args.home)
-    src = home / "src"
     reference = Path(args.reference).expanduser()
-    options = cmake_options(reference / "CMakeCache.txt")
-    jobs = os.cpu_count() or 1
     out = sys.stdout
     if args.dry_run:
         # The folder is named by the commit git resolves after the fetch; the commit as given stands in.
+        options = cmake_options(reference / "CMakeCache.txt")
         steps = [
-            *git_commands(args.commit, src),
-            *cmake_commands(src, builds_dir(home) / args.commit, options, jobs),
+            *git_commands(args.commit, home / "src"),
+            *cmake_commands(home / "src", builds_dir(home) / args.commit, options, build_jobs()),
         ]
         out.writelines(f"{' '.join(step)}\n" for step in steps)
         out.write(f"# then: {server_binary(builds_dir(home) / args.commit)}\n")
         return EXIT_OK
     try:
-        src.parent.mkdir(parents=True, exist_ok=True)
-        for step in git_commands(args.commit, src):
-            _run(step)
-        build = builds_dir(home) / _short_commit(src)
-        if not server_binary(build).is_file():
-            for step in cmake_commands(src, build, options, jobs):
-                _run(step)
+        build = compile_commit(home, args.commit, reference)
     except (subprocess.CalledProcessError, OSError) as exc:
         sys.stderr.write(f"llama build failed: {exc}\n")
         return EXIT_ERROR
@@ -238,33 +255,50 @@ def comparison_passed(build: Path) -> str | None:
     return None if passed else f"{path} does not record passed: true"
 
 
-def cmd_switch(args: argparse.Namespace) -> int:
-    """Move the ``current`` link to a finished build whose comparison passed."""
-    build = builds_dir(llama_home(args.home)) / args.commit
+def switch(home: Path, commit: str) -> str | None:
+    """Move the ``current`` link to a finished build whose comparison passed; None, or why it was not moved."""
+    build = builds_dir(home) / commit
     problem = (
         f"{build} is not a finished build" if not server_binary(build).is_file() else comparison_passed(build)
     )
     if problem is not None:
-        sys.stderr.write(f"not switching: {problem}\n")
-        return EXIT_ERROR
+        return problem
     link = build.parent / CURRENT
     staging = build.parent / f".{CURRENT}.{os.getpid()}"
     staging.unlink(missing_ok=True)
     staging.symlink_to(build.name)
     staging.replace(link)
-    sys.stdout.write(f"current -> {build.name}\n")
+    return None
+
+
+def cmd_switch(args: argparse.Namespace) -> int:
+    """Move the ``current`` link to a finished build whose comparison passed."""
+    problem = switch(llama_home(args.home), args.commit)
+    if problem is not None:
+        sys.stderr.write(f"not switching: {problem}\n")
+        return EXIT_ERROR
+    sys.stdout.write(f"current -> {args.commit}\n")
     return EXIT_OK
+
+
+def prune_builds(home: Path, *, keep: Collection[str] = (), dry_run: bool = False) -> list[Path]:
+    """Delete, or with ``dry_run`` only list, the builds that are not ``current``, not in ``keep`` and that no
+    project names; the folders concerned."""
+    current, users = current_commit(home), read_users(home)
+    doomed = [
+        folder
+        for folder in build_folders(home)
+        if folder.name != current and folder.name not in keep and not named_by(folder.name, current, users)
+    ]
+    if not dry_run:
+        for folder in doomed:
+            shutil.rmtree(folder)
+    return doomed
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
     """Delete the builds that are not ``current`` and that no project names."""
-    home = llama_home(args.home)
-    current, users = current_commit(home), read_users(home)
-    for folder in build_folders(home):
-        if folder.name == current or named_by(folder.name, current, users):
-            continue
-        if not args.dry_run:
-            shutil.rmtree(folder)
+    for folder in prune_builds(llama_home(args.home), dry_run=args.dry_run):
         sys.stdout.write(f"{'would remove' if args.dry_run else 'removed'} {folder}\n")
     return EXIT_OK
 
