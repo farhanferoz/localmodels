@@ -88,6 +88,24 @@ def test_switch_is_refused_until_a_comparison_passed(
     assert main(base) == 0
     assert (tmp_path / "builds" / "current").readlink().name == "abc1234"
 
+    make_build(tmp_path, "def5678")  # the owner switches although the comparison failed: recorded, not hidden
+    failed = tmp_path / "builds" / "def5678" / "comparison.json"
+    assert (
+        main(["llama", "--home", str(tmp_path), "switch", "def5678", "--override", "owner: 2"]) == 1
+    )  # none yet
+    failed.write_text(json.dumps({"passed": False}), encoding="utf-8")
+    assert main(["llama", "--home", str(tmp_path), "switch", "def5678"]) == 1
+    assert main(["llama", "--home", str(tmp_path), "switch", "def5678", "--override", "owner: 2"]) == 0
+    assert (tmp_path / "builds" / "current").readlink().name == "def5678"
+    assert (tmp_path / "builds" / "previous").readlink().name == "abc1234"  # the rollback
+    assert json.loads(failed.read_text(encoding="utf-8")) == {
+        "passed": False
+    }  # the comparison stays as measured
+    record = json.loads((failed.parent / "override.json").read_text(encoding="utf-8"))
+    assert record["override"] == "owner: 2"
+    assert "does not record passed: true" in record["refused"]
+    assert [folder.name for folder in prune_builds(tmp_path, dry_run=True)] == []  # previous is never pruned
+
 
 def test_prune_keeps_current_and_the_builds_projects_name(tmp_path: Path) -> None:
     for commit in ("cur0000", "pinned1", "followed", "unused1", "unused2"):

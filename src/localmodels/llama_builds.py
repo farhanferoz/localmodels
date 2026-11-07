@@ -8,6 +8,8 @@ Syncthing copies to every machine):
   finished build holds ``bin/llama-server``. CMake build folders are not relocatable, so a build is made in
   place and a folder without ``bin/llama-server`` is an unfinished build.
 - ``builds/current``: a symlink to one build folder; the build a project that follows ``current`` runs.
+- ``builds/previous``: a symlink to the build ``current`` pointed to before the last switch; never pruned, so
+  ``llama switch <it>`` rolls back.
 - ``builds/users.toml``: ``[projects]`` with ``<project> = "<commit>"`` or ``"current"``. Each project's
   configuration step may update it; editing it by hand is fine. A missing file names nobody.
 - ``builds/<commit>/comparison.json``: written by whoever ran the K1-K3 recipes on this build and on the
@@ -29,9 +31,12 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+
+from .atomic import write_text_atomically
 
 if TYPE_CHECKING:
     import argparse
@@ -48,6 +53,10 @@ REFERENCE_BUILD: Final = Path.home() / "dev" / "llama.cpp" / "build"
 REPO_URL: Final = "https://github.com/ggml-org/llama.cpp"
 SERVER_BINARY: Final = Path("bin") / "llama-server"
 CURRENT: Final = "current"
+#: The build ``current`` pointed to before the last switch: kept by every prune, for a rollback.
+PREVIOUS: Final = "previous"
+#: Written by a switch the owner made although the comparison did not pass: their words and the refusal.
+OVERRIDE_FILE: Final = "override.json"
 USERS_FILE: Final = "users.toml"
 COMPARISON_FILE: Final = "comparison.json"
 #: A project that follows the ``current`` link.
@@ -204,10 +213,18 @@ def read_users(home: Path) -> dict[str, str]:
     return {str(name): str(commit) for name, commit in projects.items()}
 
 
-def current_commit(home: Path) -> str | None:
-    """The build the ``current`` link points to; None when there is no link."""
-    link = builds_dir(home) / CURRENT
+def current_commit(home: Path, link_name: str = CURRENT) -> str | None:
+    """The build the ``current`` link (or ``link_name``) points to; None when there is no link."""
+    link = builds_dir(home) / link_name
     return link.resolve().name if link.is_symlink() else None
+
+
+def _point(folder: Path, link_name: str, target: str) -> None:
+    """Make ``folder/link_name`` a symlink to ``target`` in one rename, so no reader sees it missing."""
+    staging = folder / f".{link_name}.{os.getpid()}"
+    staging.unlink(missing_ok=True)
+    staging.symlink_to(target)
+    staging.replace(folder / link_name)
 
 
 def build_folders(home: Path) -> list[Path]:
@@ -239,6 +256,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     for folder in build_folders(home):
         notes = [
             *([CURRENT] if folder.name == current else []),
+            *([PREVIOUS] if folder.name == current_commit(home, PREVIOUS) else []),
+            *([f"switched by override ({OVERRIDE_FILE})"] if (folder / OVERRIDE_FILE).is_file() else []),
             *([] if server_binary(folder).is_file() else ["unfinished"]),
         ]
         projects = named_by(folder.name, current, users)
@@ -260,25 +279,36 @@ def comparison_passed(build: Path) -> str | None:
     return None if passed else f"{path} does not record passed: true"
 
 
-def switch(home: Path, commit: str) -> str | None:
-    """Move ``current`` to a finished build whose comparison passed; None, or why it was not moved."""
+def switch(home: Path, commit: str, *, override: str = "") -> str | None:
+    """Move ``current`` to a finished build whose comparison passed; None, or why it was not moved.
+
+    ``override`` is the owner's decision to switch although the comparison did not pass: it is written to
+    ``override.json`` beside the comparison, which stays as measured. It never stands in for a comparison
+    that was not made. The build ``current`` left becomes ``previous``.
+    """
     build = builds_dir(home) / commit
-    problem = (
-        f"{build} is not a finished build" if not server_binary(build).is_file() else comparison_passed(build)
-    )
+    if not server_binary(build).is_file():
+        return f"{build} is not a finished build"
+    problem = comparison_passed(build)
     if problem is not None:
-        return problem
-    link = build.parent / CURRENT
-    staging = build.parent / f".{CURRENT}.{os.getpid()}"
-    staging.unlink(missing_ok=True)
-    staging.symlink_to(build.name)
-    staging.replace(link)
+        if not override or not (build / COMPARISON_FILE).is_file():
+            return problem
+        record = {
+            "override": override,
+            "at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "refused": problem,
+        }
+        write_text_atomically(build / OVERRIDE_FILE, json.dumps(record, indent=2) + "\n")
+    before = current_commit(home)
+    if before is not None and before != build.name:
+        _point(build.parent, PREVIOUS, before)
+    _point(build.parent, CURRENT, build.name)
     return None
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
     """Move the ``current`` link to a finished build whose comparison passed."""
-    problem = switch(llama_home(args.home), args.commit)
+    problem = switch(llama_home(args.home), args.commit, override=args.override or "")
     if problem is not None:
         sys.stderr.write(f"not switching: {problem}\n")
         return EXIT_ERROR
@@ -287,15 +317,16 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def prune_builds(home: Path, *, keep: Collection[str] = (), dry_run: bool = False) -> list[Path]:
-    """The build folders that are not ``current``, not in ``keep`` and that no project names, deleted.
+    """The build folders that are not ``current``, ``previous``, in ``keep`` or named by a project: deleted.
 
     With ``dry_run`` they are only listed.
     """
     current, users = current_commit(home), read_users(home)
+    kept = {current, current_commit(home, PREVIOUS), *keep}
     doomed = [
         folder
         for folder in build_folders(home)
-        if folder.name != current and folder.name not in keep and not named_by(folder.name, current, users)
+        if folder.name not in kept and not named_by(folder.name, current, users)
     ]
     if not dry_run:
         for folder in doomed:
@@ -332,6 +363,11 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 
     switch = commands.add_parser("switch", help="move `current` to a build whose comparison passed")
     switch.add_argument("commit", help="build folder name")
+    switch.add_argument(
+        "--override",
+        metavar="WORDS",
+        help="the owner's decision to switch although the comparison did not pass (kept in override.json)",
+    )
     switch.set_defaults(fn=cmd_switch)
 
     prune = commands.add_parser(
