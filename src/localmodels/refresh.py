@@ -40,6 +40,7 @@ from .llama_builds import (
     COMPARISON_FILE,
     REFERENCE_BUILD,
     REPO_URL,
+    build_folders,
     builds_dir,
     compile_commit,
     current_commit,
@@ -77,12 +78,18 @@ DATE_LENGTH: Final = 10  # "YYYY-MM-DD", the front of a run id or an ISO 8601 ti
 JOB_PLACEHOLDER: Final = "<build job id>"  # what a dry run shows for the id of a job it did not submit
 LS_REMOTE_TIMEOUT_S: Final = 60
 
-# The slurm jobs (design 2.1); the cores and memory are estimates, to be corrected from the first run's peak.
+# The slurm jobs (design 2.1).
 BUILD_CPUS: Final = 8
-BUILD_MEM: Final = "24G"
-MEASURE_MEM: Final = "40G"  # includes GPU memory on this machine; the 30B model alone is 18.6 GB
+BUILD_MEM: Final = "8G"  # measured: b12189 peaked at 5.2 GB on 8 cores (8 min 9 s), slurm advised 6G
+MEASURE_MEM: Final = "40G"  # estimate, includes GPU memory on this machine; the 30B model alone is 18.6 GB
 MEASURE_LIMIT_S: Final = 1200  # the hard stop of the whole measurement, by ``timeout``
 KILL_AFTER_S: Final = 30
+# `run --urgent`: the measure job goes through slurm's urgent.py (beside submit.py), which pauses what can be
+# paused in its way; it has no --after, so the candidate must already be built.
+URGENT_SCRIPT: Final = "urgent.py"
+URGENT_TIME: Final = "0:30:00"  # slurm's limit: the 1200 s measurement, the quiet card's wait and a margin
+URGENT_TIMEOUT_S: Final = 300  # for urgent.py itself, which looks at what is in the way before submitting
+_URGENT_JOB = re.compile(r"\[urgent\] job (\d+) submitted")
 TOOL_TIMEOUT_S: Final = 300.0  # design 2.3: each tool run has its own
 SIGTERM_EXIT: Final = 128 + signal.SIGTERM
 
@@ -362,17 +369,17 @@ class Candidate(NamedTuple):
 _TAG_LINE = re.compile(r"^(?P<sha>[0-9a-f]{40})\trefs/tags/(?P<tag>b(?P<number>\d+))(?P<peeled>\^\{\})?$")
 
 
-def newest_tag(ls_remote: str) -> Candidate | None:
+def newest_tag(ls_remote: str, only: str | None = None) -> Candidate | None:
     """The release tag with the largest number after ``b``, from ``git ls-remote --tags`` text.
 
     The commit is the peeled (``^{}``) line's when the tag is annotated, else the tag line's. Other tags
-    (``backup/...``, which the ``b*`` pattern also matches) are ignored.
+    (``backup/...``, which the ``b*`` pattern also matches) are ignored. ``only`` picks that one tag instead.
     """
     commits: dict[str, str] = {}
     numbers: dict[str, int] = {}
     for line in ls_remote.splitlines():
         match = _TAG_LINE.match(line)
-        if match is None:
+        if match is None or (only is not None and match.group("tag") != only):
             continue
         tag = match.group("tag")
         numbers[tag] = int(match.group("number"))
@@ -397,15 +404,20 @@ def _ls_remote() -> str:
 
 
 def candidate_for(
-    ls_remote: Callable[[], str], current: str | None, state: RefreshState, *, retry: bool
+    ls_remote: Callable[[], str],
+    current: str | None,
+    state: RefreshState,
+    *,
+    retry: bool,
+    tag: str | None = None,
 ) -> tuple[Candidate | None, str]:
-    """The release to compare with ``current``, or None and why not."""
+    """The release to compare with ``current`` (the newest, or ``tag``), or None and why not."""
     try:
-        found = newest_tag(ls_remote())
+        found = newest_tag(ls_remote(), only=tag)
     except (subprocess.SubprocessError, OSError) as exc:
         return None, f"git ls-remote failed: {exc}"
     if found is None:
-        return None, "git ls-remote listed no b<number> tag"
+        return None, f"git ls-remote listed no tag {tag}" if tag else "git ls-remote listed no b<number> tag"
     if current and found.commit.startswith(current):
         return None, f"current ({current}) is {found.tag}"
     if not retry and any(found.commit.startswith(done) for done in state.tried):
@@ -475,6 +487,42 @@ def measure_argv(script: Path, run: Path, after: str | None, home: str | None) -
     )  # fmt: skip
 
 
+def urgent_argv(script: Path, run: Path, home: str | None) -> list[str]:
+    """The ``urgent.py`` call (beside ``script``) of the GPU measure job, for ``run --urgent``."""
+    flags = ["--time", URGENT_TIME, "--gpu", "--mem", MEASURE_MEM, "--wait"]
+    command = [*_job_command(), "refresh", *(["--home", home] if home else []), "measure"]
+    return _submit(
+        script.with_name(URGENT_SCRIPT), run, JobName.MEASURE,
+        f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name}, urgent)", flags,
+        ["timeout", f"--kill-after={KILL_AFTER_S}", str(MEASURE_LIMIT_S), *command, "--run", str(run)],
+    )  # fmt: skip
+
+
+def _run_urgent(argv: list[str]) -> tuple[str, str]:
+    """Run ``urgent.py``: (the job id, ""), or ("", why not). It prints ``[urgent] job N submitted; ...``."""
+    try:
+        done = subprocess.run(  # noqa: S603
+            argv, capture_output=True, text=True, errors="replace", timeout=URGENT_TIMEOUT_S, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return "", f"urgent.py did not answer in {URGENT_TIMEOUT_S} s"
+    except OSError as exc:
+        return "", f"urgent.py could not be run: {exc}"
+    match = _URGENT_JOB.search(done.stdout)
+    if done.returncode or match is None:
+        lines = [line for line in done.stderr.splitlines() if line.strip()]
+        return "", lines[-1] if lines else f"urgent.py exited {done.returncode} without a job id"
+    return match.group(1), ""
+
+
+def built_folder(home: Path, commit: str) -> Path | None:
+    """The finished build of ``commit`` (its folder is named by a short form of it); None when none is."""
+    for folder in build_folders(home):
+        if commit.startswith(folder.name) and server_binary(folder).is_file():
+            return folder
+    return None
+
+
 def _write_run(run: Path, record: RunRecord) -> None:
     write_text_atomically(run / RUN_FILE, record.model_dump_json(indent=2) + "\n")
 
@@ -483,6 +531,7 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
     """Fill ``record`` with what is due: the candidate, the stale rules, the builds to remove.
 
     Returns the candidate and the submit script; ``record.skipped`` says why there is nothing to submit.
+    The candidate's own build is never removed, so a build made ahead of the run is measured, not redone.
     """
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
@@ -490,13 +539,17 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
         record.skipped = f"{', '.join(live)} still queued"
         return None, None
     state = read_state()
-    removed = prune_builds(home, keep=[state.previous_current or ""], dry_run=args.dry_run)
+    candidate, record.no_candidate = candidate_for(
+        _ls_remote, current_commit(home), state, retry=args.retry, tag=args.candidate
+    )
+    keep = [state.previous_current or ""]
+    if candidate is not None:
+        record.candidate_tag, record.candidate_commit = candidate.tag, candidate.commit
+        keep += [folder.name for folder in build_folders(home) if candidate.commit.startswith(folder.name)]
+    removed = prune_builds(home, keep=keep, dry_run=args.dry_run)
     record.removed_builds = [str(folder) for folder in removed]
     if args.dry_run:
         sys.stdout.writelines(f"would remove {folder}\n" for folder in removed)
-    candidate, record.no_candidate = candidate_for(_ls_remote, current_commit(home), state, retry=args.retry)
-    if candidate is not None:
-        record.candidate_tag, record.candidate_commit = candidate.tag, candidate.commit
     found = rules.assess(rules.rules_text(), rules.host_stamp(current_server(home)))
     record.stale_rules = [a.line for a in found]
     unanswered = {rules.RuleState.NEEDS_REMEASURE, rules.RuleState.DOES_NOT_HOLD}
@@ -506,30 +559,49 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
         record.skipped = f"nothing to do ({record.no_candidate}; K1-K3 answered)"
     elif script is None:
         record.skipped = f"no submit script (${retune.SUBMIT_ENV} is empty)"
+    elif args.urgent and candidate is not None and built_folder(home, candidate.commit) is None:
+        record.skipped = (
+            f"--urgent needs {candidate.tag} built first (urgent.py cannot wait for a build job): "
+            f"`localmodels llama build --commit {candidate.tag}`, or run without --urgent"
+        )
     return candidate, script
 
 
 def _submit_jobs(
     args: argparse.Namespace, script: Path, run: Path, record: RunRecord, candidate: Candidate | None
 ) -> bool:
-    """Submit the build job (when there is a candidate) and the measure job after it; whether one failed."""
+    """Submit the build job (when the candidate is not built yet), then the measure job; whether one failed.
+
+    A candidate whose build is already finished gets its ``build.json`` written here instead of a build job.
+    """
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
+    home = llama_home(args.home)
+    built = built_folder(home, candidate.commit) if candidate is not None else None
+    if candidate is not None and built is not None:
+        done = BuildResult(tag=candidate.tag, commit=built.name, ok=True, error="already built")
+        if args.dry_run:
+            sys.stdout.write(f"{candidate.tag} is already built in {built}: no build job\n")
+        else:
+            run.mkdir(parents=True, exist_ok=True)
+            _write_json(run / BUILD_FILE, done)
     after: str | None = None
     failed = False
     for name in (JobName.BUILD, JobName.MEASURE):
-        if name is JobName.BUILD and candidate is None:
+        if name is JobName.BUILD and (candidate is None or built is not None):
             continue
-        argv = (
-            build_argv(script, run, record.candidate_tag, args.home)
-            if name is JobName.BUILD
-            else measure_argv(script, run, after, args.home)
-        )
+        if name is JobName.BUILD:
+            argv = build_argv(script, run, record.candidate_tag, args.home)
+        elif args.urgent:
+            argv = urgent_argv(script, run, args.home)
+        else:
+            argv = measure_argv(script, run, after, args.home)
         if args.dry_run:
             sys.stdout.write(f"{shlex.join(argv)}\n")
             after = JOB_PLACEHOLDER
             continue
-        job, why = retune._run_submit(argv)  # noqa: SLF001
+        submit = _run_urgent if args.urgent and name is JobName.MEASURE else retune._run_submit  # noqa: SLF001
+        job, why = submit(argv)
         record.jobs.append(JobRecord(name=name, argv=argv, job=job, error=why))
         failed |= bool(why)
         after = job or None
@@ -546,6 +618,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     failed = False
     if record.skipped or script is None:
         sys.stdout.write(f"skipped: {record.skipped}\n")
+        failed = record.skipped.startswith("--urgent")  # asked for and not done: say so in the exit code
     else:
         failed = _submit_jobs(args, script, run, record, candidate)
     if not args.dry_run:
@@ -1111,6 +1184,15 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     run.add_argument("--retry", action="store_true", help="compare the newest release again although tried")
     run.add_argument(
         "--force-measure", action="store_true", help="submit the measure job although nothing is due"
+    )
+    run.add_argument(
+        "--candidate", metavar="TAG", help="compare this release tag (b<number>), not the newest"
+    )
+    run.add_argument(
+        "--urgent",
+        action="store_true",
+        help="submit the measure job through slurm's urgent.py (pauses what can be paused in its way); "
+        "the candidate must be built already",
     )
     run.set_defaults(fn=cmd_run)
 

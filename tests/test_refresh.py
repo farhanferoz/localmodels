@@ -162,7 +162,7 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(
     run_dir = refresh.newest_run()  # named by the clock
     assert run_dir is not None
     build, measure = world.submitted.read_text().splitlines()
-    assert "--class resume --resume-ok --no-anywhere --cpus 8 --mem 24G" in build
+    assert "--class resume --resume-ok --no-anywhere --cpus 8 --mem 8G" in build
     assert "--name refresh-build" in build
     assert f"refresh --home {world.home} build --run {run_dir} --commit b12" in build
     assert "--class restart --gpu --mem 40G --after 101" in measure
@@ -192,6 +192,43 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(
     assert main(args) == 0
     assert not world.submitted.exists()
     assert "nothing to do" in capsys.readouterr().out
+
+
+def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["refresh", "--home", str(world.home), "run"]
+    urgent_log = world.root / "urgent.txt"
+    (world.root / "urgent.py").write_text(
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(urgent_log)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        "print('[urgent] memory: fits')\nprint('[urgent] job 777 submitted; log x')\n"
+    )
+    assert (
+        main([*args, "--urgent"]) == 1
+    )  # the newest candidate (b12) is not built: refused, nothing submitted
+    assert "--urgent needs b12 built first" in capsys.readouterr().out
+    assert not world.submitted.exists()
+    assert not urgent_log.exists()
+
+    world.make_build(CANDIDATE)  # built ahead of the run, never compared, not named: kept, not rebuilt
+    assert main([*args, "--urgent"]) == 0
+    assert (world.home / "builds" / CANDIDATE).exists()
+    assert not world.submitted.exists()  # no build job, and the measure job went to urgent.py
+    urgent = urgent_log.read_text()
+    assert "--name refresh-measure" in urgent
+    assert "--time 0:30:00 --gpu --mem 40G --wait" in urgent
+    assert "--after" not in urgent
+    run_dir = refresh.newest_run()
+    assert run_dir is not None
+    built = refresh.BuildResult.model_validate_json((run_dir / refresh.BUILD_FILE).read_text())
+    assert (built.tag, built.commit, built.ok) == ("b12", CANDIDATE, True)
+    record = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
+    assert [(job.name, job.job) for job in record.jobs] == [("refresh-measure", "777")]
+
+    world.patch.setattr(refresh, "_ls_remote", lambda: TAGS + f"{'9' * 40}\trefs/tags/b13\n")
+    assert main([*args, "--dry-run", "--candidate", "b12"]) == 0
+    assert "b12 is already built" in capsys.readouterr().out
 
 
 def test_build_exits_zero_when_a_step_fails_and_says_so_in_build_json(
