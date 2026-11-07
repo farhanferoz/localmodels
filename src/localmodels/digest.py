@@ -1,8 +1,9 @@
-"""`localmodels digest run`: the monthly check of the 13 sources that can change a serving or training rule.
+"""`localmodels digest run`: the monthly check of the sources that can change a serving or training rule.
 
 No language model is involved: every source is checked with a fixed local check (``gh api``, PyPI JSON, plain
 HTTP requests, host files) and filtered by paths and keywords, so a run is reproducible from ``.raw``.
-Sources: strand B's table D1-D13 (``research-2026-10-18/b-community/report.md`` section 3.2).
+Sources: strand B's table D1-D13 (``research-2026-10-18/b-community/report.md`` section 3.2), and D14, a
+local one (no network): the newest ``localmodels refresh`` run.
 
 Output, in the output directory: ``<date>.md`` (the note), ``.raw/<date>.json`` (every finding and failure)
 and ``.state.json`` (what the next run compares with: ETags, versions, the last run time).
@@ -107,7 +108,7 @@ TAGS = re.compile(r"<[^>]+>|\s+")
 
 
 class Source(StrEnum):
-    """The digest's sources, D1-D13."""
+    """The digest's sources: D1-D13 look outside, D14 is this host's own refresh run."""
 
     D1 = "D1"
     D2 = "D2"
@@ -122,8 +123,11 @@ class Source(StrEnum):
     D11 = "D11"
     D12 = "D12"
     D13 = "D13"
+    D14 = "D14"
 
 
+#: Sources that read this host's files and never touch the network: they cannot fail with the network down.
+LOCAL_SOURCES = (Source.D14,)
 ALL_KINDS = tuple(WorkloadKind)
 LLAMA_KINDS = (WorkloadKind.K1, WorkloadKind.K2, WorkloadKind.K3)
 TORCH_KINDS = (
@@ -261,9 +265,19 @@ def _release_findings(
     return found
 
 
+def _installed_llama_commit(net: Net) -> str:
+    """The build ``current`` points to (what projects run); else the hand-made build's commit."""
+    from .llama_builds import current_commit, llama_home  # noqa: PLC0415 - llama_builds does not import this
+
+    return (
+        current_commit(llama_home())
+        or net.run(["git", "-C", str(LLAMA_CPP_DIR), "rev-parse", "HEAD"]).strip()
+    )
+
+
 def check_llama_cpp(ctx: Context) -> list[Finding]:
     """D1: commits ahead of the installed build, and the keyword-matching ones on the watched paths."""
-    installed = ctx.net.run(["git", "-C", str(LLAMA_CPP_DIR), "rev-parse", "HEAD"]).strip()
+    installed = _installed_llama_commit(ctx.net)
     compare = ctx.net.gh_json(f"repos/{LLAMA_REPO}/compare/{installed}...master?per_page=1")
     found = [
         Finding(
@@ -390,6 +404,17 @@ def check_models(ctx: Context) -> list[Finding]:
     return found
 
 
+def check_refresh(_ctx: Context) -> list[Finding]:
+    """D14: what the newest ``localmodels refresh`` run did with its candidate, and the rules it measured."""
+    from .refresh import headline, newest_view, rules_line  # noqa: PLC0415 - refresh imports rules, which imports this
+
+    view = newest_view()
+    if view is None:
+        return []
+    link = str(view.folder)
+    return [Finding(text, link) for text in (headline(view), rules_line(view)) if text]
+
+
 def check_host(ctx: Context) -> list[Finding]:
     """D13: a changed host component (DGX OS, driver, kernel) and the upgradable NVIDIA/CUDA/DGX packages."""
     now = {
@@ -434,6 +459,7 @@ SOURCES: dict[Source, SourceSpec] = {
     Source.D11: SourceSpec("awesome-dgx-spark", SERVING_KINDS, check_awesome),
     Source.D12: SourceSpec("model releases", MODEL_KINDS, check_models),
     Source.D13: SourceSpec("this host", ALL_KINDS, check_host),
+    Source.D14: SourceSpec("llama.cpp refresh", LLAMA_KINDS, check_refresh),
 }
 
 
@@ -486,7 +512,7 @@ def render_note(day: str, since: str, outcomes: dict[Source, Outcome]) -> str:
 
 
 def run_digest(net: Net, out_dir: Path, now: datetime) -> int:
-    """Run all sources, write the note, the raw file and the state; exit 1 only if every source failed."""
+    """Run all sources, write the note, the raw file and the state; exit 1 if every network source failed."""
     state_path = out_dir / ".state.json"
     state: dict[str, Any] = json.loads(state_path.read_text()) if state_path.is_file() else {}
     since = state.get("last_run") or (now - timedelta(days=FIRST_RUN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -501,7 +527,7 @@ def run_digest(net: Net, out_dir: Path, now: datetime) -> int:
     findings = sum(len(o.findings) for o in outcomes.values())
     note = out_dir / f"{day}.md"
     print(f"digest {day}: {findings} findings, {failed} of {len(outcomes)} sources failed -> {note}")  # noqa: T201
-    return EXIT_ERROR if failed == len(outcomes) else EXIT_OK
+    return EXIT_ERROR if failed == len(outcomes) - len(LOCAL_SOURCES) else EXIT_OK
 
 
 def cmd_digest_run(args: argparse.Namespace) -> int:
@@ -513,6 +539,6 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     """Add ``digest run`` to the command line."""
     digest_p = subparsers.add_parser("digest", help="monthly check of the sources that can change a rule")
     digest_sub = digest_p.add_subparsers(dest="digest_command", required=True)
-    run_p = digest_sub.add_parser("run", help="check the 13 sources and write the dated note")
+    run_p = digest_sub.add_parser("run", help="check the sources and write the dated note")
     run_p.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="output directory (default: %(default)s)")
     run_p.set_defaults(fn=cmd_digest_run)
