@@ -29,3 +29,13 @@ def no_real_scheduler(
     monkeypatch.setattr("localmodels.retune.DEFAULT_SUBMIT", script)
     yield
     assert not ran.exists(), f"a test ran the default submit.py: {ran.read_text()}"
+
+
+@pytest.fixture(autouse=True)
+def gpu_with_its_own_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test's server sees a GPU with its own memory unless the test says otherwise.
+
+    The launcher sizes llama.cpp's prompt cache only on a GPU that shares the host's RAM, and this machine's
+    does, so without this every test's server arguments would depend on the host the tests run on.
+    """
+    monkeypatch.setattr("localmodels.launcher._gpu_shares_host_ram", lambda: False)

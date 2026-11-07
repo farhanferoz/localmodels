@@ -5,21 +5,25 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
 
+from localmodels import launcher
 from localmodels.launcher import LocalServerManager, MemoryGuards, ServerStartError
 from localmodels.lease import GpuLease
 from localmodels.pinned import PinnedFile
 from localmodels.process import ServerSpec, build_args
 from localmodels.stack import Engine, Settings, SpecType
-from tests.test_launcher import _answer, _gpu_params, _make_fake_server
+from tests.test_launcher import _answer, _cpu_params, _gpu_params, _make_fake_server
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
+
+    from localmodels.params import ServingParams
 
 PORT = 8187
 PROJECTED_GIB = 20  # what the fake llama-fit-params prints (20480 MiB)
@@ -38,6 +42,7 @@ def _manager(
     readings: Iterator[float],
     *,
     health: int = 3,
+    params: ServingParams | None = None,
     **extra: Any,
 ) -> LocalServerManager:
     model = tmp_path / "test.gguf"
@@ -52,7 +57,7 @@ def _manager(
 
     return LocalServerManager(
         ServerSpec(host="127.0.0.1", port=PORT, model_path=model),
-        _gpu_params(),
+        params or _gpu_params(),
         GpuLease(tmp_path / "lease", project="localmodels-test"),
         http=http,
         pid_dir=tmp_path / "pids",
@@ -68,6 +73,20 @@ def _manager(
 def _steady(gib: float) -> Iterator[float]:
     while True:
         yield gib
+
+
+@pytest.fixture
+def calls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Every process the code under test starts, as argument lists: llama-fit-params runs, then the server."""
+    started: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        started.append([str(a) for a in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    return started
 
 
 async def test_load_refused_when_projection_plus_reserve_exceeds_available(tmp_path: Path) -> None:
@@ -143,16 +162,8 @@ async def test_server_oom_score_adj_is_set_on_the_server_alone(tmp_path: Path) -
 
 
 async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_stamp(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, calls: list[list[str]]
 ) -> None:
-    calls: list[list[str]] = []  # every process started: llama-fit-params runs, then the llama-server
-    real = asyncio.create_subprocess_exec
-
-    async def spy(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
-        calls.append([str(a) for a in args])
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
     draft = tmp_path / "draft.gguf"
     with draft.open("wb") as fh:
         fh.truncate(30 * 1024**3)  # sparse: 30 GiB by its size, none on disk
@@ -212,16 +223,8 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
 
 
 async def test_a_draft_model_is_projected_on_its_own_and_an_mtp_head_counts_as_its_size(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, calls: list[list[str]]
 ) -> None:
-    calls: list[list[str]] = []
-    real = asyncio.create_subprocess_exec
-
-    async def spy(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
-        calls.append([str(a) for a in args])
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
     draft = tmp_path / "draft.gguf"
     with draft.open("wb") as fh:
         fh.truncate(30 * 1024**3)  # sparse: 30 GiB by its size, none on disk
@@ -299,3 +302,92 @@ async def test_a_stamp_says_what_the_answer_gave_and_what_the_callers_flags_or_t
         python = _answer(**both).model_copy(update={"engine": Engine.PYTORCH})
         with pytest.raises(ValueError, match=r"llama\.cpp"):
             _manager(tmp_path, http, MemoryGuards(), _steady(100), settings=python)
+
+
+@dataclass(frozen=True)
+class _CacheCase:
+    """One server start: what it runs on, what the caller set, and the cap llama-fit-params' figure gives."""
+
+    shares: bool = True  # the GPU's memory is the host's RAM
+    cpu: bool = False
+    guards: MemoryGuards = field(default_factory=MemoryGuards)
+    own: dict[str, Any] = field(default_factory=dict)  # the caller's `extra_flags` / `extra_env`
+    available: float = 100  # GiB, as the server starts
+    fit_output: str | None = None  # what llama-fit-params prints, if not a 20 GiB projection
+    cap: tuple[str, ...] = ()  # the `--cache-ram` flags expected
+    fit_runs: int = 0
+
+
+# the projection is 20 GiB, so a cap is (available - 20 - margin) GiB, between 0 and llama.cpp's 8,192 MiB
+_CACHE_CASES = [
+    pytest.param(
+        _CacheCase(guards=MemoryGuards(host_reserve_gib=10), cap=("--cache-ram", "8192"), fit_runs=1),
+        id="clamped-to-8192",
+    ),
+    pytest.param(
+        _CacheCase(
+            guards=MemoryGuards(kill_below_gib=10), available=34, cap=("--cache-ram", "4096"), fit_runs=1
+        ),
+        id="computed",
+    ),
+    pytest.param(
+        _CacheCase(
+            guards=MemoryGuards(kill_below_gib=10), available=25, cap=("--cache-ram", "0"), fit_runs=1
+        ),
+        id="clamped-to-0",
+    ),
+    pytest.param(
+        _CacheCase(fit_output="nothing useful", cap=("--cache-ram", "0"), fit_runs=1), id="no-projection"
+    ),
+    # the caller's own flag or environment: nothing is added, and nothing is projected for it
+    pytest.param(_CacheCase(own={"extra_flags": ("-cram", "1")}), id="own-flag"),
+    pytest.param(_CacheCase(own={"extra_env": {"LLAMA_ARG_CACHE_RAM": "1"}}), id="own-env"),
+    # a GPU with its own memory, or no GPU at all: llama.cpp's default stays
+    pytest.param(_CacheCase(shares=False), id="gpu-with-own-memory"),
+    pytest.param(_CacheCase(cpu=True), id="cpu"),
+]
+
+
+@pytest.mark.parametrize("case", _CACHE_CASES)
+async def test_the_prompt_cache_is_capped_to_the_memory_the_model_leaves(
+    tmp_path: Path, calls: list[list[str]], monkeypatch: pytest.MonkeyPatch, case: _CacheCase
+) -> None:
+    monkeypatch.setattr(launcher, "_gpu_shares_host_ram", lambda: case.shares)
+    answer = _answer(
+        spec=SpecType.NONE
+    )  # an answer that adds no flag: adopting a server compares its arguments
+
+    def manager(available: float, **own: Any) -> LocalServerManager:
+        made = _manager(
+            tmp_path, http, case.guards, _steady(available), health=1, settings=answer,
+            params=_cpu_params() if case.cpu else None, **own,
+        )  # fmt: skip
+        if case.fit_output is not None:
+            _fit_params(Path(made.binary), case.fit_output)
+        return made
+
+    async with httpx.AsyncClient() as http:
+        first = manager(case.available, **case.own)
+        try:
+            started = await first.start()
+            flags = (*case.own.get("extra_flags", ()), *case.cap)
+            assert [c[0].endswith("llama-fit-params") for c in calls].count(True) == case.fit_runs
+            assert calls[-1] == build_args(first.binary, first.spec, first.params, flags)
+
+            # the cap follows the memory at the time, so it is no part of a server's identity: a manager
+            # whose own cap would differ adopts the running server, stamps its cap, and projects nothing
+            calls.clear()
+            later = manager(case.available + 50, **case.own)
+            assert (await later.start()).pid == started.pid
+            assert not calls
+            for stamped in (first.stamp().layout, later.stamp().layout):
+                assert stamped is not None
+                assert stamped.extra_flags == flags
+
+            # a caller's own value is identity: another one restarts the server
+            if "extra_flags" in case.own:
+                other = manager(case.available, extra_flags=("-cram", "2"))
+                assert (await other.start()).pid != started.pid
+                await other.stop()
+        finally:
+            await first.stop()

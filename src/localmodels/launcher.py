@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import re
 import signal
@@ -29,6 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from .hardware import available_memory, network_filesystem
 from .lease import GpuLease, GpuLeaseClient, LeaseRecord, ResidentRecord
 from .process import (
+    CACHE_RAM_DEFAULT_MIB,
+    CACHE_RAM_ENV,
+    CACHE_RAM_FLAGS,
     DRAFT_MODEL_ENV,
     DRAFT_MODEL_FLAGS,
     SPEC_TYPE_ENV,
@@ -139,6 +143,21 @@ def _available_gib(on_gpu: bool) -> float | None:
     """Available memory in GiB for a GPU or CPU server (``available_memory``); None when unreadable."""
     reading = available_memory("cuda" if on_gpu else "cpu")
     return None if reading is None else reading.bytes / _GIB
+
+
+def _gpu_shares_host_ram() -> bool:
+    """Whether the GPU's memory is the host's RAM (``available_memory``); False when it cannot be told."""
+    reading = available_memory("cuda")
+    return reading is not None and reading.unified
+
+
+def _launched_cache_cap(args: list[str]) -> tuple[str, ...]:
+    """The ``--cache-ram`` pair this manager puts last in a server's arguments, else ``()``."""
+    try:
+        flag, value = args[-2:]
+    except ValueError:  # fewer than two arguments
+        return ()
+    return (flag, value) if flag in CACHE_RAM_FLAGS else ()
 
 
 class SupervisorExit(StrEnum):
@@ -253,10 +272,13 @@ class LocalServerManager:
     """Manages lifecycle, health verification, and process isolation of one local llama-server.
 
     With ``settings`` (a llama.cpp answer) it also passes the answer's ``-ub`` and speculation, each group
-    unless the caller's own ``extra_flags`` or ``extra_env`` carry it. The command line a server runs is
-    ``build_args(binary, spec, params, manager.effective_flags)``, not ``manager.extra_flags``. The caller
-    resolves ``answer.settings.model_file`` into ``spec.model_path``; a file the manager does not serve is
-    listed as ``overridden`` in the stamp.
+    unless the caller's own ``extra_flags`` or ``extra_env`` carry it. On a GPU that shares the host's RAM it
+    also caps llama.cpp's prompt cache (``--cache-ram``) to the memory the model leaves, unless the caller
+    sets it (``_prepare_launch``). The command line a server starts with is ``build_args(binary, spec,
+    params, manager._server_flags)``: ``effective_flags`` (the caller's flags plus the answer's) and then
+    that cap, which is a launch-time choice and not part of a server's identity. The caller resolves
+    ``answer.settings.model_file`` into ``spec.model_path``; a file the manager does not serve is listed as
+    ``overridden`` in the stamp.
     """
 
     def __init__(
@@ -309,6 +331,8 @@ class LocalServerManager:
         self._available_gib = available_gib
         #: The settings answer this server starts with; None starts it exactly as it always was.
         self.settings = settings
+        #: The flags this manager adds itself when it starts a server, or reads off one it adopted: the cap.
+        self._launch_flags: tuple[str, ...] = ()
         self._watchdog: asyncio.Task[None] | None = None
         self._ready = False
         #: Why the watchdog killed the last server it started, in plain words; None if it did not.
@@ -360,6 +384,11 @@ class LocalServerManager:
             return self.extra_flags
         return (*self.extra_flags, *llama_flags(self.settings.settings, self.extra_flags, self.extra_env))
 
+    @property
+    def _server_flags(self) -> tuple[str, ...]:
+        """Everything the server runs with: ``effective_flags`` and the flags added at launch."""
+        return (*self.effective_flags, *self._launch_flags)
+
     def _applied(self) -> tuple[Settings, list[str]]:
         """The settings this server got from the answer, and those the caller's own flags or env set aside."""
         if self.settings is None:
@@ -408,7 +437,7 @@ class LocalServerManager:
                 n_ctx=self.params.n_ctx,
                 n_parallel=self.params.n_parallel,
                 kv_unified=self.params.kv_unified,
-                extra_flags=self.effective_flags,
+                extra_flags=self._server_flags,
             ),
             host=fingerprint(),
             settings=settings_stamp,
@@ -477,13 +506,9 @@ class LocalServerManager:
             raise ServerStartError(msg)
         return int(match.group(1)) / _MIB_PER_GIB
 
-    async def _check_fits(self) -> None:
+    def _check_fits(self, projection: float, free: float | None, reserve: float) -> None:
         """Refuse to load when the projection plus the host reserve exceeds available memory."""
-        reserve = self.guards.host_reserve_gib
-        if reserve is None:
-            return
-        need = await self._projected_gib() + reserve
-        free = self.free_gib()
+        need = projection + reserve
         if free is None:
             msg = "available memory cannot be read, so the model's fit cannot be checked; not loading it"
             raise ServerStartError(msg)
@@ -493,6 +518,62 @@ class LocalServerManager:
                 f"{reserve:g} GiB host reserve) but {free:.1f} GiB is available; not loading it"
             )
             raise NotEnoughMemoryError(msg)
+
+    def _caller_sets_cache_ram(self) -> bool:
+        return llama_option(self.extra_flags, self.extra_env, CACHE_RAM_FLAGS, CACHE_RAM_ENV) is not None
+
+    def _cache_cap_skipped(self) -> str | None:
+        """Why this server gets no computed prompt-cache cap, in words for the log; None when it gets one."""
+        if self._caller_sets_cache_ram():
+            return "the caller's own --cache-ram"
+        if self.params.n_gpu_layers == 0:
+            return "llama.cpp's default (the server does not use the GPU)"
+        if not _gpu_shares_host_ram():
+            return "llama.cpp's default (the GPU has its own memory)"
+        return None
+
+    async def _prepare_launch(self) -> None:
+        """Before the load: check the model fits (host reserve) and size the prompt cache (D20).
+
+        ``llama-fit-params`` runs at most once, for whichever of the two needs it. On a GPU that shares the
+        host's RAM, llama.cpp's prompt cache (default 8 GiB) grows in the same RAM the model and the host
+        use, so the cap is the memory left after the projection and the guards' floor, between 0 and
+        llama.cpp's default. Without a host reserve a missing projection or reading gives a cap of 0 (memory
+        safety over a speed-up); with one the start is refused, as it always was.
+        """
+        self._launch_flags = ()
+        reserve = self.guards.host_reserve_gib
+        skipped = self._cache_cap_skipped()
+        if skipped is not None:
+            log.info("prompt cache: %s", skipped)
+        if reserve is None and skipped is not None:
+            return
+        projection: float | None = None
+        problem = "available memory cannot be read"
+        try:
+            projection = await self._projected_gib()
+        except ServerStartError as exc:
+            if reserve is not None:
+                raise
+            problem = str(exc)
+        free = self.free_gib()
+        if reserve is not None:
+            assert projection is not None  # noqa: S101 - narrowing for mypy; a failed projection raised above
+            self._check_fits(projection, free, reserve)
+        if skipped is not None:
+            return
+        margin = max(reserve or 0.0, self.guards.kill_below_gib or 0.0)
+        if projection is None or free is None:
+            log.warning("prompt cache: --cache-ram 0 (%s; no cache rather than an unsized one)", problem)
+            mib = 0
+        else:
+            mib = max(0, min(CACHE_RAM_DEFAULT_MIB, math.floor((free - projection - margin) * _MIB_PER_GIB)))
+            log.info(
+                "prompt cache: --cache-ram %s MiB (available %.1f GiB, projection %.1f GiB, margin %g GiB; "
+                "GPU shares the host's RAM)",
+                f"{mib:,}", free, projection, margin,
+            )  # fmt: skip
+        self._launch_flags = (CACHE_RAM_FLAGS[-1], str(mib))
 
     async def _check_left_over(self) -> None:
         """After the load: stop the server if it left less than the host reserve available."""
@@ -561,6 +642,12 @@ class LocalServerManager:
                             raise LeaseConflictError(msg)
                         await self.stop()
                         return None
+                    # the stamp says what the adopted server runs; a caller's own value is in its flags
+                    self._launch_flags = () if self._caller_sets_cache_ram() else _launched_cache_cap(args)
+                    if self._launch_flags:
+                        log.info(
+                            "prompt cache: the adopted server's --cache-ram %s MiB", self._launch_flags[1]
+                        )
                     return ServerHandle(pid=pid, port=self.spec.port, model_path=self.spec.model_path)
         return None
 
@@ -573,8 +660,12 @@ class LocalServerManager:
     def _runs_as_started_now(self, args: list[str]) -> bool:
         """Whether a running server's arguments are those this manager would start it with.
 
-        The binary is not compared, and a file given under another spelling of its path is the same file.
+        The binary is not compared, and a file given under another spelling of its path is the same file. The
+        prompt-cache cap this manager adds at launch is left out of the running arguments: it follows the
+        memory at the time, so it is no part of the server's identity (a caller's own value is).
         """
+        if not self._caller_sets_cache_ram():
+            args = args[: len(args) - len(_launched_cache_cap(args))]
         wanted = build_args(self.binary, self.spec, self.params, self.effective_flags)
         return _resolved(args[len(args) - len(wanted) + 1 :]) == _resolved(wanted[1:])
 
@@ -734,10 +825,10 @@ class LocalServerManager:
                 self.spec.model_path,
                 kind,
             )
-        args = build_args(self.binary, self.spec, self.params, self.effective_flags)
+        await self._prepare_launch()
+        args = build_args(self.binary, self.spec, self.params, self._server_flags)
         if self.guards.server_oom_score_adj is not None:
             args = ["sh", "-c", _OOM_WRAPPER.format(score=self.guards.server_oom_score_adj), *args]
-        await self._check_fits()
 
         publishes = self.contention is Contention.STAY_UP or self.params.n_gpu_layers != 0
         if self.contention is Contention.STAY_UP:

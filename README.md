@@ -189,7 +189,12 @@ in-process load with `answer.server_stamp(model_path, build)`; it appears as `Se
 To start a llama-server with an answer, pass `LocalServerManager(settings=answer)` (or set `settings_request` in the `serve` config): it
 adds `-ub` and the speculative-decoding flags, each as a group the caller's own `extra_flags` or `extra_env` win (the stamp lists it as
 `overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it
-(unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)`, not `manager.extra_flags`.
+(unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)` (the caller's `extra_flags` and the answer's flags) and then the prompt-cache cap below, not `manager.extra_flags`.
+On a GPU that shares the host's RAM (a DGX Spark's, found by `available_memory`), `LocalServerManager` also passes `--cache-ram` = available memory
+minus `llama-fit-params`' projection minus the larger of the guards' `host_reserve_gib` and `kill_below_gib`, between 0 and llama.cpp's own
+8,192 MiB (0 when the projection cannot be made and no host reserve is set; the start is refused when one is); a GPU with its own memory, a server
+without GPU layers, and a caller's own `--cache-ram` or `LLAMA_ARG_CACHE_RAM` keep llama.cpp's default or the caller's value (D20). The cap is logged,
+stamped in `layout.extra_flags` (for an adopted server too), and is no part of a running server's identity: a server whose cap differs is adopted, not restarted.
 `python -m localmodels.llama_tune --help` is the tune that makes such a record (the recipe command for llama.cpp; run it through slurm,
 never by hand on the card). It measures the reference first, then `-ub` (`llama-bench`, then a teacher-forced `llama-perplexity` check
 against 512 with a restart control; only for prompts of at least 512 tokens), the speculation candidates you declare and, with your own

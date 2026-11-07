@@ -155,12 +155,16 @@ def build_args(
 # The flag and variable names below are read from llama.cpp 5aeac37a3, common/arg.cpp: `-b` and `-ub` at
 # 1672-1684; the speculation options (those marked `.set_spec()`, their negated names such as
 # `--no-spec-draft-backend-sampling` at 4234-4236, `--spec-default`, and the n-gram cache files `-lcs`
-# and `-lcd` at 1627-1640, which set `params.speculative.ngram_cache`) at 3996-4780. Re-derive them when
-# the build in use moves on.
+# and `-lcd` at 1627-1640, which set `params.speculative.ngram_cache`) at 3996-4780, and `-cram` at 1686.
+# Re-derive them when the build in use moves on.
 BATCH_FLAGS: Final = ("-b", "--batch-size")
 BATCH_ENV: Final = "LLAMA_ARG_BATCH"
 UBATCH_FLAGS: Final = ("-ub", "--ubatch-size")
 UBATCH_ENV: Final = "LLAMA_ARG_UBATCH"
+CACHE_RAM_FLAGS: Final = ("-cram", "--cache-ram")
+CACHE_RAM_ENV: Final = "LLAMA_ARG_CACHE_RAM"
+#: llama.cpp's own default for ``--cache-ram`` in MiB (arg.cpp:1686; tools/server/README.md: "0 - disable").
+CACHE_RAM_DEFAULT_MIB: Final = 8192
 DRAFT_MODEL_FLAGS: Final = ("--spec-draft-model", "-md", "--model-draft")
 DRAFT_MODEL_ENV: Final = "LLAMA_ARG_SPEC_DRAFT_MODEL"
 SPEC_TYPE_FLAG: Final = "--spec-type"
