@@ -190,7 +190,10 @@ class TuneRecipe(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     project: str
-    command: tuple[str, ...]  # run by slurm in the project's own environment; ends by adopting its record
+    # Run by slurm in the project's own environment, as its installed command (``<repo>/.venv/bin/<tool>``,
+    # never ``uv run``, which syncs the environment and can remove what the lock does not hold); it ends by
+    # adopting its record.
+    command: tuple[str, ...]
     workdir: Path | None = None
     reference: str = ""  # the name of the reference candidate (listed first)
     quality: str = ""  # the name of the quality check; a recipe without one adopts nothing
@@ -374,9 +377,14 @@ class SettingsAnswer(BaseModel):
         return out
 
 
+def state_dir() -> Path:
+    """The state directory: ``$LOCALMODELS_STATE_DIR``, else ``~/.local/state/localmodels``."""
+    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser()
+
+
 def settings_dir() -> Path:
     """The store: ``$LOCALMODELS_STATE_DIR``/settings, else ``~/.local/state/localmodels/settings``."""
-    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / "settings"
+    return state_dir() / "settings"
 
 
 @contextmanager

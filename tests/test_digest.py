@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from localmodels import digest
 from localmodels.digest import Context, Source
 
@@ -16,6 +18,15 @@ FULL = "ccc3646a1b2c3d4e5f60718293a4b5c6d7e8f901"
 NOW = datetime(2026, 11, 1, 7, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def isolated_llama_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """No `current` link and no refresh run: the checks read an empty llama home, never this machine's."""
+    home = tmp_path_factory.mktemp("llama-home")
+    monkeypatch.setenv("LOCALMODELS_LLAMA_HOME", str(home))
+    monkeypatch.setenv("LOCALMODELS_REFRESH_DIR", str(home / "refresh"))
+    return home
+
+
 def _fixture(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text())
 
@@ -23,12 +34,12 @@ def _fixture(name: str) -> Any:
 class FixtureNet:
     """Answers only the requests it was given a recording for; anything else fails like a dead network."""
 
-    def __init__(self, *, forum: bool = False, llama: bool = False) -> None:
+    def __init__(self, *, forum: bool = False, llama: bool = False, installed: str = FULL) -> None:
         self.json: dict[str, Any] = {}
         self.pages: dict[str, str] = {}
         if llama:
             base = "repos/ggml-org/llama.cpp"
-            self.json[f"{base}/compare/{FULL}...master?per_page=1"] = _fixture("llama_compare.json")
+            self.json[f"{base}/compare/{installed}...master?per_page=1"] = _fixture("llama_compare.json")
             self.json[f"{base}/commits?since={SINCE}&per_page=100&path=ggml/src/ggml-cuda"] = _fixture(
                 "llama_cuda_commits.json"
             )
@@ -59,12 +70,16 @@ class FixtureNet:
         raise FileNotFoundError(argv[0])
 
 
-def test_llama_cpp_counts_ahead_and_keeps_keyword_titles_only() -> None:
+def test_llama_cpp_counts_ahead_and_keeps_keyword_titles_only(isolated_llama_home: Path) -> None:
     found = digest.check_llama_cpp(Context(FixtureNet(llama=True), SINCE))
     texts = [f.text for f in found]
-    assert texts[0].startswith(
-        f"master is {_fixture('llama_compare.json')['ahead_by']} commits ahead of the installed ccc3646"
-    )
+    ahead = f"master is {_fixture('llama_compare.json')['ahead_by']} commits ahead of the installed "
+    assert texts[0].startswith(f"{ahead}ccc3646")  # no `current` link: the hand-made build's HEAD
+    builds = isolated_llama_home / "builds"
+    (builds / "5aeac37a3").mkdir(parents=True)
+    (builds / "current").symlink_to("5aeac37a3")
+    linked = digest.check_llama_cpp(Context(FixtureNet(llama=True, installed="5aeac37a3"), SINCE))
+    assert linked[0].text.startswith(f"{ahead}5aeac37")  # the build projects run, not the reference
     assert any("rms_norm: add variants that load float4" in t for t in texts)
     assert not any("tautological" in t for t in texts)
 

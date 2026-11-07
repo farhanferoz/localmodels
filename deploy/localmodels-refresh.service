@@ -1,0 +1,19 @@
+# systemd --user unit: one run of the monthly llama.cpp refresh (see localmodels-refresh.timer).
+#
+# It takes seconds and runs nothing on the GPU: it submits a CPU build job and a GPU measure job through slurm
+# (so it needs the slurm submit script, $LOCALMODELS_SUBMIT or the default) and exits.
+#
+# Install (the timer starts this unit, so only the timer is enabled):
+#   cp deploy/localmodels-refresh.service deploy/localmodels-refresh.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now localmodels-refresh.timer
+# Try it once by hand: systemctl --user start localmodels-refresh.service
+# Output: ~/cache/localmodels/refresh/<run>/ (run.json, build.json, result.json, comparison.json and each tool's
+# output); `localmodels refresh status` prints the newest run.
+[Unit]
+Description=localmodels monthly llama.cpp refresh
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/dev/localmodels/.venv/bin/localmodels refresh run

@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -28,6 +30,19 @@ def write_text_atomically(path: Path, text: str) -> Path:
         Path(temp).unlink(missing_ok=True)
         raise
     return path
+
+
+def write_model(path: Path, model: BaseModel) -> Path:
+    """Store a pydantic model at ``path`` as indented JSON with a final newline, atomically."""
+    return write_text_atomically(path, model.model_dump_json(indent=2) + "\n")
+
+
+def read_model[T: BaseModel](path: Path, model: type[T]) -> T | None:
+    """The ``model`` stored at ``path``; None when the file is missing, unreadable or does not validate."""
+    try:
+        return model.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # ValueError: bytes that are not UTF-8, and pydantic's ValidationError
+        return None
 
 
 def replace_dir_atomically(target: Path, fill: Callable[[Path], None], marker: str) -> None:
