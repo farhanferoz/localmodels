@@ -88,6 +88,9 @@ class World:
         script = root / "submit.py"
         script.write_text(
             "import pathlib, sys\n"
+            "workdir = pathlib.Path(sys.argv[sys.argv.index('--workdir') + 1])\n"
+            # sbatch --chdir needs the folder to exist when the job is queued
+            "if not workdir.is_dir():\n    sys.exit('the --workdir does not exist')\n"
             f"log = pathlib.Path({str(self.submitted)!r})\n"
             "n = len(log.read_text().splitlines()) if log.exists() else 0\n"
             "log.open('a').write(' '.join(sys.argv[1:]) + '\\n')\n"

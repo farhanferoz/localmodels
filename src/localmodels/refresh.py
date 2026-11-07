@@ -659,6 +659,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         sys.stdout.write(f"skipped: {record.skipped}\n")
         failed = record.skipped.startswith("--urgent")  # asked for and not done: say so in the exit code
     else:
+        if not args.dry_run:
+            run.mkdir(parents=True, exist_ok=True)  # the jobs' --workdir and --log: there before they queue
         failed = _submit_jobs(args, script, run, record, candidate)
     if not args.dry_run and not record.queued:  # a run still in progress keeps its folder the newest
         run.mkdir(parents=True, exist_ok=True)
