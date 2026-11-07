@@ -71,7 +71,7 @@ def _perplexity(args: list[str], cfg: dict, build: Path) -> None:
     text = re.sub(r"(Mean PPL\(Q\)/PPL\(base\)\s*:\s*)[\d.]+", rf"\g<1>{ratio:.6f}", text)
     text = re.sub(r"(Mean\s+KLD:\s*)[\d.]+", rf"\g<1>{kl:.6f}", text)
     text = re.sub(r"(Same top p:\s*)[\d.]+", rf"\g<1>{top:.3f}", text)
-    sys.stderr.write(text)  # llama-perplexity logs its statistics on stderr
+    sys.stdout.write(text)  # llama-perplexity prints its statistics through LOG(), on stdout
 
 
 def main() -> int:

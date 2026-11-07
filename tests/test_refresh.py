@@ -237,7 +237,7 @@ def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(
     assert not world.submitted.exists()  # no build job, and the measure job went to urgent.py
     urgent = urgent_log.read_text()
     assert "--name refresh-measure" in urgent
-    assert "--time 0:30:00 --gpu --mem 52G --wait" in urgent
+    assert "--time 1:30:00 --gpu --mem 52G --wait" in urgent
     assert "--after" not in urgent
     run_dir = refresh.newest_run()
     assert run_dir is not None
@@ -246,6 +246,15 @@ def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(
     record = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
     assert [(job.name, job.job) for job in record.jobs] == [("refresh-measure", "777")]
 
+    def offline() -> str:
+        raise OSError("no network")
+
+    world.make_build(
+        "eeeeeeeee"
+    )  # unnamed: removed by a run that read the release list, kept by one that did not
+    world.patch.setattr(refresh, "_ls_remote", offline)
+    assert main([*args, "--force-measure"]) == 0
+    assert (world.home / "builds" / "eeeeeeeee").exists()
     world.patch.setattr(refresh, "_ls_remote", lambda: TAGS + f"{'9' * 40}\trefs/tags/b13\n")
     assert main([*args, "--dry-run", "--candidate", "b12"]) == 0
     assert "b12 is already built" in capsys.readouterr().out

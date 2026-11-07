@@ -87,7 +87,7 @@ KILL_AFTER_S: Final = 30
 # `run --urgent`: the measure job goes through slurm's urgent.py (beside submit.py), which pauses what can be
 # paused in its way; it has no --after, so the candidate must already be built.
 URGENT_SCRIPT: Final = "urgent.py"
-URGENT_TIME: Final = "0:30:00"  # slurm's limit: the 1200 s measurement, the quiet card's wait and a margin
+URGENT_TIME: Final = "1:30:00"  # slurm's limit: the job wrapper's wait for the card (up to 1 h), then 1200 s
 URGENT_TIMEOUT_S: Final = 300  # for urgent.py itself, which looks at what is in the way before submitting
 _URGENT_JOB = re.compile(r"\[urgent\] job (\d+) submitted")
 #: slurm's pending reason for a job whose ``--after`` job did not end cleanly: it can never start, and this
@@ -408,19 +408,27 @@ def candidate_for(
     *,
     retry: bool,
     tag: str | None = None,
-) -> tuple[Candidate | None, str]:
-    """The release to compare with ``current`` (the newest, or ``tag``), or None and why not."""
+) -> tuple[Candidate | None, str, bool]:
+    """The release to compare with ``current`` (the newest, or ``tag``), or None and why not.
+
+    The third value says whether the release list was read at all: when it was not, nothing is known about
+    which build is the candidate.
+    """
     try:
         found = newest_tag(ls_remote(), only=tag)
     except (subprocess.SubprocessError, OSError) as exc:
-        return None, f"git ls-remote failed: {exc}"
+        return None, f"git ls-remote failed: {exc}", False
     if found is None:
-        return None, f"git ls-remote listed no tag {tag}" if tag else "git ls-remote listed no b<number> tag"
+        return (
+            None,
+            f"git ls-remote listed no tag {tag}" if tag else "git ls-remote listed no b<number> tag",
+            True,
+        )
     if current and found.commit.startswith(current):
-        return None, f"current ({current}) is {found.tag}"
+        return None, f"current ({current}) is {found.tag}", True
     if not retry and any(found.commit.startswith(done) for done in state.tried):
-        return None, f"{found.tag} was compared already (--retry compares again)"
-    return found, ""
+        return None, f"{found.tag} was compared already (--retry compares again)", True
+    return found, "", True
 
 
 def _refresh_queue() -> list[tuple[str, str]] | None:
@@ -579,7 +587,7 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
         )
         return None, None
     state = read_state()
-    candidate, record.no_candidate = candidate_for(
+    candidate, record.no_candidate, listed = candidate_for(
         _ls_remote, current_commit(home), state, retry=args.retry, tag=args.candidate
     )
     keep = [state.previous_current or ""]
@@ -587,7 +595,8 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
         record.candidate_tag, record.candidate_commit = candidate.tag, candidate.commit
         folder = folder_for(home, candidate.commit)
         keep += [folder.name] if folder is not None else []
-    removed = prune_builds(home, keep=keep, dry_run=args.dry_run)
+    # Without the release list the candidate is unknown, and its build made ahead may be any folder: keep all.
+    removed = prune_builds(home, keep=keep, dry_run=args.dry_run) if listed else []
     record.removed_builds = [str(folder) for folder in removed]
     if args.dry_run:
         sys.stdout.writelines(f"would remove {folder}\n" for folder in removed)
@@ -986,7 +995,7 @@ class Measurer:
         output = self.tool(step, argv)
         if output is None:
             return None
-        try:  # llama-perplexity logs its statistics on stderr in practice (the October scripts used 2>&1)
+        try:  # llama-perplexity prints its statistics on stdout (LOG) and its progress on stderr: read both
             stats = parse_kl("\n".join(output))
         except ValueError as exc:
             self._fail(step, str(exc))
