@@ -524,10 +524,11 @@ def run_digest(net: Net, out_dir: Path, now: datetime) -> int:
     write_text_atomically(out_dir / ".raw" / f"{day}.json", json.dumps(raw, indent=2) + "\n")
     write_text_atomically(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
     failed = sum(o.failed is not None for o in outcomes.values())
+    network = [o for s, o in outcomes.items() if s not in LOCAL_SOURCES]
     findings = sum(len(o.findings) for o in outcomes.values())
     note = out_dir / f"{day}.md"
     print(f"digest {day}: {findings} findings, {failed} of {len(outcomes)} sources failed -> {note}")  # noqa: T201
-    return EXIT_ERROR if failed == len(outcomes) - len(LOCAL_SOURCES) else EXIT_OK
+    return EXIT_ERROR if all(o.failed is not None for o in network) else EXIT_OK
 
 
 def cmd_digest_run(args: argparse.Namespace) -> int:
