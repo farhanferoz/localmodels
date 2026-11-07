@@ -20,6 +20,7 @@ from localmodels.enums import DeviceType, ServingRole, WorkloadKind
 from localmodels.hardware import AvailableMemory
 from localmodels.lease import GpuLease
 from localmodels.llama_tune import (
+    UB_LIMITS,
     ArmResult,
     FileSet,
     KlResult,
@@ -40,7 +41,6 @@ from localmodels.llama_tune import (
     parse_kl,
     run_guarded,
     tune_and_adopt,
-    ub_limits,
 )
 from localmodels.params import derive_serving_params
 from localmodels.pinned import PinnedFile, snapshot_dir
@@ -63,6 +63,9 @@ def stats(name: str) -> Any:
     return parse_kl((FIXTURES / name).read_text())
 
 
+DRIFTED = stats("hl2c_kld_ub2048.txt").model_copy(update={"same_top": 0.96})  # outside UB_LIMITS
+
+
 def test_ub_limits_applied_to_the_saved_teacher_forced_outputs() -> None:
     control = stats("hl2c_kld_ub512.txt")  # the restart: the base file's 16-bit storage gives 1.0013
     assert control.ppl_ratio == pytest.approx(1.001281)
@@ -70,17 +73,19 @@ def test_ub_limits_applied_to_the_saved_teacher_forced_outputs() -> None:
         saved = stats(f"hl2c_kld_ub{ub}.txt")
         assert 0.016 < saved.mean_kl < 0.019
         assert 0.976 < saved.same_top < 0.978
-        assert judge_ub(saved, control, ub_limits(K1)).passed  # a generator: 0.03 and 97 %
-        assert not judge_ub(saved, control, ub_limits(K3)).passed  # a scorer: 98 % is missed by 0.3 points
-    longer = judge_ub(stats("hl2d_kld_ub2048.txt"), stats("hl2d_kld_ub512.txt"), ub_limits(K1))
+        assert judge_ub(saved, control, UB_LIMITS).passed  # within 0.03 and 97 %, writers and scorers (D21)
+        edges = (({"same_top": 0.969}, False), ({"mean_kl": 0.031}, False), ({"mean_kl": 0.029}, True))
+        for change, passes in edges:  # each limit's edge
+            assert judge_ub(saved.model_copy(update=change), control, UB_LIMITS).passed is passes
+    longer = judge_ub(stats("hl2d_kld_ub2048.txt"), stats("hl2d_kld_ub512.txt"), UB_LIMITS)
     assert not longer.passed
     assert "0.0604" in longer.detail  # at 4,096-token chunks the mean KL divergence is three times as large
     worse = stats("hl2c_kld_ub2048.txt").model_copy(update={"ppl_ratio": control.ppl_ratio + 0.02})
-    assert not judge_ub(worse, control, ub_limits(K1)).passed  # a perplexity loss beyond the control's
+    assert not judge_ub(worse, control, UB_LIMITS).passed  # a perplexity loss beyond the control's
     base_storage = control.model_copy(update={"ppl_ratio": 1.02})  # the base file's 16-bit storage offsets it
     near = stats("hl2c_kld_ub2048.txt").model_copy(update={"ppl_ratio": 1.025})
-    assert judge_ub(near, base_storage, ub_limits(K1)).passed  # judged against the control, not against 1.0
-    assert not judge_ub(near, control, ub_limits(K1)).passed
+    assert judge_ub(near, base_storage, UB_LIMITS).passed  # judged against the control, not against 1.0
+    assert not judge_ub(near, control, UB_LIMITS).passed
 
 
 def test_speculation_tripwires_on_the_hl3_arms() -> None:
@@ -223,8 +228,8 @@ class FakeTune(LlamaTune):
         )
         if base:
             (self.spec.run_dir / "base.kld").write_text("a base file")
-        else:
-            result.stats = stats(f"hl2c_kld_ub{ubatch}.txt")
+        else:  # a case may script the figures of a -ub in "kl"; otherwise the saved HL2c outputs
+            result.stats = self.script.get("kl", {}).get(ubatch) or stats(f"hl2c_kld_ub{ubatch}.txt")
         self.ppl_s = 30.0
         self.measurements.append(result)
         return result
@@ -336,8 +341,10 @@ def test_a_text_other_than_the_pinned_one_is_not_used(
         ),
         # a larger -ub that passes, from a server that ran with it
         ({}, {}, "ub2048", 2048, None),
-        # a scorer keeps K3's own limits: 97.7 % is under 98 %, so -ub stays
-        ({"kind": K3}, {}, "reference", 512, None),
+        # a scorer is judged by the same limits (D21): its larger -ub passes and is adopted under its own kind
+        ({"kind": K3}, {}, "ub2048", 2048, None),
+        # ... and refused when its figures fall outside them: the reference's -ub stays
+        ({"kind": K3}, {"kl": dict.fromkeys((1024, 2048), DRIFTED)}, "reference", 512, None),
         # no memory figure from nvidia-smi: a larger -ub is not adopted
         ({}, {"ub2048": {"request_s": 8.0, "outputs": TEXTS}}, "reference", 512, None),
     ],

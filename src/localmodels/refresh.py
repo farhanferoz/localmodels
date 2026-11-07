@@ -769,7 +769,7 @@ def judge_candidate(
     figures of the current and the candidate build against the current's base. ``skipped`` maps each
     comparison step that did not measure to why; any entry fails the verdict (``cmp-k3`` steps: quality).
     """
-    from .llama_tune import GENERATION_LIMITS, judge_ub  # noqa: PLC0415 - heavy; only a measurement needs it
+    from .llama_tune import UB_LIMITS, judge_ub  # noqa: PLC0415 - heavy; only a measurement needs it
 
     speed: list[str] = []
     quality: list[str] = []
@@ -797,7 +797,7 @@ def judge_candidate(
     else:
         # D18: the limits calibrated on this pinned text. K3's scoring limits (98 % same top) came from
         # October's GPL text; on this one they refused October's accepted switch too (97.63 %, slurm 2159).
-        agreement = judge_ub(scored, control, GENERATION_LIMITS)
+        agreement = judge_ub(scored, control, UB_LIMITS)
         if not agreement.passed:
             quality.append(f"K3 outside its limits: {agreement.detail}")
     slowdown = max(slowdowns, default=0.0)

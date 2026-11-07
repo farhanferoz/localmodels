@@ -272,15 +272,9 @@ class UbLimits(NamedTuple):
     min_top: float
 
 
-GENERATION_LIMITS: Final = UbLimits(
-    ppl_margin=0.01, max_kl=0.03, min_top=0.97
-)  # K1, K2 (HL2c: 0.016-0.018, 97.7 %)
-SCORING_LIMITS: Final = UbLimits(ppl_margin=0.01, max_kl=0.02, min_top=0.98)  # K3's own (rules.md K3)
-
-
-def ub_limits(kind: WorkloadKind) -> UbLimits:
-    """The limits for ``kind``: a scorer's numbers are compared across runs, so it keeps K3's own."""
-    return SCORING_LIMITS if kind is WorkloadKind.K3 else GENERATION_LIMITS
+#: One set for writers and scorers alike (D21), calibrated on the pinned text (HL2c: 0.016-0.018, 97.7 %); the
+#: refresh gate judges a new build by the same limits (D18), which every project, scorers included, accepts
+UB_LIMITS: Final = UbLimits(ppl_margin=0.01, max_kl=0.03, min_top=0.97)
 
 
 def judge_ub(candidate: KlStats, control: KlStats, limits: UbLimits) -> Agreement:
@@ -968,7 +962,7 @@ class LlamaTune:
     async def _kl(self, ubatch: int) -> KlResult:
         result = await self._perplexity(ubatch, base=False)
         if result.stats is not None and self.control is not None:
-            result.agreement = judge_ub(result.stats, self.control, ub_limits(self.spec.kind))
+            result.agreement = judge_ub(result.stats, self.control, UB_LIMITS)
         self.kl[ubatch] = result
         return result
 
