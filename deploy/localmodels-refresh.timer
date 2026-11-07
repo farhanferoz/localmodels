@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly localmodels llama.cpp refresh
+
+[Timer]
+# Two hours after the digest (07:00), so the next month's digest reports this run.
+OnCalendar=*-*-01 09:00:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
