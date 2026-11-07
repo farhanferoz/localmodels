@@ -60,8 +60,14 @@ def test_verdict_applies_the_speed_tolerance_the_kl_limits_and_fails_what_was_no
     base, cand = _rounds(b_small_tg128=[100.0, 104.0], c_small_tg128=[98.0, 98.0])  # 3.9 % slower, spread 4 %
     assert refresh.judge_candidate(base, cand, SAME, OCTOBER, {}).passed
     base, cand = _rounds()
-    noisy = KlStats(ppl_ratio=1.0, mean_kl=0.03, same_top=0.99)
-    assert refresh.judge_candidate(base, cand, SAME, noisy, {}).quality_failures  # KL 0.03 is over 0.02
+    noisy = KlStats(ppl_ratio=1.0, mean_kl=0.04, same_top=0.99)
+    assert refresh.judge_candidate(base, cand, SAME, noisy, {}).quality_failures  # KL 0.04 is over 0.03
+    accepted = KlStats(
+        ppl_ratio=1.0014, mean_kl=0.0036, same_top=0.9763
+    )  # October's switch on this text (2159)
+    assert refresh.judge_candidate(base, cand, SAME, accepted, {}).passed
+    flips = KlStats(ppl_ratio=1.0, mean_kl=0.005, same_top=0.965)
+    assert refresh.judge_candidate(base, cand, SAME, flips, {}).quality_failures  # 96.5 % is under 97 %
     missing = refresh.judge_candidate(base, cand, None, None, {"cmp-k3-control": "exited 3"})
     assert missing.quality_failures == ["not measured: cmp-k3-control: exited 3"]
     assert not refresh.judge_candidate(base, cand[:1], SAME, OCTOBER, {}).passed  # a missing round
