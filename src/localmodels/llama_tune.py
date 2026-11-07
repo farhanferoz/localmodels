@@ -66,6 +66,7 @@ from localmodels.params import ServingParams, derive_serving_params
 from localmodels.pinned import snapshot_dir
 from localmodels.process import LocalModelsError, ServerSpec, resolve_llama_server_bin
 from localmodels.pull import _default_hub_cache
+from localmodels.retune import TUNE_LIMIT_S
 from localmodels.serving.protocol import ResultMessage
 from localmodels.serving.tune import Agreement, hardware_key, text_agreement
 from localmodels.settings import (
@@ -135,10 +136,10 @@ CHECK_TIMEOUT_FACTOR: Final = 2.0
 CHECK_TIMEOUT_MIN_S: Final = 60.0
 
 # time (design 5.4, 6.7)
-SOFT_LIMIT_S: Final = 780.0  # no step starts that would end past it; owner 2026-10-23 (D8)
-HARD_LIMIT_S: Final = (
-    840.0  # no step runs past it: `timeout --kill-after=30 900`, less 30 s to finish and write
-)
+# both limits follow the job's ceiling, ``retune.TUNE_LIMIT_S`` (D19): set the time there, nowhere else
+STOP_MARGIN_S: Final = 60.0
+HARD_LIMIT_S: Final = TUNE_LIMIT_S - STOP_MARGIN_S  # no step runs past it: to stop and write before SIGTERM
+SOFT_LIMIT_S: Final = HARD_LIMIT_S - STOP_MARGIN_S  # no step starts that would end past it
 BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
 OUT_OF_TIME: Final = "not measured: out of time"  # a step the hard limit cut short

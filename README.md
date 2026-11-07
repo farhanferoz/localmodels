@@ -199,7 +199,7 @@ passed, and writes `record.json` and its measurements to `--run-dir` (a local fo
 16 GiB while it runs; the vocabulary is not read, so 16 GiB covers models up to about 299k tokens). `--draft-file NAME` names the file
 `draft-mtp` (a model whose head is a separate file, as Flash-Next's) or `draft-simple` loads with `-md`, in the Hub cache snapshot of
 `--repository` at `--revision` (or of `--draft-repository` at `--draft-revision`); `--alternative FILE[,FILE...]` names a quantised file
-set of the same repository and revision. The soft limit stops new candidates; a hard limit of 840 s stops every step, and a tune that
+set of the same repository and revision. The soft limit (2,280 s) stops new candidates; a hard limit of 2,340 s stops every step, both a fixed margin under the job's 40-minute ceiling (D19), and a tune that
 is stopped or that measured nothing but the reference leaves its measurements in `record.json` and adopts nothing. The teacher-forced
 text is llama.cpp's own `docs/*.md` (MIT), shipped as `localmodels/data/kl-text.txt`. The quality
 command gets the live server in `LLAMA_TUNE_SERVER_URL` and the file in `LLAMA_TUNE_MODEL_FILE`, and ends by printing
@@ -207,7 +207,7 @@ command gets the live server in `LLAMA_TUNE_SERVER_URL` and the file in `LLAMA_T
 
 A lookup that is given a `recipe=TuneRecipe(...)` and finds a tune due (a first use, or a stale record) queues one slurm
 job per model and change by running slurm's `submit.py` (`$LOCALMODELS_SUBMIT`, default
-`~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the recipe's `command` is the project's own installed
+`~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 40 minutes each (D19); the recipe's `command` is the project's own installed
 command (for example `<repo>/.venv/bin/<tool> tune`), never `uv run`, which syncs the environment first and can remove
 packages installed outside the lock (it removed a CUDA PyTorch build in one project); the answer's `tune` and
 `tune_detail` say what happened (`queued`, `already-queued`, `waiting`, `failed-before`, `measured-not-adopted`, ...). Until the

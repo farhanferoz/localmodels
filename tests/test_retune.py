@@ -177,7 +177,7 @@ def test_two_lookups_at_once_queue_one_job_with_the_exact_call(
             "--workdir", str(tmp_path),
             "--log", str(settings.settings_dir() / "tune-logs" / f"{change}.log"),
             "--",
-            "timeout", "--kill-after=30", "900",
+            "timeout", "--kill-after=30", "2400",
             "env", "LOCALMODELS_TUNING=1", f"LOCALMODELS_TUNE_CHANGE={change}",
             "python", "tune.py", "--fast",
         ]
