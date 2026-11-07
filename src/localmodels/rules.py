@@ -11,7 +11,6 @@ is never rewritten by a job.
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from enum import StrEnum
@@ -19,9 +18,9 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
-from .atomic import write_text_atomically
+from .atomic import read_model, write_model
 from .digest import DEFAULT_OUT_DIR as DEFAULT_DIGEST_DIR
 from .digest import LINE_RE
 from .enums import WorkloadKind
@@ -186,10 +185,10 @@ def stale_rules(text: str, current: Mapping[str, str]) -> list[str]:
 
 
 def state_dir() -> Path:
-    """The state directory: ``$LOCALMODELS_STATE_DIR``, else ``~/.local/state/localmodels``."""
-    from .settings import DEFAULT_STATE_DIR, STATE_DIR_ENV  # noqa: PLC0415 - settings imports this module
+    """The state directory, as ``settings.state_dir`` defines it (``$LOCALMODELS_STATE_DIR``)."""
+    from .settings import state_dir as settings_state_dir  # noqa: PLC0415 - settings imports this module
 
-    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser()
+    return settings_state_dir()
 
 
 def records_dir() -> Path:
@@ -199,10 +198,7 @@ def records_dir() -> Path:
 
 def read_record(kind: str) -> RuleRecord | None:
     """The newest record of ``kind``; None when there is none or it cannot be read."""
-    try:
-        return RuleRecord.model_validate_json((records_dir() / f"{kind}.json").read_text(encoding="utf-8"))
-    except (OSError, ValidationError):
-        return None
+    return read_model(records_dir() / f"{kind}.json", RuleRecord)
 
 
 def _moved(figures: Mapping[str, float], previous: Mapping[str, float]) -> list[str]:
@@ -221,7 +217,7 @@ def write_record(record: RuleRecord) -> RuleRecord:
         record = record.model_copy(
             update={"previous": before.figures, "moved": _moved(record.figures, before.figures)}
         )
-    write_text_atomically(records_dir() / f"{record.kind}.json", record.model_dump_json(indent=2) + "\n")
+    write_model(records_dir() / f"{record.kind}.json", record)
     return record
 
 

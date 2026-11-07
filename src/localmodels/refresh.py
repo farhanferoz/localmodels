@@ -30,21 +30,21 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from . import rules
-from .atomic import write_text_atomically
+from .atomic import read_model, write_model
 from .enums import WorkloadKind
 from .lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
 from .llama_builds import (
     COMPARISON_FILE,
     REFERENCE_BUILD,
     REPO_URL,
-    build_folders,
     builds_dir,
     compile_commit,
     current_commit,
     current_server,
+    folder_for,
     llama_home,
     prune_builds,
     server_binary,
@@ -74,7 +74,6 @@ RUN_ID_FORMAT: Final = "%Y-%m-%dT%H%M"
 _RUN_ID = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}$")
 PROJECT: Final = "localmodels"  # the slurm project of both jobs
 LEASE_PROJECT: Final = "localmodels-refresh"  # the name on the quiet request
-DATE_LENGTH: Final = 10  # "YYYY-MM-DD", the front of a run id or an ISO 8601 time
 JOB_PLACEHOLDER: Final = "<build job id>"  # what a dry run shows for the id of a job it did not submit
 LS_REMOTE_TIMEOUT_S: Final = 60
 
@@ -104,6 +103,9 @@ K3_MAX_KL: Final = 1e-4
 K3_MIN_TOP: Final = 0.999
 KL_CHUNKS: Final = 40  # of 512 tokens: about 5 GB for the base file at a 248k vocabulary (design 2.3)
 KL_CONTEXT: Final = 512
+COMPARISON_STEP: Final = "cmp-"  # the front of every step name that belongs to the comparison
+STEP_OK: Final = "ok"
+NOT_MEASURED: Final = "not measured: "  # the front of a step's outcome when it did not measure
 
 #: K1's figures: prompt and generation speed of the small model, then of the production model.
 K1_FIGURES: Final = ("small_pp512", "small_pp2048", "small_tg128", "prod_pp512", "prod_tg128")
@@ -191,15 +193,12 @@ class RefreshState(BaseModel):
 
 def read_state() -> RefreshState:
     """The state file; an empty state when there is none or it cannot be read."""
-    try:
-        return RefreshState.model_validate_json(state_path().read_text(encoding="utf-8"))
-    except (OSError, ValidationError):
-        return RefreshState()
+    return read_model(state_path(), RefreshState) or RefreshState()
 
 
 def write_state(state: RefreshState) -> None:
     """Store ``state`` atomically."""
-    write_text_atomically(state_path(), state.model_dump_json(indent=2) + "\n")
+    write_model(state_path(), state)
 
 
 class JobRecord(BaseModel):
@@ -279,13 +278,6 @@ class RunView(NamedTuple):
     result: MeasureResult | None
 
 
-def _read_model[T: BaseModel](path: Path, model: type[T]) -> T | None:
-    try:
-        return model.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, ValidationError):
-        return None
-
-
 def newest_run(root: Path | None = None) -> Path | None:
     """The newest run folder under ``root`` (default ``refresh_dir()``); None when there is none."""
     root = refresh_dir() if root is None else root
@@ -302,9 +294,9 @@ def newest_view(root: Path | None = None) -> RunView | None:
         return None
     return RunView(
         folder,
-        _read_model(folder / RUN_FILE, RunRecord),
-        _read_model(folder / BUILD_FILE, BuildResult),
-        _read_model(folder / RESULT_FILE, MeasureResult),
+        read_model(folder / RUN_FILE, RunRecord),
+        read_model(folder / BUILD_FILE, BuildResult),
+        read_model(folder / RESULT_FILE, MeasureResult),
     )
 
 
@@ -329,7 +321,7 @@ def _comparison_line(day: str, tag: str, view: RunView) -> str | None:
 
 def headline(view: RunView) -> str:
     """One line on what the run did with its candidate (the digest's line and the first line of `status`)."""
-    day = view.folder.name[:DATE_LENGTH]
+    day = view.folder.name[: rules.DATE_LENGTH]
     run, build, result = view.run, view.build, view.result
     if run is not None and run.skipped:
         return f"refresh {day}: skipped, {run.skipped}"
@@ -433,9 +425,15 @@ def live_refresh_jobs() -> list[str]:
     return sorted(job for job, name in jobs.items() if name.startswith(f"{PROJECT}:") and "refresh-" in name)
 
 
-def _job_command() -> list[str]:
-    """The program a job runs: this interpreter with ``-m localmodels``, so the job runs this checkout."""
-    return [sys.executable, "-m", "localmodels"]
+def _refresh_command(home: str | None, command: str) -> list[str]:
+    """This interpreter running ``localmodels refresh [--home H] <command>``, so a job runs this checkout."""
+    return [sys.executable, "-m", "localmodels", "refresh", *(["--home", home] if home else []), command]
+
+
+def _measure_command(home: str | None, run: Path) -> list[str]:
+    """``refresh measure`` under ``timeout``, the hard stop of the whole measurement."""
+    measure = [*_refresh_command(home, "measure"), "--run", str(run)]
+    return ["timeout", f"--kill-after={KILL_AFTER_S}", str(MEASURE_LIMIT_S), *measure]
 
 
 def _submit(
@@ -469,33 +467,31 @@ def build_argv(script: Path, run: Path, tag: str, home: str | None) -> list[str]
         "--mem",
         BUILD_MEM,
     ]
-    command = [*_job_command(), "refresh", *(["--home", home] if home else []), "build"]
+    what = f"llama.cpp {tag} candidate build (refresh {run.name})"
     return _submit(
-        script, run, JobName.BUILD, f"llama.cpp {tag} candidate build (refresh {run.name})", flags,
-        [*command, "--run", str(run), "--commit", tag],
-    )  # fmt: skip
+        script,
+        run,
+        JobName.BUILD,
+        what,
+        flags,
+        [*_refresh_command(home, "build"), "--run", str(run), "--commit", tag],
+    )
 
 
 def measure_argv(script: Path, run: Path, after: str | None, home: str | None) -> list[str]:
     """The ``submit.py`` call of the GPU measure job, chained after the build job when there is one."""
     flags = ["--class", "restart", "--gpu", "--mem", MEASURE_MEM, *(["--after", after] if after else [])]
-    command = [*_job_command(), "refresh", *(["--home", home] if home else []), "measure"]
-    return _submit(
-        script, run, JobName.MEASURE, f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name})",
-        flags,
-        ["timeout", f"--kill-after={KILL_AFTER_S}", str(MEASURE_LIMIT_S), *command, "--run", str(run)],
-    )  # fmt: skip
+    what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name})"
+    return _submit(script, run, JobName.MEASURE, what, flags, _measure_command(home, run))
 
 
 def urgent_argv(script: Path, run: Path, home: str | None) -> list[str]:
     """The ``urgent.py`` call (beside ``script``) of the GPU measure job, for ``run --urgent``."""
     flags = ["--time", URGENT_TIME, "--gpu", "--mem", MEASURE_MEM, "--wait"]
-    command = [*_job_command(), "refresh", *(["--home", home] if home else []), "measure"]
+    what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name}, urgent)"
     return _submit(
-        script.with_name(URGENT_SCRIPT), run, JobName.MEASURE,
-        f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name}, urgent)", flags,
-        ["timeout", f"--kill-after={KILL_AFTER_S}", str(MEASURE_LIMIT_S), *command, "--run", str(run)],
-    )  # fmt: skip
+        script.with_name(URGENT_SCRIPT), run, JobName.MEASURE, what, flags, _measure_command(home, run)
+    )
 
 
 def _run_urgent(argv: list[str]) -> tuple[str, str]:
@@ -516,15 +512,9 @@ def _run_urgent(argv: list[str]) -> tuple[str, str]:
 
 
 def built_folder(home: Path, commit: str) -> Path | None:
-    """The finished build of ``commit`` (its folder is named by a short form of it); None when none is."""
-    for folder in build_folders(home):
-        if commit.startswith(folder.name) and server_binary(folder).is_file():
-            return folder
-    return None
-
-
-def _write_run(run: Path, record: RunRecord) -> None:
-    write_text_atomically(run / RUN_FILE, record.model_dump_json(indent=2) + "\n")
+    """The finished build of ``commit``; None when it has no folder or no ``llama-server`` in it."""
+    folder = folder_for(home, commit)
+    return folder if folder is not None and server_binary(folder).is_file() else None
 
 
 def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Candidate | None, Path | None]:
@@ -545,7 +535,8 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
     keep = [state.previous_current or ""]
     if candidate is not None:
         record.candidate_tag, record.candidate_commit = candidate.tag, candidate.commit
-        keep += [folder.name for folder in build_folders(home) if candidate.commit.startswith(folder.name)]
+        folder = folder_for(home, candidate.commit)
+        keep += [folder.name] if folder is not None else []
     removed = prune_builds(home, keep=keep, dry_run=args.dry_run)
     record.removed_builds = [str(folder) for folder in removed]
     if args.dry_run:
@@ -570,42 +561,40 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
 def _submit_jobs(
     args: argparse.Namespace, script: Path, run: Path, record: RunRecord, candidate: Candidate | None
 ) -> bool:
-    """Submit the build job (when the candidate is not built yet), then the measure job; whether one failed.
+    """Submit the build job (a candidate not built yet), then the measure job; whether one failed.
 
     A candidate whose build is already finished gets its ``build.json`` written here instead of a build job.
     """
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
-    home = llama_home(args.home)
-    built = built_folder(home, candidate.commit) if candidate is not None else None
+    built = built_folder(llama_home(args.home), candidate.commit) if candidate is not None else None
     if candidate is not None and built is not None:
-        done = BuildResult(tag=candidate.tag, commit=built.name, ok=True, error="already built")
         if args.dry_run:
             sys.stdout.write(f"{candidate.tag} is already built in {built}: no build job\n")
         else:
-            run.mkdir(parents=True, exist_ok=True)
-            _write_json(run / BUILD_FILE, done)
+            done = BuildResult(tag=candidate.tag, commit=built.name, ok=True, error="already built")
+            write_model(run / BUILD_FILE, done)
     after: str | None = None
     failed = False
-    for name in (JobName.BUILD, JobName.MEASURE):
-        if name is JobName.BUILD and (candidate is None or built is not None):
-            continue
-        if name is JobName.BUILD:
-            argv = build_argv(script, run, record.candidate_tag, args.home)
-        elif args.urgent:
-            argv = urgent_argv(script, run, args.home)
-        else:
-            argv = measure_argv(script, run, after, args.home)
+
+    def submit(name: JobName, argv: list[str], how: Callable[[list[str]], tuple[str, str]]) -> None:
+        nonlocal after, failed
         if args.dry_run:
             sys.stdout.write(f"{shlex.join(argv)}\n")
             after = JOB_PLACEHOLDER
-            continue
-        submit = _run_urgent if args.urgent and name is JobName.MEASURE else retune._run_submit  # noqa: SLF001
-        job, why = submit(argv)
+            return
+        job, why = how(argv)
         record.jobs.append(JobRecord(name=name, argv=argv, job=job, error=why))
         failed |= bool(why)
         after = job or None
         sys.stdout.write(f"{name}: {'job ' + job if job else 'not submitted: ' + why}\n")
+
+    if candidate is not None and built is None:
+        submit(JobName.BUILD, build_argv(script, run, candidate.tag, args.home), retune._run_submit)  # noqa: SLF001
+    if args.urgent:
+        submit(JobName.MEASURE, urgent_argv(script, run, args.home), _run_urgent)
+    else:
+        submit(JobName.MEASURE, measure_argv(script, run, after, args.home), retune._run_submit)  # noqa: SLF001
     return failed
 
 
@@ -623,7 +612,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         failed = _submit_jobs(args, script, run, record, candidate)
     if not args.dry_run:
         run.mkdir(parents=True, exist_ok=True)
-        _write_run(run, record)
+        write_model(run / RUN_FILE, record)
     return EXIT_ERROR if failed else EXIT_OK
 
 
@@ -653,7 +642,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         result.error = str(exc)
     result.seconds = _seconds_since(started)
     try:
-        write_text_atomically(run / BUILD_FILE, result.model_dump_json(indent=2) + "\n")
+        write_model(run / BUILD_FILE, result)
     except OSError as exc:
         sys.stderr.write(f"cannot write {run / BUILD_FILE}: {exc}\n")
         return EXIT_ERROR
@@ -766,11 +755,43 @@ def judge_candidate(
 # measure: running the tools
 
 
+class SpeedRecipe(NamedTuple):
+    """llama-bench and llama-batched-bench on one model: their arguments and the figures each must print."""
+
+    model: Model
+    prefix: str  # of every figure's name: "small_" or "prod_"
+    bench: tuple[str, ...]
+    batched: tuple[str, ...]
+    bench_figures: tuple[str, ...]
+    batched_figures: tuple[str, ...]
+
+
+_SLOTS: Final = ",".join(map(str, SLOT_COUNTS))
+#: The comparison's figures on the small model (design 2.3 step 4, as cu_compare.sh).
+SMALL_SPEED: Final = SpeedRecipe(
+    SMALL_MODEL,
+    "small_",
+    ("-p", "512,2048", "-n", "128", "-fa", "1", "-r", "3", "-o", "json"),
+    ("-fa", "on", "-npp", "512", "-ntg", "32", "-npl", _SLOTS, "--output-format", "jsonl"),
+    _BENCH_NAMES,
+    _BATCHED_NAMES,
+)
+#: The production model's figures on the final current (design 2.3 step 7, as remeasure_k123.sh).
+PROD_SPEED: Final = SpeedRecipe(
+    PRODUCTION_MODEL,
+    "prod_",
+    ("-p", "512", "-n", "128", "-fa", "1", "-r", "3", "-o", "json"),
+    ("-fa", "on", "-c", "8192", "-npp", "256", "-ntg", "128", "-npl", _SLOTS, "--output-format", "jsonl"),
+    ("prod_pp512", "prod_tg128"),
+    tuple(f"prod_tg_at_{slots}" for slots in SLOT_COUNTS),
+)
+
+
 class Measurer:
     """Runs the llama.cpp tools of one measurement and records each step's outcome.
 
     A step that fails (timeout, non-zero exit, output that does not parse, a missing model) is recorded in
-    ``steps`` and ``failed``, never raised: the other steps continue.
+    ``steps`` as ``not measured: <why>``, never raised: the other steps continue.
     """
 
     def __init__(self, run: Path, home: Path, *, timeout_s: float = TOOL_TIMEOUT_S) -> None:
@@ -778,7 +799,6 @@ class Measurer:
         self.home = home
         self.timeout_s = timeout_s
         self.steps: dict[str, str] = {}
-        self.failed: dict[str, str] = {}
         self.base_ready = False
 
     @property
@@ -786,9 +806,17 @@ class Measurer:
         """The teacher-forced base file: about 5 GB, deleted when the measurement ends."""
         return self.run / KL_BASE_FILE
 
+    @property
+    def failed(self) -> dict[str, str]:
+        """Each step that did not measure, and why."""
+        return {
+            step: outcome.removeprefix(NOT_MEASURED)
+            for step, outcome in self.steps.items()
+            if outcome != STEP_OK
+        }
+
     def _fail(self, step: str, why: str) -> None:
-        self.steps[step] = f"not measured: {why}"
-        self.failed[step] = why
+        self.steps[step] = f"{NOT_MEASURED}{why}"
 
     def model(self, pin: Model) -> Path | None:
         """The model file in the Hub cache; None when it is not there."""
@@ -839,66 +867,25 @@ class Measurer:
         if missing := [name for name in required if name not in found]:
             self._fail(step, f"output lacks {', '.join(missing)}")
             return {}
-        self.steps[step] = "ok"
+        self.steps[step] = STEP_OK
         return found
 
-    def speed_round(self, bin_dir: Path, model: Path | None, step: str, filename: str) -> dict[str, float]:
-        """One round of the small model's nine figures on the build whose programs are in ``bin_dir``."""
-        names = {f"{step}-bench": Tool.BENCH, f"{step}-batched": Tool.BATCHED}
+    def speed(self, step: str, bin_dir: Path, recipe: SpeedRecipe) -> dict[str, float]:
+        """llama-bench, then llama-batched-bench, on the build whose programs are in ``bin_dir``."""
+        bench, batched = f"{step}-bench", f"{step}-batched"
+        model = self.model(recipe.model)
         if model is None:
-            for name in names:
-                self._fail(name, f"{filename} absent")
+            for name in (bench, batched):
+                self._fail(name, f"{recipe.model.filename} absent")
             return {}
-        bench = ["-p", "512,2048", "-n", "128", "-fa", "1", "-r", "3", "-o", "json"]
-        batched = ["-fa", "on", "-npp", "512", "-ntg", "32", "-npl", "1,4,16", "--output-format", "jsonl"]
         found = self.figures(
-            f"{step}-bench", [bin_dir / Tool.BENCH, "-m", model, *bench], parse_bench, "small_", _BENCH_NAMES
-        )
+            bench, [bin_dir / Tool.BENCH, "-m", model, *recipe.bench], parse_bench, recipe.prefix,
+            recipe.bench_figures,
+        )  # fmt: skip
         found |= self.figures(
-            f"{step}-batched",
-            [bin_dir / Tool.BATCHED, "-m", model, *batched],
-            parse_batched,
-            "small_",
-            _BATCHED_NAMES,
-        )
-        return found
-
-    def production(self, bin_dir: Path) -> dict[str, float]:
-        """The production model's figures on the final current (llama-bench, then llama-batched-bench)."""
-        model = self.model(PRODUCTION_MODEL)
-        if model is None:
-            for step in ("prod-bench", "prod-batched"):
-                self._fail(step, f"{PRODUCTION_MODEL.filename} absent")
-            return {}
-        bench = ["-p", "512", "-n", "128", "-fa", "1", "-r", "3", "-o", "json"]
-        batched = [
-            "-fa",
-            "on",
-            "-c",
-            "8192",
-            "-npp",
-            "256",
-            "-ntg",
-            "128",
-            "-npl",
-            "1,4,16",
-            "--output-format",
-            "jsonl",
-        ]
-        found = self.figures(
-            "prod-bench",
-            [bin_dir / Tool.BENCH, "-m", model, *bench],
-            parse_bench,
-            "prod_",
-            ("prod_pp512", "prod_tg128"),
-        )
-        found |= self.figures(
-            "prod-batched",
-            [bin_dir / Tool.BATCHED, "-m", model, *batched],
-            parse_batched,
-            "prod_",
-            [f"prod_tg_at_{slots}" for slots in SLOT_COUNTS],
-        )
+            batched, [bin_dir / Tool.BATCHED, "-m", model, *recipe.batched], parse_batched, recipe.prefix,
+            recipe.batched_figures,
+        )  # fmt: skip
         return found
 
     def k3_base(self, bin_dir: Path, step: str) -> None:
@@ -928,7 +915,7 @@ class Measurer:
         if not self.kld.is_file():
             self._fail(step, f"no {KL_BASE_FILE} was written")
             return
-        self.steps[step] = "ok"
+        self.steps[step] = STEP_OK
         self.base_ready = True
 
     def k3_against(self, bin_dir: Path, step: str) -> KlStats | None:
@@ -952,7 +939,7 @@ class Measurer:
         except ValueError as exc:
             self._fail(step, str(exc))
             return None
-        self.steps[step] = "ok"
+        self.steps[step] = STEP_OK
         return stats
 
 
@@ -1031,10 +1018,6 @@ def write_records(
     _record(WorkloadKind.K3, result, run, stamped(WorkloadKind.K3), k3, holds, detail)
 
 
-def _write_json(path: Path, model: BaseModel) -> None:
-    write_text_atomically(path, model.model_dump_json(indent=2) + "\n")
-
-
 def _bin(home: Path, arm: Arm, name: str | None) -> Path:
     """The programs of an arm: ``current``'s (the reference build when there is no link) or a build's."""
     return (
@@ -1042,69 +1025,78 @@ def _bin(home: Path, arm: Arm, name: str | None) -> Path:
     )
 
 
+def _compare(
+    run: Path,
+    home: Path,
+    result: MeasureResult,
+    m: Measurer,
+    tag: str,
+    candidate: str,
+    rounds: Mapping[Arm, Sequence[Mapping[str, float]]],
+) -> KlStats | None:
+    """K3 against current's logits, D13's verdict, the switch on a pass and the state; current's own repeat.
+
+    Fills ``result.comparison``, ``switched`` and ``switch_problem``; writes ``comparison.json`` into the
+    candidate's build folder and the run folder.
+    """
+    current_bin = _bin(home, Arm.CURRENT, None)
+    m.k3_base(current_bin, f"{COMPARISON_STEP}k3-base")
+    control = m.k3_against(current_bin, f"{COMPARISON_STEP}k3-control")
+    scored = m.k3_against(_bin(home, Arm.CANDIDATE, candidate), f"{COMPARISON_STEP}k3-candidate")
+    skipped = {step: why for step, why in m.failed.items() if step.startswith(COMPARISON_STEP)}
+    verdict = judge_candidate(rounds[Arm.CURRENT], rounds[Arm.CANDIDATE], control, scored, skipped)
+    before = current_commit(home)
+    comparison = Comparison(
+        **verdict.model_dump(),
+        baseline_commit=before or "reference",
+        measured_at=result.measured_at,
+        candidate_tag=tag,
+        slurm_job=result.slurm_job,
+        kl={
+            "control": control.model_dump() if control else None,
+            "candidate": scored.model_dump() if scored else None,
+        },
+    )
+    result.comparison = comparison
+    write_model(builds_dir(home) / candidate / COMPARISON_FILE, comparison)
+    write_model(run / COMPARISON_FILE, comparison)
+    state = read_state()
+    if comparison.passed:
+        problem = switch(home, candidate)
+        result.switched, result.switch_problem = problem is None, problem or ""
+        if result.switched:
+            state.previous_current = before
+    state.tried[candidate] = Tried(passed=comparison.passed, run=run.name)
+    write_state(state)
+    return control
+
+
 def run_measurement(run: Path, home: Path, result: MeasureResult, m: Measurer) -> None:
     """The measurement with the card already quiet (design 2.3, steps 3-9); fills ``result``."""
-    state = read_state()
-    build = _read_model(run / BUILD_FILE, BuildResult)
-    small = m.model(SMALL_MODEL)
-    before = current_commit(home)
+    build = read_model(run / BUILD_FILE, BuildResult)
     candidate = build.commit if build is not None and build.ok else None
     if candidate is not None and (
-        candidate == before or not server_binary(builds_dir(home) / candidate).is_file()
+        candidate == current_commit(home) or not server_binary(builds_dir(home) / candidate).is_file()
     ):
         candidate = None
-    rounds: dict[Arm, list[dict[str, float]]] = {Arm.CURRENT: [], Arm.CANDIDATE: []}
     arms = (Arm.CURRENT, Arm.CANDIDATE) if candidate else (Arm.CURRENT,)
-    for number in range(1, ROUNDS + 1):
+    prefix = COMPARISON_STEP if candidate else ""
+    rounds: dict[Arm, list[dict[str, float]]] = {Arm.CURRENT: [], Arm.CANDIDATE: []}
+    for number in range(1, ROUNDS + 1):  # the arms interleaved, as cu_compare.sh
         for arm in arms:
-            prefix = "cmp-" if candidate else ""
-            rounds[arm].append(
-                m.speed_round(
-                    _bin(home, arm, candidate), small, f"{prefix}r{number}-{arm}", SMALL_MODEL.filename
-                )
-            )
+            rounds[arm].append(m.speed(f"{prefix}r{number}-{arm}", _bin(home, arm, candidate), SMALL_SPEED))
 
-    control = repeat = None
-    switched = False
-    if candidate is not None and build is not None:
-        m.k3_base(_bin(home, Arm.CURRENT, None), "cmp-k3-base")
-        control = m.k3_against(_bin(home, Arm.CURRENT, None), "cmp-k3-control")
-        scored = m.k3_against(_bin(home, Arm.CANDIDATE, candidate), "cmp-k3-candidate")
-        skipped = {s: why for s, why in m.failed.items() if s.startswith("cmp-")}
-        verdict = judge_candidate(rounds[Arm.CURRENT], rounds[Arm.CANDIDATE], control, scored, skipped)
-        comparison = Comparison(
-            **verdict.model_dump(),
-            baseline_commit=before or "reference",
-            measured_at=result.measured_at,
-            candidate_tag=build.tag,
-            slurm_job=result.slurm_job,
-            kl={
-                "control": control.model_dump() if control else None,
-                "candidate": scored.model_dump() if scored else None,
-            },
-        )
-        result.comparison = comparison
-        _write_json(builds_dir(home) / candidate / COMPARISON_FILE, comparison)
-        _write_json(run / COMPARISON_FILE, comparison)
-        if comparison.passed:
-            problem = switch(home, candidate)
-            result.switched, result.switch_problem = problem is None, problem or ""
-            if result.switched:
-                state.previous_current = before
-        state.tried[candidate] = Tried(passed=comparison.passed, run=run.name)
-        write_state(state)
-        switched = result.switched
-        repeat = control
-    final_arm = Arm.CANDIDATE if switched else Arm.CURRENT
+    repeat = None
+    if candidate is not None and build is not None:  # build: for the type checker, it is set with candidate
+        repeat = _compare(run, home, result, m, build.tag, candidate, rounds)
     final_bin = _bin(home, Arm.CURRENT, None)  # the link, moved or not
     result.final_current = current_commit(home) or "reference"
-
-    if switched or candidate is None:
+    if result.switched or candidate is None:  # current's control run is no repeat of the new build
         m.k3_base(final_bin, "final-k3-base")
         repeat = m.k3_against(final_bin, "final-k3-repeat")
-    prod = m.production(final_bin)
-    stamp = rules.host_stamp(current_server(home))
-    write_records(result, run, stamp, _means(rounds[final_arm]), prod, repeat)
+    prod = m.speed("prod", final_bin, PROD_SPEED)
+    small = _means(rounds[Arm.CANDIDATE if result.switched else Arm.CURRENT])
+    write_records(result, run, rules.host_stamp(current_server(home)), small, prod, repeat)
 
 
 def cmd_measure(args: argparse.Namespace) -> int:
@@ -1140,8 +1132,8 @@ def cmd_measure(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGTERM, previous)
         measurer.kld.unlink(missing_ok=True)
         result.steps = measurer.steps
-        _write_json(run / RESULT_FILE, result)
-    sys.stdout.write(headline(RunView(run, None, _read_model(run / BUILD_FILE, BuildResult), result)) + "\n")
+        write_model(run / RESULT_FILE, result)
+    sys.stdout.write(headline(RunView(run, None, read_model(run / BUILD_FILE, BuildResult), result)) + "\n")
     return code
 
 
@@ -1166,7 +1158,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
         out.writelines(f"  {line}\n" for line in view.run.stale_rules)
     if view.result is not None:
         out.writelines(
-            f"  {step}: {outcome}\n" for step, outcome in view.result.steps.items() if outcome != "ok"
+            f"  {step}: {outcome}\n" for step, outcome in view.result.steps.items() if outcome != STEP_OK
         )
         if line := rules_line(view):
             out.write(f"  {line}\n")

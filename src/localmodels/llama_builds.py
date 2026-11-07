@@ -218,6 +218,11 @@ def build_folders(home: Path) -> list[Path]:
     return sorted(p for p in folder.iterdir() if p.is_dir() and not p.is_symlink())
 
 
+def folder_for(home: Path, commit: str) -> Path | None:
+    """The build folder of ``commit``: the one whose name (a short commit) starts it; None when none does."""
+    return next((folder for folder in build_folders(home) if commit.startswith(folder.name)), None)
+
+
 def named_by(commit: str, current: str | None, users: Mapping[str, str]) -> list[str]:
     """The projects that name ``commit`` (a longer hash of it counts) or follow ``current`` while it is."""
     return sorted(

@@ -355,6 +355,17 @@ def test_measure_records_a_step_that_failed_and_the_rule_that_no_longer_holds(wo
     assert "not measured" in k2.detail
     assert (world.run_dir / "r1-current-batched.err").read_text().strip() == "fake failure"
 
+    world.configure(
+        CURRENT, speed=1.0
+    )  # a comparison whose candidate cannot score: the verdict names the step
+    world.make_build(CANDIDATE, speed=1.0, fail=["llama-perplexity"])
+    world.build_done()
+    assert world.measure() == 0
+    comparison = world.result().comparison
+    assert comparison is not None
+    assert comparison.quality_failures == ["not measured: cmp-k3-candidate: exited 3"]
+    assert world.current() == CURRENT
+
 
 def test_measure_stops_when_the_card_does_not_go_quiet(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(*_args: object, **_kwargs: object) -> None:

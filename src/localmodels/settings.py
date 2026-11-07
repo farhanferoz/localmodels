@@ -377,9 +377,14 @@ class SettingsAnswer(BaseModel):
         return out
 
 
+def state_dir() -> Path:
+    """The state directory: ``$LOCALMODELS_STATE_DIR``, else ``~/.local/state/localmodels``."""
+    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser()
+
+
 def settings_dir() -> Path:
     """The store: ``$LOCALMODELS_STATE_DIR``/settings, else ``~/.local/state/localmodels/settings``."""
-    return Path(os.environ.get(STATE_DIR_ENV) or DEFAULT_STATE_DIR).expanduser() / "settings"
+    return state_dir() / "settings"
 
 
 @contextmanager

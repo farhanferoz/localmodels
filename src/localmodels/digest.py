@@ -126,8 +126,6 @@ class Source(StrEnum):
     D14 = "D14"
 
 
-#: Sources that read this host's files and never touch the network: they cannot fail with the network down.
-LOCAL_SOURCES = (Source.D14,)
 ALL_KINDS = tuple(WorkloadKind)
 LLAMA_KINDS = (WorkloadKind.K1, WorkloadKind.K2, WorkloadKind.K3)
 TORCH_KINDS = (
@@ -443,6 +441,7 @@ class SourceSpec:
     name: str
     kinds: tuple[WorkloadKind, ...]
     check: Callable[[Context], list[Finding]]
+    local: bool = False  # reads this host's files only, so it cannot fail with the network down
 
 
 SOURCES: dict[Source, SourceSpec] = {
@@ -459,7 +458,7 @@ SOURCES: dict[Source, SourceSpec] = {
     Source.D11: SourceSpec("awesome-dgx-spark", SERVING_KINDS, check_awesome),
     Source.D12: SourceSpec("model releases", MODEL_KINDS, check_models),
     Source.D13: SourceSpec("this host", ALL_KINDS, check_host),
-    Source.D14: SourceSpec("llama.cpp refresh", LLAMA_KINDS, check_refresh),
+    Source.D14: SourceSpec("llama.cpp refresh", LLAMA_KINDS, check_refresh, local=True),
 }
 
 
@@ -524,7 +523,7 @@ def run_digest(net: Net, out_dir: Path, now: datetime) -> int:
     write_text_atomically(out_dir / ".raw" / f"{day}.json", json.dumps(raw, indent=2) + "\n")
     write_text_atomically(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
     failed = sum(o.failed is not None for o in outcomes.values())
-    network = [o for s, o in outcomes.items() if s not in LOCAL_SOURCES]
+    network = [o for s, o in outcomes.items() if not SOURCES[s].local]
     findings = sum(len(o.findings) for o in outcomes.values())
     note = out_dir / f"{day}.md"
     print(f"digest {day}: {findings} findings, {failed} of {len(outcomes)} sources failed -> {note}")  # noqa: T201
