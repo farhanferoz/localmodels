@@ -227,6 +227,15 @@ check fails is listed under "Failed sources" and never stops the run; the exit c
 
 ## Development
 
+To make a commit refuse private-looking lines (private network addresses, tailnet host names, secret-shaped
+strings, and any of your own names listed one regular expression per line in `.private-patterns`, which git
+ignores), install the hook once:
+
+```
+printf '#!/bin/sh\nexec python3 tools/check_private.py --staged\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+
 ```
 uv sync
 uv run pytest -q

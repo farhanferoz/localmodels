@@ -61,6 +61,9 @@ ignore = [
 "src/localmodels/launcher.py" = ["PLR0913"]
 # The command line's job is to print: its output is the interface, not a leftover debug print.
 "src/localmodels/cli.py" = ["T201"]
+# The commit guard is a command-line tool run by the pre-commit hook: printing is its output, it runs `git` with
+# fixed arguments, and it lives in tools/ (not a package) so it runs without installing anything.
+"tools/check_private.py" = ["T201", "S603", "S607", "INP001"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["localmodels"]

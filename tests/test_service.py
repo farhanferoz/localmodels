@@ -115,9 +115,7 @@ async def test_run_serve_under_refuse_restarts_after_a_yield_once_the_other_leas
         outcome = next(outcomes)
         if outcome is SupervisorExit.YIELDED:
             yielded_at.append(time.monotonic())
-            other_path.write_text(
-                json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": 1})
-            )
+            other_path.write_text(json.dumps({"pid": os.getpid(), "project": "service_c", "requested_at": 1}))
             asyncio.get_running_loop().call_later(_OTHER_LEASE_HELD_S, other_path.unlink)
         return outcome
 

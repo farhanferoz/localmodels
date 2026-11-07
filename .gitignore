@@ -8,3 +8,7 @@ __pycache__/
 *.egg-info/
 dist/
 .env
+
+# Local to this machine, never committed: the decision log and the names the commit guard refuses.
+/DECISIONS.md
+/.private-patterns

@@ -52,9 +52,7 @@ HOST = {"driver": "580.1", "cuda": "13.0", "kernel": "6.17", "dgx_os": "7.6.0", 
 NEWER_DRIVER = {**HOST, "driver": "590.2"}
 QWEN = ModelIdentity(repository="Qwen/Qwen3-30B-A3B-GGUF", revision="c" * 40)  # K1's rule was measured on it
 FLASH = ModelIdentity(repository="Qwen/Qwen3.8-Flash-Next-GGUF", revision="d" * 40)  # K1's rule was not
-DETECTOR = ModelIdentity(
-    repository="service_c/machine-text-detector", revision="e" * 40
-)  # K6's rule was not
+DETECTOR = ModelIdentity(repository="service_c/machine-text-detector", revision="e" * 40)  # K6's rule was not
 MEDGEMMA = ModelIdentity(repository="google/medgemma-1.5-4b-it", revision="a" * 40)
 FP32 = Settings(dtype=Precision.FLOAT32)
 

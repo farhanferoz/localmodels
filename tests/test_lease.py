@@ -69,9 +69,7 @@ def test_live_others_purges_dead_pid_and_ignores_garbage_and_its_own_lease(tmp_p
     sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
     try:
         live_path = tmp_path / "service_c.json"
-        live_path.write_text(
-            json.dumps({"pid": sub.pid, "project": "service_c", "requested_at": 1700000000})
-        )
+        live_path.write_text(json.dumps({"pid": sub.pid, "project": "service_c", "requested_at": 1700000000}))
 
         others = lease.live_others()
         assert len(others) == 1
