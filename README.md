@@ -222,8 +222,24 @@ playbooks, Spark Arena, new models, and this host's driver, kernel and DGX OS) w
 language model. It writes `DIR/<date>.md` (default `DIR` is `~/cache/localmodels/digests`), the raw findings in
 `DIR/.raw/<date>.json`, and `DIR/.state.json` (what the next run compares with). A finding line reads
 `- [K1,K2] D1 llama.cpp: <finding> (<link>)`, tagged with the workload kinds the source touches. A source whose
-check fails is listed under "Failed sources" and never stops the run; the exit code is 1 only if every source failed.
+check fails is listed under "Failed sources" and never stops the run; the exit code is 1 only if every network source failed. A fourteenth, local source (D14) adds the newest `localmodels refresh` run.
 `deploy/localmodels-digest.timer` runs it on the 1st of each month at 07:00 (install steps in the `.service` file).
+
+## Monthly llama.cpp refresh
+
+`localmodels refresh run [--dry-run] [--retry] [--force-measure]` takes seconds, runs nothing on the GPU and only
+submits slurm jobs: a CPU job that builds the newest llama.cpp release when `current` is not it and it was never
+compared, and a GPU job that compares that build with `current`, switches to it only when the comparison passes
+(speed no slower than the larger of 2 % and the baseline's own spread, K3's KL limits, nothing unmeasured), and
+re-measures rules K1-K3 on whichever build is `current` at its end. The records land in
+`$LOCALMODELS_STATE_DIR/rules/<K>.json`, so `localmodels rules check` exits 0 once every changed stamp has a holding
+record or a stated reason (K5, K6, K8 and K9 are not re-measured here); `rules.md` itself is never rewritten by a job.
+Builds that are not `current`, the previous `current` or named in `users.toml` are removed on each run. The previous
+`current` stays for a rollback: `localmodels llama switch <previous>`.
+
+`localmodels refresh status` prints the newest run, kept in `~/cache/localmodels/refresh/<run>/`
+(`$LOCALMODELS_REFRESH_DIR` overrides it). `deploy/localmodels-refresh.timer` runs `refresh run` on the 1st of each
+month at 09:00, two hours after the digest (install steps in the `.service` file).
 
 ## Development
 
