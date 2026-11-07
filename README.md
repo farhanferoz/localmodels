@@ -207,7 +207,9 @@ command gets the live server in `LLAMA_TUNE_SERVER_URL` and the file in `LLAMA_T
 
 A lookup that is given a `recipe=TuneRecipe(...)` and finds a tune due (a first use, or a stale record) queues one slurm
 job per model and change by running slurm's `submit.py` (`$LOCALMODELS_SUBMIT`, default
-`~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the answer's `tune` and
+`~/dev/turing/preflight/slurm/submit.py`), at most two at a time, under 15 minutes each; the recipe's `command` is the project's own installed
+command (for example `<repo>/.venv/bin/<tool> tune`), never `uv run`, which syncs the environment first and can remove
+packages installed outside the lock (it removed a CUDA PyTorch build in one project); the answer's `tune` and
 `tune_detail` say what happened (`queued`, `already-queued`, `waiting`, `failed-before`, `measured-not-adopted`, ...). Until the
 job adopts a record the model runs on its current settings. `retune=RetunePolicy.OFF` (per call) or `LOCALMODELS_RETUNE=off`
 (per process; any value but `on` counts as off) turns it off. Under pytest it is off by default (`tune: disabled`, nothing created), so a test suite that loads
@@ -227,7 +229,7 @@ check fails is listed under "Failed sources" and never stops the run; the exit c
 
 ## Monthly llama.cpp refresh
 
-`localmodels refresh run [--dry-run] [--retry] [--force-measure]` takes seconds, runs nothing on the GPU and only
+`localmodels refresh run [--dry-run] [--retry] [--force-measure] [--candidate TAG] [--urgent]` takes seconds, runs nothing on the GPU and only
 submits slurm jobs: a CPU job that builds the newest llama.cpp release when `current` is not it and it was never
 compared, and a GPU job that compares that build with `current`, switches to it only when the comparison passes
 (speed no slower than the larger of 2 % and the baseline's own spread, K3's KL limits, nothing unmeasured), and
@@ -236,6 +238,9 @@ re-measures rules K1-K3 on whichever build is `current` at its end. The records 
 record or a stated reason (K5, K6, K8 and K9 are not re-measured here); `rules.md` itself is never rewritten by a job.
 Builds that are not `current`, the previous `current` or named in `users.toml` are removed on each run. The previous
 `current` stays for a rollback: `localmodels llama switch <previous>`.
+A candidate already built (for example by `localmodels llama build --commit <tag>` ahead of the run) is measured
+without a build job. `--candidate TAG` compares that release instead of the newest; `--urgent` sends the measure
+job through slurm's `urgent.py`, which pauses what can be paused in its way, and needs the candidate built first.
 
 `localmodels refresh status` prints the newest run, kept in `~/cache/localmodels/refresh/<run>/`
 (`$LOCALMODELS_REFRESH_DIR` overrides it). `deploy/localmodels-refresh.timer` runs `refresh run` on the 1st of each
