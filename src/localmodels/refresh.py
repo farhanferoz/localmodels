@@ -17,6 +17,7 @@ Nothing here runs a llama.cpp program except ``measure``, which holds the GPU le
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -89,6 +90,9 @@ URGENT_SCRIPT: Final = "urgent.py"
 URGENT_TIME: Final = "0:30:00"  # slurm's limit: the 1200 s measurement, the quiet card's wait and a margin
 URGENT_TIMEOUT_S: Final = 300  # for urgent.py itself, which looks at what is in the way before submitting
 _URGENT_JOB = re.compile(r"\[urgent\] job (\d+) submitted")
+#: slurm's pending reason for a job whose ``--after`` job did not end cleanly: it can never start, and this
+#: slurm does not cancel such jobs by itself (SchedulerParameters has no kill_invalid_depend).
+DEAD_DEPENDENCY: Final = "DependencyNeverSatisfied"
 TOOL_TIMEOUT_S: Final = 300.0  # design 2.3: each tool run has its own
 SIGTERM_EXIT: Final = 128 + signal.SIGTERM
 
@@ -220,6 +224,8 @@ class RunRecord(BaseModel):
     no_candidate: str = ""  # why there is no candidate
     stale_rules: list[str] = Field(default_factory=list)
     removed_builds: list[str] = Field(default_factory=list)
+    cancelled: list[str] = Field(default_factory=list)  # refresh jobs that could never start, cancelled
+    queued: list[str] = Field(default_factory=list)  # live refresh jobs that made this run skip
     jobs: list[JobRecord] = Field(default_factory=list)
 
 
@@ -417,12 +423,46 @@ def candidate_for(
     return found, ""
 
 
-def live_refresh_jobs() -> list[str]:
-    """The ids of unfinished slurm jobs of this project's refresh; none when slurm cannot say."""
+def _refresh_queue() -> list[tuple[str, str]] | None:
+    """Each unfinished refresh job of this project as (id, slurm's reason); None when squeue could not say."""
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
-    jobs = retune._squeue() or {}  # noqa: SLF001 - the one squeue wrapper of the package
-    return sorted(job for job, name in jobs.items() if name.startswith(f"{PROJECT}:") and "refresh-" in name)
+    done = retune._run(["squeue", "-h", "-o", "%i|%j|%r", "--states", retune._UNFINISHED])  # noqa: SLF001
+    if done is None or done.returncode:
+        return None
+    rows = [line.split("|", 2) for line in done.stdout.splitlines() if line.count("|") >= 2]  # noqa: PLR2004
+    return sorted(
+        (job, reason.strip())
+        for job, name, reason in rows
+        if name.startswith(f"{PROJECT}:") and "refresh-" in name
+    )
+
+
+def _scancel(job: str) -> str:
+    """Cancel one of the refresh's own jobs; "" when slurm took it, else why not."""
+    try:
+        done = subprocess.run(  # noqa: S603
+            ["scancel", job],  # noqa: S607
+            capture_output=True, text=True, errors="replace", timeout=LS_REMOTE_TIMEOUT_S, check=False,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    return done.stderr.strip() or f"scancel exited {done.returncode}" if done.returncode else ""
+
+
+def live_refresh_jobs(record: RunRecord, *, dry_run: bool) -> list[str] | None:
+    """The refresh jobs still queued or running; None when slurm cannot say.
+
+    A job that waits on a build job that did not end cleanly can never start; it is cancelled here (and
+    listed in ``record.cancelled``) so that it does not hold every later run back.
+    """
+    queue = _refresh_queue()
+    if queue is None:
+        return None
+    for job in (job for job, reason in queue if reason == DEAD_DEPENDENCY):
+        why = "" if dry_run else _scancel(job)
+        record.cancelled.append(f"{job}{': ' + why if why else ''}")
+    return [job for job, reason in queue if reason != DEAD_DEPENDENCY]
 
 
 def _refresh_command(home: str | None, command: str) -> list[str]:
@@ -525,8 +565,18 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
     """
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
-    if live := live_refresh_jobs():
-        record.skipped = f"{', '.join(live)} still queued"
+    live = live_refresh_jobs(record, dry_run=args.dry_run)
+    if live is None:
+        record.skipped = "squeue did not answer, so whether a refresh job is still queued is unknown"
+        return None, None
+    if live:
+        record.skipped, record.queued = f"{', '.join(live)} still queued", live
+        return None, None
+    if state_path().exists() and read_model(state_path(), RefreshState) is None:
+        record.skipped = (
+            f"{state_path()} cannot be read: repair or remove it (it names the rollback build, which a run "
+            "would otherwise remove, and the candidates already compared)"
+        )
         return None, None
     state = read_state()
     candidate, record.no_candidate = candidate_for(
@@ -610,7 +660,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         failed = record.skipped.startswith("--urgent")  # asked for and not done: say so in the exit code
     else:
         failed = _submit_jobs(args, script, run, record, candidate)
-    if not args.dry_run:
+    if not args.dry_run and not record.queued:  # a run still in progress keeps its folder the newest
         run.mkdir(parents=True, exist_ok=True)
         write_model(run / RUN_FILE, record)
     return EXIT_ERROR if failed else EXIT_OK
@@ -728,7 +778,7 @@ def judge_candidate(
         slower = (mean - statistics.fmean(cand)) / mean
         slowdowns.append(slower)
         tolerance = max(MIN_SLOWDOWN, (max(base) - min(base)) / min(base))
-        if slower > tolerance:
+        if math.isnan(slower) or slower > tolerance:  # a NaN figure is no measurement
             speed.append(f"{name} {_percent(slower)} slower than baseline (limit {_percent(tolerance)})")
     if control is None or scored is None:
         if not any(step.startswith("cmp-k3") for step in skipped):
@@ -1061,12 +1111,14 @@ def _compare(
     write_model(builds_dir(home) / candidate / COMPARISON_FILE, comparison)
     write_model(run / COMPARISON_FILE, comparison)
     state = read_state()
+    state.tried[candidate] = Tried(passed=comparison.passed, run=run.name)
     if comparison.passed:
+        kept, state.previous_current = state.previous_current, before
+        write_state(state)  # before the link moves: a run stopped in between still knows the rollback build
         problem = switch(home, candidate)
         result.switched, result.switch_problem = problem is None, problem or ""
-        if result.switched:
-            state.previous_current = before
-    state.tried[candidate] = Tried(passed=comparison.passed, run=run.name)
+        if not result.switched:
+            state.previous_current = kept
     write_state(state)
     return control
 

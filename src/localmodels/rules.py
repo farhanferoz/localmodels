@@ -133,7 +133,8 @@ def cmd_rules_show(args: argparse.Namespace) -> int:
             f"\nRe-measured {record.measured_at[:DATE_LENGTH]} (slurm {record.slurm_job}, "
             f"llama.cpp {stamp.get(StampKey.LLAMA_CPP, 'unknown')}, "
             f"driver {stamp.get('driver', 'unknown')}): "
-            f"{figures_text(record.figures)}\n"
+            f"{figures_text(record.figures)}"
+            f"{'' if record.holds else f'; does not hold: {record.detail}'}\n"
         )
     digest = digest_lines(kind, Path(args.digests))
     if digest is not None:

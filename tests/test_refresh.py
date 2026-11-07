@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from localmodels import digest, refresh, retune, rules
+from localmodels import digest, refresh, rules
 from localmodels.cli import main
 from localmodels.digest import Context
 from localmodels.llama_tune import KlStats
@@ -65,6 +65,8 @@ def test_verdict_applies_the_speed_tolerance_the_kl_limits_and_fails_what_was_no
     missing = refresh.judge_candidate(base, cand, None, None, {"cmp-k3-control": "exited 3"})
     assert missing.quality_failures == ["not measured: cmp-k3-control: exited 3"]
     assert not refresh.judge_candidate(base, cand[:1], SAME, OCTOBER, {}).passed  # a missing round
+    base, cand = _rounds(c_small_tg128=[float("nan"), float("nan")])
+    assert not refresh.judge_candidate(base, cand, SAME, OCTOBER, {}).passed  # NaN is no measurement
 
 
 def test_newest_tag_prefers_the_peeled_line_and_ignores_other_tags() -> None:
@@ -98,7 +100,9 @@ class World:
         monkeypatch.setenv("HF_HUB_CACHE", str(root / "hub"))
         monkeypatch.setattr(refresh, "DEFAULT_LEASE_DIR", root / "lease")
         monkeypatch.setattr(rules, "host_stamp", lambda _binary: HOST.copy())
-        monkeypatch.setattr(retune, "_squeue", dict)
+        self.cancelled: list[str] = []
+        monkeypatch.setattr(refresh, "_refresh_queue", list)
+        monkeypatch.setattr(refresh, "_scancel", lambda job: self.cancelled.append(job) or "")
         monkeypatch.setattr(refresh, "_ls_remote", lambda: TAGS)
         from localmodels.pinned import snapshot_dir  # noqa: PLC0415
 
@@ -143,7 +147,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     return World(tmp_path, monkeypatch)
 
 
-def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(
+def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(  # noqa: PLR0915 - one run after another
     world: World, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world.make_build("aaaaaaaaa")  # not current, not previous, not named: removed
@@ -176,11 +180,23 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(
     assert record.removed_builds == [str(world.home / "builds" / "aaaaaaaaa")]
 
     world.submitted.unlink()
-    world.patch.setattr(retune, "_squeue", lambda: {"900": "localmodels:resume:refresh-build"})
+    world.patch.setattr(refresh, "_refresh_queue", lambda: [("900", "None")])
     assert main(args) == 0
     assert not world.submitted.exists()
     assert "900 still queued" in capsys.readouterr().out
-    world.patch.setattr(retune, "_squeue", dict)
+    kept = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
+    assert (kept.skipped, len(kept.jobs)) == ("", 2)  # a skipped run writes nothing over the run in progress
+    world.patch.setattr(refresh, "_refresh_queue", lambda: None)
+    assert main(args) == 0
+    assert "squeue did not answer" in capsys.readouterr().out
+    assert not world.submitted.exists()
+    refresh.state_path().write_text("{not json")
+    world.patch.setattr(refresh, "_refresh_queue", list)
+    assert main(args) == 0
+    assert "cannot be read" in capsys.readouterr().out
+    assert not world.submitted.exists()
+    refresh.state_path().unlink()
+    world.patch.setattr(refresh, "_refresh_queue", lambda: [("901", "DependencyNeverSatisfied")])
 
     world.patch.setattr(refresh, "_ls_remote", lambda: f"{CURRENT}{'0' * 31}\trefs/tags/b13")
     for kind in refresh.REMEASURED_KINDS:  # answered: a holding record on this stack
@@ -192,6 +208,7 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due(
     assert main(args) == 0
     assert not world.submitted.exists()
     assert "nothing to do" in capsys.readouterr().out
+    assert world.cancelled == ["901"]  # it waited on a build job that died: it could never start
 
 
 def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(

@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -41,7 +41,7 @@ def read_model[T: BaseModel](path: Path, model: type[T]) -> T | None:
     """The ``model`` stored at ``path``; None when the file is missing, unreadable or does not validate."""
     try:
         return model.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, ValidationError):
+    except (OSError, ValueError):  # ValueError: bytes that are not UTF-8, and pydantic's ValidationError
         return None
 
 

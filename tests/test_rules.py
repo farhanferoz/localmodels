@@ -106,6 +106,8 @@ def test_check_answers_a_changed_stamp_by_a_record_or_a_reason_and_exits_1_only_
     rules.write_record(_record("K1", holds=False))  # a record that does not hold is no answer
     assert main(args) == 1
     assert "K1: re-measured 2026-11-01: does not hold: mean KL 0.01 above 1e-4" in capsys.readouterr().out
+    assert main(["rules", "show", "K1"]) == 0
+    assert "; does not hold: mean KL 0.01 above 1e-4" in capsys.readouterr().out
     rules.write_record(_record("K1", holds=True, figures={"small_tg128": 80.0}))  # moved 23 % from 65
     assert main(args) == 0  # a holding record and a reason remain
     out = capsys.readouterr().out
@@ -115,3 +117,5 @@ def test_check_answers_a_changed_stamp_by_a_record_or_a_reason_and_exits_1_only_
     assert "Re-measured 2026-11-01 (slurm 77, llama.cpp abc1234, driver 590.2): small_tg128=80" in (
         capsys.readouterr().out
     )
+    (rules.records_dir() / "K1.json").write_bytes(b"\xff\xfe not utf-8")  # unreadable: no record, no crash
+    assert rules.read_record("K1") is None
