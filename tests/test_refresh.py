@@ -205,8 +205,11 @@ def test_build_exits_zero_when_a_step_fails_and_says_so_in_build_json(
             '[ "$1" = clone ] && exit "${GIT_FAIL:-0}"; [ "$3" = rev-parse ] && echo abc1234; exit 0'
         )
     )
-    (tools / "cmake").write_text(
-        script.format('mkdir -p "$4/bin"; [ -n "$CMAKE_FAIL" ] && exit 1; touch "$4/bin/llama-server"')
+    (tools / "cmake").write_text(  # configure is `-S src -B build ...`, compile is `--build build ...`
+        script.format(
+            '[ "$1" = -S ] && mkdir -p "$4/bin"; [ -n "$CMAKE_FAIL" ] && exit 1; '
+            '[ "$1" = --build ] && touch "$2/bin/llama-server"; exit 0'
+        )
     )
     for tool in tools.iterdir():
         tool.chmod(0o755)
