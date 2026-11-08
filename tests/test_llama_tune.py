@@ -619,8 +619,8 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     assert arm.acceptance == pytest.approx(0.6)  # the warm-up's line is left out
     assert arm.peak_gib == pytest.approx((4468 + 2048) / 1024)  # the largest sample, not the last
     # a GPU with its own memory: the host side is not added
-    tune._unified, peaks = False, []
-    sampler = asyncio.create_task(tune._sample(4242, peaks))
+    tune._unified, peaks, lows = False, [], []
+    sampler = asyncio.create_task(tune._sample(4242, peaks, lows))
     await asyncio.sleep(0.12)
     sampler.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -638,6 +638,18 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     assert started["argv"][started["argv"].index("--spec-draft-model") + 1] == str(head)  # the head file
     assert not _is_pid_alive(started["pid"])  # stopped when its arm ended
     assert arm.stop_s is not None
+
+    # the fall in available memory while it ran counts when larger: in slurm 2187 the process's own figure
+    # missed at least 3.1 GiB of what the server took
+    readings = iter([14.0, 3.0])  # before the start, then at every sample
+
+    def falling(_device: str) -> AvailableMemory:
+        gib = next(readings, 3.0)
+        return AvailableMemory(bytes=int(gib * GIB), device=DeviceType.CUDA, unified=True, source="test")
+
+    monkeypatch.setattr(llama_tune, "available_memory", falling)
+    fell = await tune._serve(Settings(), tune.spec.reference, checked=False)
+    assert fell.peak_gib == pytest.approx(11.0)
 
 
 async def test_no_step_runs_past_the_hard_limit(tmp_path: Path, fake_bin: Path) -> None:
@@ -778,13 +790,15 @@ async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> N
     # the restart and llama-bench then loaded the same model; the host ran out of memory and rebooted
     script = arm_script()
     script["reference"] = {**script["reference"], "peak_gib": 91.4}  # 91.4 + 10 kept free > 100 GiB
-    tune, record = await measured(tmp_path, script, speculation=MTP_ONLY)
+    tune = FakeTune(make_spec(tmp_path, speculation=MTP_ONLY), script)
+    tune._free_gib = lambda: 104.5  # type: ignore[method-assign]  # more free once it stopped, as in 2187
+    record = await tune.tune()
     assert tune.calls == ["reference"]
     assert "llama-bench" not in tune.tools
     assert not any(t.startswith("llama-perplexity") for t in tune.tools)
     skipped = {m.name: m.reason for m in tune.measurements if isinstance(m, NotMeasured)}
     assert skipped["reference restart"].startswith("not tried: the reference's peak of 91.4 GiB")
-    assert skipped["llama-bench"].startswith("not tried: about 91.4 GiB at -ub 2048")
+    assert skipped["llama-bench"] == "not tried: the reference itself left less than the margin free"
     assert record.candidate == "reference"
 
     class Killed(FakeTune):

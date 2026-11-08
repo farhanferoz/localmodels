@@ -946,6 +946,9 @@ class LlamaTune:
         ``name`` is the step a refusal is recorded under (``-ub <ubatch>`` by default).
         """
         name = name or f"-ub {ubatch}"
+        if self.arms and self.reference.fits is False:  # the memory now is no reason to load it again (D22)
+            self._skip(name, "not tried: the reference itself left less than the margin free")
+            return False
         free = self._free_gib()
         if free is None:
             self._skip(name, "not measured: memory not measured (available memory cannot be read)")
@@ -1102,6 +1105,7 @@ class LlamaTune:
         """Start a server with ``settings``, send the prompts at the role's concurrency, and measure."""
         arm = ArmResult(name=arm_name(settings), settings=settings, free_gib=self._free_gib())
         peaks: list[int] = []
+        lows: list[float] = []  # available memory, GiB, at each sample
         sampler: asyncio.Task[None] | None = None
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as http:
             manager = self._manager(settings, files, http)
@@ -1110,7 +1114,7 @@ class LlamaTune:
                     started = self._clock()
                     handle = await manager.start()
                     arm.start_s = self._clock() - started
-                    sampler = asyncio.create_task(self._sample(handle.pid, peaks))
+                    sampler = asyncio.create_task(self._sample(handle.pid, peaks, lows))
                     started = self._clock()
                     await self._send_prompts(http, manager, arm)
                     arm.run_s = self._clock() - started
@@ -1133,22 +1137,28 @@ class LlamaTune:
                 if manager.killed_reason is not None:
                     self.guard_kill = manager.killed_reason
                     arm.error = f"killed by its memory guard: {manager.killed_reason}"
-        if peaks:
-            arm.peak_gib = max(peaks) / MIB_PER_GIB
+        drop = arm.free_gib - min(lows) if lows and arm.free_gib is not None else None
+        if peaks or drop is not None:
+            arm.peak_gib = max(max(peaks, default=0) / MIB_PER_GIB, drop or 0.0)
         arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.margin_gib)
         return arm
 
-    async def _sample(self, pid: int, peaks: list[int]) -> None:
-        """Note the server process's memory every half second until cancelled.
+    async def _sample(self, pid: int, peaks: list[int], lows: list[float]) -> None:
+        """Note the server process's memory and the memory available every half second until cancelled.
 
         Its GPU memory, and on a GPU that shares the host's RAM its host memory too, which comes out of the
-        same available figure.
+        same available figure. The process's figure missed at least 3.1 GiB of what the server took in slurm
+        2187 (swapped or driver memory), so the peak is also the fall in available memory from before the
+        start (D22): larger when anything else grew meanwhile, never smaller.
         """
         while True:
             held = await asyncio.to_thread(gpu_process_memory_mib)
             if held and pid in held:
                 host = (process_anon_mib(pid) or 0) if self._unified else 0
                 peaks.append(held[pid] + host)
+            reading = available_memory("cuda")  # not _free_gib(): it also sets the memory kind
+            if reading is not None:
+                lows.append(reading.bytes / GIB)
             await asyncio.sleep(SAMPLE_INTERVAL_S)
 
     async def _complete(

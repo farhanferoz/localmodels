@@ -149,10 +149,10 @@ def _available_gib(on_gpu: bool) -> float | None:
     return None if reading is None else reading.bytes / _GIB
 
 
-def _gpu_shares_host_ram() -> bool:
-    """Whether the GPU's memory is the host's RAM (``available_memory``); False when it cannot be told."""
+def _gpu_shares_host_ram() -> bool | None:
+    """Whether the GPU's memory is the host's RAM (``available_memory``); None when it cannot be told."""
     reading = available_memory("cuda")
-    return reading is not None and reading.unified
+    return None if reading is None else reading.unified
 
 
 def _launched_cache_cap(args: list[str]) -> tuple[str, ...]:
@@ -468,6 +468,13 @@ class LocalServerManager:
             draft = llama_option(flags, self.extra_env, DRAFT_MODEL_FLAGS, DRAFT_MODEL_ENV)
             kinds = ",".join(llama_values(flags, self.extra_env, (SPEC_TYPE_FLAG,), SPEC_TYPE_ENV))
         shares = _gpu_shares_host_ram()  # read once for every file projected
+        if shares is None and self.params.n_gpu_layers != 0:
+            msg = (
+                "whether the GPU's memory is the host's RAM cannot be read, so the model's memory need "
+                "cannot be counted; not loading it"
+            )
+            raise ServerStartError(msg)
+        shares = bool(shares)
         total = await self._fit_gib(self.spec.model_path, ubatch, shares=shares)
         if draft is not None and SpecType.DRAFT_MTP in (kinds or "").split(","):
             try:
@@ -561,7 +568,7 @@ class LocalServerManager:
             return "the caller's own --cache-ram"
         if self.params.n_gpu_layers == 0:
             return "llama.cpp's default (the server does not use the GPU)"
-        if not _gpu_shares_host_ram():
+        if _gpu_shares_host_ram() is False:  # unknown is capped: the projection then refuses or gives 0
             return "llama.cpp's default (the GPU has its own memory)"
         return None
 
@@ -570,9 +577,11 @@ class LocalServerManager:
 
         ``llama-fit-params`` runs at most once, for whichever of the two needs it. On a GPU that shares the
         host's RAM, llama.cpp's prompt cache (default 8 GiB) grows in the same RAM the model and the host
-        use, so the cap is the memory left after the projection and the guards' floor, between 0 and
-        llama.cpp's default. Without a host reserve a missing projection or reading gives a cap of 0 (memory
-        safety over a speed-up); with one the start is refused, as it always was.
+        use, so the cap is the memory left after the need, the host reserve and the kill floor, between 0
+        and llama.cpp's default: the reserve stays free above the floor for what the need misses (2.55 GiB
+        on Flash-Next, slurm 2187; a full cache sized to the floor alone would reach it, D22). Without a
+        host reserve a missing projection or reading gives a cap of 0 (memory safety over a speed-up); with
+        one the start is refused, as it always was.
         """
         self._launch_flags = ()
         reserve = self.guards.host_reserve_gib
@@ -602,7 +611,7 @@ class LocalServerManager:
             self._check_fits(projection, free, reserve)
         if skipped is not None:
             return
-        margin = max(reserve or 0.0, self.guards.kill_below_gib or 0.0)
+        margin = (reserve or 0.0) + (self.guards.kill_below_gib or 0.0)
         if projection is None or free is None:
             log.warning("prompt cache: --cache-ram 0 (%s; no cache rather than an unsized one)", problem)
             mib = 0

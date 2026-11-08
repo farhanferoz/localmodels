@@ -194,7 +194,7 @@ adds `-ub` and the speculative-decoding flags, each as a group the caller's own 
 `overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it
 (unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)` (the caller's `extra_flags` and the answer's flags) and then the prompt-cache cap below, not `manager.extra_flags`.
 On a GPU that shares the host's RAM (a DGX Spark's, found by `available_memory`), `LocalServerManager` also passes `--cache-ram` = available memory
-minus the model's memory need (above) minus the larger of the guards' `host_reserve_gib` and `kill_below_gib`, between 0 and llama.cpp's own
+minus the model's memory need (above) minus the guards' `host_reserve_gib` and `kill_below_gib` together (the reserve stays free above the floor for what the need misses, D22), between 0 and llama.cpp's own
 8,192 MiB (0 when the projection cannot be made and no host reserve is set; the start is refused when one is); a GPU with its own memory, a server
 without GPU layers, and a caller's own `--cache-ram` or `LLAMA_ARG_CACHE_RAM` keep llama.cpp's default or the caller's value (D20). The cap is logged,
 stamped in `layout.extra_flags` (for an adopted server too), and is no part of a running server's identity: a server whose cap differs is adopted, not restarted.

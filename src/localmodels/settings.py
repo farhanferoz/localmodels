@@ -938,7 +938,7 @@ def _measured_peak(record: SettingsRecord) -> MeasuredPeak | None:
     if layout is None or not peaks:
         return None
     try:
-        fields = {k: layout.get(k) for k in ("n_ctx", "n_parallel", "kv_unified")}
+        fields = {k: layout[k] for k in ("n_ctx", "n_parallel", "kv_unified") if layout.get(k) is not None}
         return MeasuredPeak(gib=max(peaks), layout=LlamaLayout(**fields))
     except ValidationError:
         return None

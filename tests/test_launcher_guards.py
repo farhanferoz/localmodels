@@ -367,7 +367,7 @@ async def test_a_stamp_says_what_the_answer_gave_and_what_the_callers_flags_or_t
 class _CacheCase:
     """One server start: what it runs on, what the caller set, and the cap llama-fit-params' figure gives."""
 
-    shares: bool = True  # the GPU's memory is the host's RAM
+    shares: bool | None = True  # the GPU's memory is the host's RAM; None: cannot be told
     cpu: bool = False
     guards: MemoryGuards = field(default_factory=MemoryGuards)
     own: dict[str, Any] = field(default_factory=dict)  # the caller's `extra_flags` / `extra_env`
@@ -395,6 +395,18 @@ _CACHE_CASES = [
         ),
         id="clamped-to-0",
     ),
+    # both guards: the reserve stays free above the kill floor, for what the projection misses (D22)
+    pytest.param(
+        _CacheCase(
+            guards=MemoryGuards(host_reserve_gib=10, kill_below_gib=10),
+            available=44,
+            cap=("--cache-ram", "4096"),
+            fit_runs=1,
+        ),
+        id="reserve-above-the-floor",
+    ),
+    # the memory kind cannot be read: capped like a shared one, never left at llama.cpp's 8 GiB
+    pytest.param(_CacheCase(shares=None, cap=("--cache-ram", "0")), id="kind-unknown"),
     pytest.param(
         _CacheCase(fit_output="nothing useful", cap=("--cache-ram", "0"), fit_runs=1), id="no-projection"
     ),
