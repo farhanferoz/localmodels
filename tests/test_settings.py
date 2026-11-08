@@ -16,9 +16,24 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from localmodels import retune, settings
+from localmodels.atomic import write_model
 from localmodels.cli import main
+from localmodels.engine_bench import EngineRun
+from localmodels.engine_choice import ChoiceRule, JobShape, choose
+from localmodels.engine_refresh import same_client_path
+from localmodels.engines import (
+    Approval,
+    GateVerdict,
+    Publisher,
+    VersionRecord,
+    pins_for,
+    register_approval,
+    switch,
+    write_record,
+)
 from localmodels.enums import DeviceTier, DeviceType, Precision, WorkloadKind
 from localmodels.hardware import HardwareReport
+from localmodels.refresh import Model
 from localmodels.rules import rules_text, stamps
 from localmodels.serving.tune import Agreement, TuneCandidate, TuneMeasurement, TuneRecord
 from localmodels.settings import (
@@ -38,7 +53,7 @@ from localmodels.settings import (
     record_from_tune,
     record_path,
 )
-from localmodels.stack import Engine, LoadOptions
+from localmodels.stack import Engine, LoadOptions, RetunePolicy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -822,3 +837,214 @@ def test_importing_localmodels_or_its_cli_does_not_import_the_lookup() -> None:
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)  # noqa: S603
     assert done.returncode == 0, done.stderr
+
+
+# --- the engine chooser (design 6) -----------------------------------------------------------------
+
+FILE_REPO, FILE_REVISION = "nvidia/Qwen3-30B-A3B-NVFP4", "b" * 40
+IMAGE = "vllm/vllm-openai@sha256:" + "ab" * 32
+BULK_JOB = JobShape(project="proj", requests=1000, prompt_tokens=1000, output_tokens=500, concurrency=16)
+LLAMA_FIGURES = {
+    "write_tps_16_at_once": 100.0,
+    "read_tps_prefill_512": 900.0,
+    "read_tps_prefill_8192": 1000.0,
+}
+
+
+def stage(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: Engine = Engine.VLLM,
+    *,
+    write_tps: float = 300.0,
+    read_tps: float = 3000.0,
+    startup_s: float = 200.0,
+    **flaws: bool,
+) -> None:
+    """A passing world for ``QWEN`` K2 work: an approval, a complete record on `current`, llama.cpp's figures.
+
+    llama.cpp writes 100 tokens/s and reads 1,000 at 16 at once; the container writes ``write_tps`` and
+    reads 3,000, so ``BULK_JOB`` takes 6,000 s on llama.cpp and 2,000 s (at 300) on the container, which
+    starts 150 s later. ``flaws`` breaks one piece: no_approval, no_current, incomplete, no_same_client,
+    no_memory (no recorded need).
+    """
+    llama_home = root / "llama"
+    commit = "abc1234"
+    monkeypatch.setenv("LOCALMODELS_LLAMA_HOME", str(llama_home))
+    (llama_home / "builds" / commit).mkdir(parents=True, exist_ok=True)
+    if not (llama_home / "builds" / "current").is_symlink():
+        (llama_home / "builds" / "current").symlink_to(commit)
+    gguf = Model(QWEN.repository, QWEN.revision, "q4.gguf")
+    if not flaws.get("no_same_client"):
+        run = EngineRun(
+            engine="llama.cpp", model="m", url="u", started="t", startup_s=50.0, figures=LLAMA_FIGURES
+        )  # fmt: skip
+        write_model(same_client_path(commit, gguf), run)
+    if not flaws.get("no_approval"):
+        evidence = root / "check.json"
+        evidence.write_text("{}", encoding="utf-8")
+        approval = Approval(
+            project="proj", model_key=QWEN.key, gguf_repository=gguf.repository, gguf_revision=gguf.revision,
+            gguf_file=gguf.filename, engine=engine, file_repository=FILE_REPO, file_revision=FILE_REVISION,
+            evidence=str(evidence), evidence_sha256="0" * 64, approved_at="2026-11-08T00:00:00+00:00",
+        )  # fmt: skip
+        assert register_approval(approval) is None
+    if flaws.get("no_current"):
+        return
+    figures = {
+        "write_tps_16_at_once": write_tps,
+        "read_tps_prefill_512": read_tps,
+        "read_tps_prefill_8192": read_tps,
+    }
+    result = {
+        "model": FILE_REPO, "kind": "approved", "complete": not flaws.get("incomplete"), "figures": figures,
+        "startup_s": startup_s, "memory": {} if flaws.get("no_memory") else {"fall_gib": 30.0},
+    }  # fmt: skip
+    write_record(
+        VersionRecord(
+            engine=engine,
+            tag="v0.31.0",
+            image=IMAGE,
+            publisher=Publisher.OFFICIAL,
+            gate=GateVerdict.PASSED,
+            pulled=True,
+            results=[result],
+        )
+    )
+    assert switch(engine, "v0.31.0") is None
+
+
+def test_a_container_engine_is_chosen_only_when_every_rule_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "ok" / "state"))
+    stage(tmp_path / "ok", monkeypatch)
+    chosen = choose(QWEN, WorkloadKind.K2, BULK_JOB, available_gib=100.0)
+    assert (chosen.engine, chosen.rule, chosen.version, chosen.image) == (
+        Engine.VLLM, ChoiceRule.CHOSEN, "v0.31.0", IMAGE,
+    )  # fmt: skip
+    assert chosen.file == f"{FILE_REPO}@{FILE_REVISION}"
+    assert chosen.numbers == pytest.approx(
+        {
+            "t_llama_s": 6000.0,
+            "t_container_s": 2000.0,
+            "saving_s": 4000.0,
+            "extra_start_s": 150.0,
+            "need_gib": 30.0,
+            "available_gib": 100.0,
+        }
+    )
+    # each rule broken once from that passing world
+    small = BULK_JOB.model_copy(update={"requests": 1})  # saves 4 s, under twice the 150 s extra start
+    eight = BULK_JOB.model_copy(update={"concurrency": 8})
+    broken = {
+        "no approval": ({"no_approval": True}, BULK_JOB, 100.0, ChoiceRule.NO_APPROVAL),
+        "no current": ({"no_current": True}, BULK_JOB, 100.0, ChoiceRule.NO_CURRENT),
+        "incomplete record": ({"incomplete": True}, BULK_JOB, 100.0, ChoiceRule.NO_COMPLETE_RECORD),
+        "no same-client record": ({"no_same_client": True}, BULK_JOB, 100.0, ChoiceRule.NO_SAME_CLIENT),
+        "8 at once": ({}, eight, 100.0, ChoiceRule.LOW_CONCURRENCY),
+        "saving too small": ({}, small, 100.0, ChoiceRule.SAVING_TOO_SMALL),
+        "need over available": ({}, BULK_JOB, 39.0, ChoiceRule.MEMORY),
+        "no recorded need": ({"no_memory": True}, BULK_JOB, 100.0, ChoiceRule.MEMORY),
+        "no saving at all": (
+            {"write_tps": 100.0, "read_tps": 1000.0, "startup_s": 40.0},
+            BULK_JOB,
+            100.0,
+            ChoiceRule.SAVING_TOO_SMALL,
+        ),
+    }
+    for index, (name, (flaws, job, available, rule)) in enumerate(broken.items()):
+        root = tmp_path / f"case{index}"
+        monkeypatch.setenv(settings.STATE_DIR_ENV, str(root / "state"))
+        stage(root, monkeypatch, **flaws)  # type: ignore[arg-type]
+        answer = choose(QWEN, WorkloadKind.K2, job, available_gib=available)
+        assert (answer.engine, answer.rule) == (Engine.LLAMA_CPP, rule), name
+        assert answer.version is None
+        if rule is not ChoiceRule.NO_APPROVAL:
+            assert answer.considered[0].startswith("vllm "), name
+    # K1 and K3 are llama.cpp, K4 is PyTorch, K2 without a job is llama.cpp, whatever the approvals say
+    monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "ok" / "state"))
+    monkeypatch.setenv("LOCALMODELS_LLAMA_HOME", str(tmp_path / "ok" / "llama"))
+    routes = [
+        (WorkloadKind.K1, BULK_JOB),
+        (WorkloadKind.K3, BULK_JOB),
+        (WorkloadKind.K4, BULK_JOB),
+        (WorkloadKind.K2, None),
+    ]
+    answers = [choose(QWEN, kind, job, available_gib=100.0) for kind, job in routes]
+    assert [(a.engine, a.rule) for a in answers] == [
+        (Engine.LLAMA_CPP, ChoiceRule.INTERACTIVE_OR_SCORING),
+        (Engine.LLAMA_CPP, ChoiceRule.INTERACTIVE_OR_SCORING),
+        (Engine.PYTORCH, ChoiceRule.PYTORCH_KIND),
+        (Engine.LLAMA_CPP, ChoiceRule.NO_JOB),
+    ]
+
+
+def test_the_approval_with_the_largest_saving_is_chosen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "state"))
+    stage(tmp_path, monkeypatch, Engine.VLLM, write_tps=300.0)
+    stage(tmp_path, monkeypatch, Engine.SGLANG, write_tps=600.0)
+    best = choose(QWEN, WorkloadKind.K2, BULK_JOB, available_gib=100.0)
+    assert (best.engine, best.rule) == (Engine.SGLANG, ChoiceRule.CHOSEN)
+    assert len(best.considered) == 2
+
+
+def test_lookup_chooses_the_engine_only_when_asked_and_a_pin_keeps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "state"))
+    stage(tmp_path, monkeypatch)
+    monkeypatch.setattr("localmodels.container_run.available_gib", lambda: 100.0)
+    off = RetunePolicy.OFF
+    put(
+        QWEN,
+        WorkloadKind.K2,
+        engine="llama.cpp",
+        build="ccc3646",
+        chosen={"n_ubatch": 1024},
+        candidate="ub1024",
+    )
+    # an existing call is what it always was: no chooser, no choice, nothing extra in the stamp
+    for engine in (Engine.PYTORCH, Engine.LLAMA_CPP):
+        plain = lookup(QWEN, WorkloadKind.K2, engine=engine, retune=off)
+        assert (plain.engine, plain.choice, plain.stamp().engine_choice) == (engine, None, None)
+        assert "engine_choice" not in plain.stamp().model_dump(mode="json")
+    default = lookup(QWEN, WorkloadKind.K2, retune=off, job=BULK_JOB)  # a job alone does not ask for a choice
+    assert (default.engine, default.choice) == (Engine.PYTORCH, None)
+
+    pin = tmp_path / "study" / "pin.json"
+    asked = lookup(QWEN, WorkloadKind.K2, engine=None, job=BULK_JOB, retune=off, pin=pin)
+    llama = lookup(QWEN, WorkloadKind.K2, engine=Engine.LLAMA_CPP, retune=off)
+    assert llama.settings.n_ubatch == 1024  # the tuned llama.cpp record: what a fallback would run
+    assert asked.choice is not None
+    assert (asked.engine, asked.choice.rule, asked.settings) == (
+        Engine.VLLM,
+        ChoiceRule.CHOSEN,
+        llama.settings,
+    )
+    assert asked.stamp().engine_choice == {
+        "engine": "vllm", "rule": "chosen", "version": "v0.31.0", "image": IMAGE,
+        "file": f"{FILE_REPO}@{FILE_REVISION}",
+    }  # fmt: skip
+    assert any("engine vllm (chosen)" in note for note in asked.notes)
+    entry = json.loads(pin.read_text(encoding="utf-8"))["entries"][0]
+    assert (entry["engine"], entry["engine_version"], entry["engine_file"]) == (
+        "vllm", "v0.31.0", f"{FILE_REPO}@{FILE_REVISION}",
+    )  # fmt: skip
+    assert [(p.version, p.file) for p in pins_for(Engine.VLLM)] == [("v0.31.0", pin.resolve())]
+
+    # the world changes (the approval goes), and the chooser alone would now say llama.cpp; the pin does not
+    (tmp_path / "state" / "engines" / "approvals.json").unlink()
+    free = lookup(QWEN, WorkloadKind.K2, engine=None, job=BULK_JOB, retune=off)
+    assert free.choice is not None
+    assert (free.engine, free.choice.rule) == (Engine.LLAMA_CPP, ChoiceRule.NO_APPROVAL)
+    again = lookup(QWEN, WorkloadKind.K2, engine=None, job=BULK_JOB, retune=off, pin=pin)
+    assert again.choice is not None
+    assert (again.engine, again.choice.rule, again.choice.version, again.status) == (
+        Engine.VLLM, ChoiceRule.PINNED, "v0.31.0", PINNED,
+    )  # fmt: skip
+    assert (again.choice.image, again.choice.file) == (IMAGE, f"{FILE_REPO}@{FILE_REVISION}")
+    # an explicit engine beats the pin's: no chooser, no choice
+    assert lookup(QWEN, WorkloadKind.K2, engine=Engine.LLAMA_CPP, retune=off, pin=pin).choice is None

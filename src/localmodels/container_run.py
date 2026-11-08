@@ -40,17 +40,39 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Self
 
-from .engines import VersionRecord, docker_runner, read_record, run_command, write_record
-from .hardware import gpu_process_memory_mib
-from .launcher import MemoryGuards, NotEnoughMemoryError, ServerStartError, check_fits, kill_below_floor
+from .engines import (
+    CONTAINER_ENGINES,
+    VersionRecord,
+    docker_runner,
+    read_record,
+    run_command,
+    write_record,
+)
+from .enums import ServingRole
+from .hardware import gpu_process_memory_mib, inspect_hardware
+from .launcher import (
+    LocalServerManager,
+    MemoryGuards,
+    NotEnoughMemoryError,
+    ServerStartError,
+    check_fits,
+    kill_below_floor,
+)
+from .params import derive_serving_params
+from .process import ServerSpec
 from .stack import Engine
 
 if TYPE_CHECKING:
     import subprocess
     import types
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+
+    import httpx
 
     from .engines import Runner
+    from .lease import GpuLease
+    from .params import ServingParams
+    from .settings import SettingsAnswer
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +196,8 @@ class MemoryNeed:
         return max(known) if known else None
 
 
-def _available_gib() -> float | None:
+def available_gib() -> float | None:
+    """Memory a new allocation can get now (GiB, the device the engines run on); None when unreadable."""
     from .hardware import available_memory  # noqa: PLC0415 - hardware reads /proc only when asked
 
     reading = available_memory("cuda")
@@ -194,7 +217,7 @@ class ContainerRun:
     hub_root: Path = HUB_ROOT
     work_dir: Path = field(default_factory=lambda: Path(os.environ.get("TMPDIR", "/tmp")))  # noqa: S108
     docker: Runner = docker_runner
-    free_gib: Callable[[], float | None] = _available_gib
+    free_gib: Callable[[], float | None] = available_gib
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     reaper: Reaper | None = None  # default: a ``Reaper`` on ``docker`` and the real ``squeue``
     #: The GPU memory each process holds now, MiB by host pid (``nvidia-smi``); None when it cannot say.
@@ -596,6 +619,139 @@ class ContainerRun:
             # None: a handler not set from Python, which cannot be put back; the default stands in
             signal.signal(signal.SIGTERM, self._previous_handler or signal.SIG_DFL)
         self._remove_files()
+
+
+# --- the central server for a bulk job (design 3.8) -----------------------------------------------
+
+LOCALHOST: Final = "127.0.0.1"
+
+
+@dataclass(frozen=True)
+class LlamaFallback:
+    """Everything llama.cpp's bulk layout needs, and what the container's start falls back to.
+
+    ``binary``, ``guards`` and ``params`` default to the current build, the refresh's guards and the
+    bulk layout derived from the measured device and memory.
+    """
+
+    model_path: Path  # the GGUF
+    lease: GpuLease
+    http: httpx.AsyncClient
+    pid_dir: Path
+    port: int
+    binary: Path | None = None
+    guards: MemoryGuards | None = None
+    params: ServingParams | None = None
+
+
+@dataclass(frozen=True)
+class BulkServer:
+    """A running server: its address, the engine behind it, its stamp, and why it is the fallback if it is."""
+
+    url: str
+    engine: Engine
+    stamp: dict[str, Any]
+    fallback: str | None
+
+
+def _container_run(answer: SettingsAnswer, fallback: LlamaFallback) -> tuple[ContainerRun, str]:
+    """The run for the chosen version and file, and its URL; ``ContainerStartError`` if it cannot be made."""
+    from . import engine_refresh  # noqa: PLC0415 - engine_refresh imports this module
+
+    choice = answer.choice
+    assert choice is not None  # noqa: S101 - the caller checked
+    record = read_record(choice.engine, choice.version) if choice.version else None
+    model = (choice.file or "").partition("@")[0]
+    if record is None:
+        msg = f"{choice.engine.value} {choice.version}: no version record"
+        raise ContainerStartError(msg)
+    recipe = engine_refresh.realized(record, model)
+    if recipe is None:
+        msg = f"{choice.engine.value} {record.tag}: no realized recipe for {model}"
+        raise ContainerStartError(msg)
+    port = (recipe.get("defaults") or {}).get("port")
+    if not isinstance(port, int):
+        msg = f"{choice.engine.value} {record.tag}: the recipe for {model} names no port"
+        raise ContainerStartError(msg)
+    run = ContainerRun(
+        record,
+        model,
+        recipe,
+        ensure_sparkrun(engine_refresh.in_use_version()),
+        fallback.guards or engine_refresh.GUARDS,
+        kind=RunKind.PROJECT,
+    )
+    return run, f"http://{LOCALHOST}:{port}"
+
+
+@contextlib.asynccontextmanager
+async def _llama_server(
+    answer: SettingsAnswer, fallback: LlamaFallback, reason: str | None
+) -> AsyncIterator[BulkServer]:
+    """llama.cpp's bulk layout through the launcher, started and stopped by the context."""
+    from . import engine_refresh  # noqa: PLC0415 - engine_refresh imports this module
+    from .llama_builds import current_server, llama_home  # noqa: PLC0415
+
+    params = fallback.params
+    if params is None:
+        report = inspect_hardware()
+        params = derive_serving_params(report.device, report.total_memory_gb, role=ServingRole.BULK)
+    settings = answer.model_copy(update={"engine": Engine.LLAMA_CPP})
+    manager = LocalServerManager(
+        ServerSpec(LOCALHOST, fallback.port, fallback.model_path),
+        params,
+        fallback.lease,
+        http=fallback.http,
+        pid_dir=fallback.pid_dir,
+        binary=fallback.binary or current_server(llama_home()),
+        ready_timeout_s=engine_refresh.LLAMA_READY_S,
+        guards=fallback.guards or engine_refresh.GUARDS,
+        settings=settings,
+    )
+    await manager.start()
+    try:
+        stamp = manager.stamp(settings=settings).model_dump(mode="json")
+        yield BulkServer(
+            f"http://{LOCALHOST}:{fallback.port}",
+            Engine.LLAMA_CPP,
+            {**stamp, **({"fallback": reason} if reason else {})},
+            reason,
+        )
+    finally:
+        await manager.stop()
+
+
+@contextlib.asynccontextmanager
+async def bulk_server(answer: SettingsAnswer, *, fallback: LlamaFallback) -> AsyncIterator[BulkServer]:
+    """A running server for a bulk job, as the answer chose: the container engine, else llama.cpp.
+
+    A container answer starts that engine's chosen version on the approved file (the run is entered on the
+    calling thread, so its SIGTERM chain is installed when that is the main thread). When the start is
+    refused or fails (``ContainerStartError``, ``NotEnoughMemoryError``) llama.cpp's bulk layout is started
+    instead and the stamp says why. A llama.cpp answer starts llama.cpp. Any other engine is no server:
+    ``ValueError``. No project writes its own fallback.
+    """
+    engine = answer.choice.engine if answer.choice else answer.engine
+    reason = None
+    if engine in CONTAINER_ENGINES:
+        stack = contextlib.ExitStack()
+        try:
+            run, url = _container_run(answer, fallback)
+            stack.enter_context(run)
+        except (ContainerStartError, NotEnoughMemoryError) as exc:
+            reason = f"{engine.value} did not start, llama.cpp serves instead: {exc}"
+            log.warning("%s", reason)
+        else:
+            with stack:
+                yield BulkServer(
+                    url, engine, {**run.stamp(), "settings": answer.stamp().model_dump(mode="json")}, None
+                )
+            return
+    elif engine is not Engine.LLAMA_CPP:
+        msg = f"{engine.value} is not a server: bulk_server starts llama.cpp or a container engine"
+        raise ValueError(msg)
+    async with _llama_server(answer, fallback, reason) as served:
+        yield served
 
 
 def listing_hash(folder: Path) -> str:

@@ -201,6 +201,9 @@ class SettingsStamp(BaseModel):
     tune_detail: str | None = None
     changed_from: str | None = None
     recipe_project: str | None = None
+    #: Which engine the chooser picked and why (engine, rule, version, image, file); None for a caller that
+    #: named its engine, and left out of a dump then so that caller's stamp is the JSON it always was.
+    engine_choice: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ServerStamp(BaseModel):

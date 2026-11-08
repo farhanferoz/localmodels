@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from localmodels.atomic import write_text_atomically
+from localmodels.engine_choice import EngineChoice  # noqa: TC001 - a pydantic field type
+from localmodels.engines import CONTAINER_ENGINES, register_pin
 from localmodels.enums import DeviceType, Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
 from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
@@ -65,6 +67,7 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Iterator, Mapping
 
+    from localmodels.engine_choice import JobShape
     from localmodels.hardware import HardwareReport
 
 STATE_DIR_ENV: Final = "LOCALMODELS_STATE_DIR"
@@ -254,6 +257,8 @@ class PinEntry(BaseModel):
     model: ModelIdentity
     kind: WorkloadKind
     engine: Engine | None = None  # an entry without one matches any engine
+    engine_version: str | None = None  # a container engine's tag, when the chooser picked one
+    engine_file: str | None = None  # the container's model file, ``repo@revision``
     settings: Settings  # as resolved, before the caller's ``explicit`` was applied
     status: SettingsStatus
     source: SettingsSource
@@ -314,6 +319,7 @@ class SettingsAnswer(BaseModel):
     pin_entry: PinEntry | None = None  # the entry a pinned answer was taken from (it has no ``record``)
     pin_problem: str | None = None  # why a pin that was asked for could not be used
     tune_detail: str | None = None  # the job id, log path or reason behind ``tune``
+    choice: EngineChoice | None = None  # set when the caller asked localmodels to choose the engine
 
     def stamp(self, applied: Settings | None = None) -> SettingsStamp:
         """The part of a result's stamp that says how its settings were decided.
@@ -338,6 +344,7 @@ class SettingsAnswer(BaseModel):
             tune_detail=self.tune_detail,
             changed_from=record.changed_from if record else None,
             recipe_project=pin.recipe_project if pin else record.recipe_project if record else None,
+            engine_choice=self.choice.stamp() if self.choice else None,
         )
 
     def server_stamp(
@@ -386,6 +393,8 @@ class SettingsAnswer(BaseModel):
             applied = "applied" if self.rule.applied else f"NOT applied: {_describe(self.rule.values)}"
             measured = ", ".join(self.rule.models) or "no named model"
             out.append(f"rule: {self.rule.id}, measured on {measured}; {applied}")
+        if self.choice:
+            out.append(f"engine: {self.choice.note()}")
         out.extend(f"stale: {line}" for line in self.stale)
         if self.overridden:
             out.append(f"overridden by explicit: {', '.join(self.overridden)}")
@@ -562,7 +571,7 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     model: ModelIdentity,
     kind: WorkloadKind,
     *,
-    engine: Engine = Engine.PYTORCH,
+    engine: Engine | None = Engine.PYTORCH,
     build: str | None = None,
     explicit: Mapping[str, Any] | None = None,
     default: Settings | None = None,
@@ -571,6 +580,7 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     retune: RetunePolicy = RetunePolicy.AUTO,
     legacy_path: Path | None = None,
     pin: Path | None = None,
+    job: JobShape | None = None,
 ) -> SettingsAnswer:
     """What to load ``model`` with for ``kind`` work on this machine; it never fails a load.
 
@@ -592,7 +602,12 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     store says now; ``explicit`` still wins over it. A ``.lock`` file stays beside the pin file; leave it.
     A pin that cannot be used leaves the answer unpinned, says why in ``pin_problem`` and never raises. A
     record made through llama-server is never applied to ``Engine.LLAMA_CPP_PYTHON``, which has no tune path
-    yet. ``ValueError`` (pydantic's included) for an
+    yet. ``engine=None`` asks localmodels to choose the engine (``engine_choice.choose``; the default stays
+    PyTorch and a named engine always wins): a pin that holds the model and kind keeps its engine and
+    version, else ``job`` (what the bulk job will ask) decides between llama.cpp and a container engine the
+    project approved. The answer's ``engine`` is the chosen one and ``choice`` says why; for a container
+    engine the settings are those of llama.cpp, which is what runs when the container does not (see
+    ``container_run.bulk_server``). ``ValueError`` (pydantic's included) for an
     ``explicit`` key that is not a settings field or a value that is not valid: a caller's bug, not a store
     problem.
     """
@@ -603,6 +618,12 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     default = default or Settings()
     name = f"{model.repository} ({kind.value})"
     notes: list[str] = []
+    choice = _choose_engine(model, kind, job, pin) if engine is None else None
+    chosen = choice.engine if choice else engine
+    assert chosen is not None  # noqa: S101 - engine is None only when a choice was made
+    engine = (
+        Engine.LLAMA_CPP if chosen in CONTAINER_ENGINES else chosen
+    )  # the settings of what runs on a fallback
     if model.unpinned:
         notes.append(f"{name} is identified by its path, size and modification time, not its content.")
     if engine is Engine.LLAMA_CPP and not model.files:
@@ -610,12 +631,16 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     identity_notes = len(notes)
     answer = SettingsAnswer(
         model=model,
-        engine=engine,
+        engine=chosen,
         kind=kind,
         settings=default,
         status=SettingsStatus.UNTUNED,
         source=SettingsSource.DEFAULT,
+        choice=choice,
     )
+    if choice:
+        notes.append(f"{name}: {choice.note()}.")
+        identity_notes += 1
 
     report = None  # the hardware probed for the answer
     if engine is Engine.LLAMA_CPP_PYTHON:
@@ -639,6 +664,25 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
         )
     answer.notes = notes
     return answer
+
+
+def _choose_engine(
+    model: ModelIdentity, kind: WorkloadKind, job: JobShape | None, pin: Path | None
+) -> EngineChoice:
+    """The engine of an ``engine=None`` lookup: the pin's, else the chooser's."""
+    from localmodels.engine_choice import choose, pinned_choice  # noqa: PLC0415 - the rules load engines' records
+
+    if pin is not None:
+        try:
+            entries = read_pins(pin.resolve()).entries
+        except (OSError, RuntimeError):  # a link loop; ``_pin`` reports the same problem
+            entries = []
+        held = next(
+            (e for e in entries if (e.model.key, e.kind) == (model.key, kind) and e.engine is not None), None
+        )
+        if held is not None:
+            return pinned_choice(held)
+    return choose(model, kind, job)
 
 
 class PinFile(NamedTuple):
@@ -732,6 +776,9 @@ def _pin_entry(pin: Path, answer: SettingsAnswer) -> tuple[PinEntry | None, str]
             return entry, "" if entry else found.problem
         text = json.dumps({"schema": SCHEMA_VERSION, "entries": [*found.items, item]}, indent=2)
         write_text_atomically(pin, text + "\n")
+    choice = answer.choice
+    if choice and choice.version and answer.engine in CONTAINER_ENGINES:
+        register_pin(answer.engine, choice.version, pin)  # the pinned version joins the engine's keep list
     return None, ""
 
 
@@ -752,6 +799,8 @@ def _new_entry(answer: SettingsAnswer) -> PinEntry:
         model=answer.model,
         kind=answer.kind,
         engine=answer.engine,
+        engine_version=answer.choice.version if answer.choice else None,
+        engine_file=answer.choice.file if answer.choice else None,
         settings=answer.settings,
         status=answer.status,
         source=answer.source,

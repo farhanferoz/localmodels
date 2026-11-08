@@ -11,14 +11,17 @@ import subprocess
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import pytest
 
 from localmodels import container_run
 from localmodels.container_run import ContainerRun, ContainerStartError, MemoryNeed, Reaper, RunKind
+from localmodels.engine_choice import ChoiceRule, EngineChoice
 from localmodels.engines import GateVerdict, Publisher, VersionRecord, write_record
+from localmodels.enums import DeviceType, ServingRole, WorkloadKind
 from localmodels.launcher import MemoryGuards, NotEnoughMemoryError, ServerStartError, kill_below_floor
+from localmodels.settings import ModelIdentity, Settings, SettingsAnswer, SettingsSource, SettingsStatus
 from localmodels.stack import Engine
 
 if TYPE_CHECKING:
@@ -399,3 +402,137 @@ def test_record_result_adds_the_runs_memory_and_what_it_measured(tmp_path: Path)
     run._gpu_peak = 40.0  # larger, but incomplete: still not the need
     container_run.record_result(rec, MODEL, run, extra={"kind": "candidate", "complete": False})
     assert MemoryNeed.recorded(container_run.read_record(Engine.SGLANG, rec.tag), MODEL) == 30.0  # type: ignore[arg-type]
+
+
+# --- bulk_server (design 3.8) ----------------------------------------------------------------------
+
+
+class FakeRun:
+    """A ContainerRun that starts, or is refused with ``fail``; the last one made is kept."""
+
+    made: ClassVar[list[FakeRun]] = []
+    fail: ClassVar[Exception | None] = None
+
+    def __init__(
+        self, record: VersionRecord, model: str, recipe: dict[str, object], *args: object, **kw: object
+    ) -> None:
+        self.model, self.recipe, self.kind = model, recipe, kw["kind"]
+        self.stopped = False
+        FakeRun.made.append(self)
+
+    def __enter__(self) -> Self:
+        if FakeRun.fail is not None:
+            raise FakeRun.fail
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stopped = True
+
+    def stamp(self) -> dict[str, str]:
+        return {"engine": "sglang", "tag": "v0.5.23-cu130"}
+
+
+class FakeManager:
+    """A LocalServerManager that records how it was built, started and stopped."""
+
+    made: ClassVar[list[FakeManager]] = []
+
+    def __init__(self, spec: object, params: object, lease: object, **kw: object) -> None:
+        self.spec, self.params, self.kw = spec, params, kw
+        self.events: list[str] = []
+        FakeManager.made.append(self)
+
+    async def start(self) -> None:
+        self.events.append("start")
+
+    async def stop(self) -> bool:
+        self.events.append("stop")
+        return True
+
+    def stamp(self, settings: SettingsAnswer) -> object:
+        assert settings is self.kw["settings"]
+        return type("Stamp", (), {"model_dump": lambda _s, mode: {"engine": "llama.cpp", "settings": {}}})()
+
+
+def bulk_answer(engine: Engine, tmp_path: Path) -> tuple[SettingsAnswer, container_run.LlamaFallback]:
+    choice = EngineChoice(
+        engine=engine,
+        rule=ChoiceRule.CHOSEN,
+        version="v0.5.23-cu130",
+        file=f"{MODEL}@{'b' * 40}",
+    )
+    answer = SettingsAnswer(
+        model=ModelIdentity(repository="Qwen/Qwen3-30B-A3B-GGUF", revision="c" * 40),
+        engine=engine,
+        kind=WorkloadKind.K2,
+        settings=Settings(n_ubatch=512),
+        status=SettingsStatus.UNTUNED,
+        source=SettingsSource.DEFAULT,
+        choice=choice,
+    )
+    fallback = container_run.LlamaFallback(
+        model_path=tmp_path / "q4.gguf",
+        lease=object(),  # type: ignore[arg-type]
+        http=object(),  # type: ignore[arg-type]
+        pid_dir=tmp_path / "pid",
+        port=18123,
+        binary=tmp_path / "llama-server",
+        guards=MemoryGuards(host_reserve_gib=10.0),
+        params=container_run.derive_serving_params(DeviceType.CUDA, 122.0, role=ServingRole.BULK),
+    )
+    return answer, fallback
+
+
+def test_bulk_server_serves_the_container_and_falls_back_to_llama_cpp_when_it_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = record()
+    recipe = {"runtime": "sglang", "defaults": {"port": 18102}}
+    write_record(rec.model_copy(update={"recipes": {MODEL: json.dumps(recipe)}}))
+    FakeRun.made, FakeManager.made, FakeRun.fail = [], [], None
+    monkeypatch.setattr(container_run, "ContainerRun", FakeRun)
+    monkeypatch.setattr(container_run, "LocalServerManager", FakeManager)
+    monkeypatch.setattr(container_run, "ensure_sparkrun", lambda _tag: tmp_path / "sparkrun")
+    answer, fallback = bulk_answer(Engine.SGLANG, tmp_path)
+
+    async def serve() -> container_run.BulkServer:
+        async with container_run.bulk_server(answer, fallback=fallback) as served:
+            return served
+
+    started = asyncio.run(serve())  # the container starts: a project run on the recorded recipe's port
+    (run,) = FakeRun.made
+    assert (started.url, started.engine, started.fallback) == ("http://127.0.0.1:18102", Engine.SGLANG, None)
+    assert (run.kind, run.model, run.recipe, run.stopped) == (RunKind.PROJECT, MODEL, recipe, True)
+    assert started.stamp["tag"] == "v0.5.23-cu130"
+    assert started.stamp["settings"]["engine_choice"]["rule"] == "chosen"
+    assert FakeManager.made == []
+
+    for refusal in (ContainerStartError("its image is not on disk"), NotEnoughMemoryError("needs 105 GiB")):
+        FakeRun.made, FakeManager.made, FakeRun.fail = [], [], refusal
+        served = asyncio.run(serve())
+        (manager,) = FakeManager.made
+        assert manager.events == ["start", "stop"]  # started and stopped by the context
+        assert (served.url, served.engine) == ("http://127.0.0.1:18123", Engine.LLAMA_CPP)
+        assert served.fallback is not None
+        assert str(refusal) in served.fallback
+        assert served.stamp["fallback"] == served.fallback  # the result says it was not the engine chosen
+        assert manager.kw["settings"].engine is Engine.LLAMA_CPP  # the answer's settings, as llama.cpp's
+        assert manager.params.n_parallel == 16  # the bulk layout
+        assert manager.spec.model_path == tmp_path / "q4.gguf"
+    FakeRun.fail = None
+
+    llama_answer, _ = bulk_answer(Engine.LLAMA_CPP, tmp_path)
+    FakeRun.made, FakeManager.made = [], []
+    plain = asyncio.run(_serve_answer(llama_answer, fallback))
+    assert (plain.engine, plain.fallback, FakeRun.made) == (Engine.LLAMA_CPP, None, [])
+
+    pytorch_answer, _ = bulk_answer(Engine.PYTORCH, tmp_path)
+    with pytest.raises(ValueError, match="not a server"):
+        asyncio.run(_serve_answer(pytorch_answer, fallback))
+
+
+async def _serve_answer(
+    answer: SettingsAnswer, fallback: container_run.LlamaFallback
+) -> container_run.BulkServer:
+    async with container_run.bulk_server(answer, fallback=fallback) as served:
+        return served
