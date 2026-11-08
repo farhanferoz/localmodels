@@ -1,4 +1,4 @@
-"""Hardware inspection, torch-free: real measurement over NVML/nvidia-smi/sysconf.
+"""Hardware inspection, torch-free: real measurement over NVML/nvidia-smi, ROCm's sysfs (AMD) and sysconf.
 
 service_a's probing wins here over service_c's ``inspect_hardware`` (commit body): service_c's
 version resolves a real device name/memory only through an optional ``import torch`` call, which
@@ -191,6 +191,141 @@ def _cuda_memory_gb() -> tuple[str, float | None] | None:
     return None
 
 
+# --- AMD GPUs under ROCm, read from the kernel's own files (torch-free) -----------------------------------
+# ROCm's PyTorch addresses an AMD GPU as "cuda" (torch.cuda.is_available() is True, the device is "cuda"), so
+# an AMD GPU is reported as DeviceType.CUDA. NVML and nvidia-smi do not see it; the amdgpu driver publishes
+# what is needed under sysfs. KFD is the kernel interface ROCm runs on: its topology lists one node per CPU
+# and GPU, in the order HIP numbers the GPUs. Measured on a Bosgame M5 (Ryzen AI Max+ 395, Radeon 8060S,
+# gfx1151, kernel 7.0.0-43) on 2026-11-08: node 1 has simd_count 80, gfx_target_version 110501,
+# local_mem_size 0 and drm_render_minor 128, and /sys/class/drm/renderD128/device has the memory counters.
+_KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+_DRM = Path("/sys/class/drm")
+# HIP applies these in this order, each indexing the GPUs the previous one left (ROCm docs, "GPU isolation
+# techniques"): ROCR_VISIBLE_DEVICES at the runtime, then HIP_VISIBLE_DEVICES, and HIP also honours
+# CUDA_VISIBLE_DEVICES. An empty value or one with no usable index hides every GPU.
+_ROCM_VISIBILITY_VARS = ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+
+
+class _RocmGpu(BaseModel):
+    node: int
+    gfx: str  # e.g. "gfx1151"
+    pci_id: str  # vendor:device, e.g. "1002:1586"
+    unified: bool  # KFD local_mem_size 0: an APU whose memory is the host's RAM
+    render_minor: int
+
+
+def _kfd_properties(node: Path) -> dict[str, int]:
+    props: dict[str, int] = {}
+    try:
+        for line in (node / "properties").read_text(encoding="ascii").splitlines():
+            key, _, value = line.partition(" ")
+            if value.strip().lstrip("-").isdigit():
+                props[key] = int(value)
+    except OSError:
+        pass
+    return props
+
+
+def _gfx_name(target_version: int) -> str:
+    """KFD's ``gfx_target_version`` as LLVM names the target: 110501 is gfx1151, 90402 is gfx942."""
+    major, minor, step = target_version // 10000, (target_version // 100) % 100, target_version % 100
+    return f"gfx{major}{minor}{step:x}"
+
+
+def _rocm_gpus() -> list[_RocmGpu]:
+    """Every AMD GPU KFD lists, in HIP's order; empty when there is no KFD (no amdgpu, not Linux)."""
+    try:
+        nodes = sorted((p for p in _KFD_NODES.iterdir() if p.name.isdigit()), key=lambda p: int(p.name))
+    except OSError:
+        return []
+    gpus = []
+    for node in nodes:
+        props = _kfd_properties(node)
+        if props.get("simd_count", 0) <= 0 or props.get("vendor_id") != 0x1002:  # noqa: PLR2004 — AMD's PCI vendor id
+            continue
+        gpus.append(
+            _RocmGpu(
+                node=int(node.name),
+                gfx=_gfx_name(props.get("gfx_target_version", 0)),
+                pci_id=f"{props['vendor_id']:04x}:{props.get('device_id', 0):04x}",
+                unified=props.get("local_mem_size", 0) == 0,
+                render_minor=props.get("drm_render_minor", -1),
+            )
+        )
+    return gpus
+
+
+def _rocm_gpu(ordinal: int) -> _RocmGpu | None:
+    """The AMD GPU HIP calls ``ordinal`` in this process, after the visibility variables; None when hidden."""
+    visible = list(range(len(_rocm_gpus())))
+    for var in _ROCM_VISIBILITY_VARS:
+        value = os.environ.get(var)
+        if value is None:
+            continue
+        picked: list[int] = []
+        for raw in value.split(","):
+            index = _CUDA_INDEX.match(raw.strip())
+            if index is None or not 0 <= int(index.group()) < len(visible):
+                break
+            picked.append(visible[int(index.group())])
+        visible = picked
+    if ordinal >= len(visible):
+        return None
+    return _rocm_gpus()[visible[ordinal]]
+
+
+def _rocm_counter(gpu: _RocmGpu, name: str) -> int | None:
+    try:
+        return int((_DRM / f"renderD{gpu.render_minor}" / "device" / name).read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return None
+
+
+def _rocm_memory_gb(ordinal: int = 0) -> tuple[str, float, bool] | None:
+    """(name, GiB the GPU can use, unified) of AMD GPU ``ordinal``; None when there is none or it is hidden.
+
+    A GPU with its own memory: its VRAM. An APU (unified): the GTT limit, the most it may map from the host's
+    RAM, which is what ROCm's torch reports as the device's total memory (on the M5 with a 1 GiB BIOS
+    carve-out and ``amd-ttm --set 109``: 109.0 GiB, matching ``torch.cuda.get_device_properties(0)``).
+    """
+    gpu = _rocm_gpu(ordinal)
+    if gpu is None:
+        return None
+    vram = _rocm_counter(gpu, "mem_info_vram_total") or 0
+    gtt = _rocm_counter(gpu, "mem_info_gtt_total") or 0
+    total = max(vram, gtt) if gpu.unified else vram
+    if total <= 0:
+        return None
+    return (f"AMD GPU {gpu.gfx} ({gpu.pci_id}, ROCm)", total / _GIB, gpu.unified)
+
+
+def _rocm_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:
+    """(free bytes, unified) of AMD GPU ``ordinal``, as ``_cuda_free_bytes`` reports an NVIDIA one."""
+    gpu = _rocm_gpu(ordinal)
+    if gpu is None:
+        return None
+    if gpu.unified:
+        return None, True
+    total, used = _rocm_counter(gpu, "mem_info_vram_total"), _rocm_counter(gpu, "mem_info_vram_used")
+    if total is None or used is None:
+        return None
+    return max(total - used, 0), False
+
+
+def _rocm_gtt_room(ordinal: int) -> int | None:
+    """Bytes an AMD APU may still map (GTT limit less GTT in use); None for no AMD GPU or no APU.
+
+    On an APU the GTT limit (``amd-ttm``, ``ttm.pages_limit``) caps the GPU below the host's free RAM.
+    """
+    gpu = _rocm_gpu(ordinal)
+    if gpu is None or not gpu.unified:
+        return None
+    total, used = _rocm_counter(gpu, "mem_info_gtt_total"), _rocm_counter(gpu, "mem_info_gtt_used")
+    if total is None or used is None:
+        return None
+    return max(total - used, 0)
+
+
 def _system_memory_gb() -> float | None:
     if platform.system() == "Darwin":
         try:
@@ -223,8 +358,8 @@ def _system_memory_or_fallback(assumptions: list[str]) -> float:
     return _FALLBACK_MEMORY_GB
 
 
-def inspect_hardware(device_override: str | None = None) -> HardwareReport:
-    """Probe the host (NVML → nvidia-smi → sysctl) and report measured hardware; never raises.
+def inspect_hardware(device_override: str | None = None) -> HardwareReport:  # noqa: PLR0912 — one branch per probe
+    """Probe the host (NVML → nvidia-smi → ROCm's sysfs → sysctl) and report measured hardware; never raises.
 
     ``device_override`` forces the device family (``"cuda"``, ``"cuda:0"``, ``"mps"``, ``"cpu"``)
     without skipping measurement: memory is still probed for the forced device where possible
@@ -243,8 +378,11 @@ def inspect_hardware(device_override: str | None = None) -> HardwareReport:
         name = f"override ({device_override})"
         if device is DeviceType.CUDA:
             cuda = _cuda_memory_gb()
+            rocm = None if cuda is not None and cuda[1] is not None else _rocm_memory_gb(0)
             if cuda is not None and cuda[1] is not None:
                 name, mem = cuda[0], cuda[1]
+            elif rocm is not None:
+                name, mem = rocm[0], rocm[1]
             else:
                 mem = _system_memory_or_fallback(assumptions)
                 assumptions.append(
@@ -266,6 +404,8 @@ def inspect_hardware(device_override: str | None = None) -> HardwareReport:
                 mem = _system_memory_or_fallback(assumptions)
             else:
                 mem = reported
+        elif (rocm := _rocm_memory_gb(0)) is not None:
+            device, name, mem = DeviceType.CUDA, rocm[0], rocm[1]
         else:
             mem = _system_memory_or_fallback(assumptions)
             if system == "darwin" and arch == "arm64":
@@ -317,7 +457,7 @@ def host_available_bytes(meminfo_path: str = _MEMINFO) -> int | None:
     return fields["MemAvailable"] * 1024 if "MemAvailable" in fields else None
 
 
-def _cuda_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:
+def _cuda_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:  # noqa: PLR0911 — one return per probe
     """(free bytes, unified) of CUDA device ``ordinal`` by NVML, then nvidia-smi; None when neither reads it.
 
     Unified (the device's memory is the host's RAM, free bytes None) when NVML reports the memory as not
@@ -327,6 +467,8 @@ def _cuda_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:
     gpu = _cuda_gpu(ordinal)
     if gpu is None:
         return None
+    if shutil.which("nvidia-smi") is None and (rocm := _rocm_free_bytes(ordinal)) is not None:
+        return rocm
 
     def free(nv: Any, handle: Any) -> tuple[int | None, bool]:
         try:
@@ -342,7 +484,7 @@ def _cuda_free_bytes(ordinal: int) -> tuple[int | None, bool] | None:
         pass
     parts = _smi_query("memory.free", gpu)
     if parts is None:
-        return None
+        return _rocm_free_bytes(ordinal)
     if parts[0].isdigit():
         return int(parts[0]) * 1024**2, False
     if parts[0] == "[N/A]":
@@ -374,6 +516,11 @@ def available_memory(device: str = "cuda", meminfo_path: str = _MEMINFO) -> Avai
                 return None
             return AvailableMemory(bytes=free, device=kind, unified=False, source="the GPU's own free memory")
         source += ", as this GPU shares the host's RAM and the driver's free count leaves out the page cache"
+        _, _, index = device.partition(":")
+        gtt_room = _rocm_gtt_room(int(index) if index else 0)
+        if host is not None and gtt_room is not None and gtt_room < host:
+            host = gtt_room
+            source = "the GPU's GTT limit less what it holds (an AMD APU cannot map more of the host's RAM)"
     if host is None:
         return None
     return AvailableMemory(bytes=host, device=kind, unified=unified, source=source)

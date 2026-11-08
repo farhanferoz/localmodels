@@ -80,3 +80,14 @@ def no_real_loopback_login(monkeypatch: pytest.MonkeyPatch) -> LoginDouble:
     double = LoginDouble()
     monkeypatch.setattr("localmodels.loopback.loopback_login", lambda: double)
     return double
+
+
+@pytest.fixture(autouse=True)
+def no_real_amd_gpu(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test sees the host's own AMD GPU through sysfs: hardware tests then mean the same on every machine.
+
+    Tests that want an AMD GPU build a fake KFD and DRM tree (``tests/test_hardware.py``, ``fake_rocm``).
+    """
+    empty = tmp_path_factory.mktemp("no-kfd")
+    monkeypatch.setattr("localmodels.hardware._KFD_NODES", empty / "nodes")
+    monkeypatch.setattr("localmodels.hardware._DRM", empty / "drm")

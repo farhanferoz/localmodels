@@ -273,3 +273,126 @@ def test_gpu_process_memory_is_per_process_and_none_without_a_reading(monkeypatc
     assert after is not None
     assert after - before >= 200  # the reading follows the process, not a constant
     assert hw_mod.process_anon_mib(2**22 + 1) is None  # above the kernel's pid limit
+
+
+# --- AMD GPUs under ROCm (sysfs) ---------------------------------------------------------------------------
+
+_GIB_BYTES = 1024**3
+
+
+def fake_rocm(
+    root,
+    monkeypatch,
+    *,
+    gtt_gib: float = 109.0,
+    vram_gib: float = 1.0,
+    unified: bool = True,
+    gtt_used_gib: float = 0.0,
+    vram_used_gib: float = 0.0,
+) -> None:
+    """KFD topology: CPU node 0 and one AMD GPU node 1, as on a Bosgame M5 (gfx1151, render minor 128)."""
+    nodes, drm = root / "nodes", root / "drm"
+    (nodes / "0").mkdir(parents=True)
+    (nodes / "0" / "properties").write_text("simd_count 0\nvendor_id 0\n")
+    (nodes / "1").mkdir()
+    local = 0 if unified else int(vram_gib * _GIB_BYTES)
+    (nodes / "1" / "properties").write_text(
+        f"simd_count 80\ngfx_target_version 110501\nvendor_id 4098\ndevice_id 5510\n"
+        f"local_mem_size {local}\ndrm_render_minor 128\n"
+    )
+    dev = drm / "renderD128" / "device"
+    dev.mkdir(parents=True)
+    for name, gib in (
+        ("mem_info_gtt_total", gtt_gib),
+        ("mem_info_gtt_used", gtt_used_gib),
+        ("mem_info_vram_total", vram_gib),
+        ("mem_info_vram_used", vram_used_gib),
+    ):
+        (dev / name).write_text(f"{int(gib * _GIB_BYTES)}\n")
+    monkeypatch.setattr(hw_mod, "_KFD_NODES", nodes)
+    monkeypatch.setattr(hw_mod, "_DRM", drm)
+    monkeypatch.setattr(hw_mod, "_cuda_memory_gb", lambda: None)  # no NVIDIA GPU
+    monkeypatch.setattr(hw_mod.shutil, "which", lambda _: None)
+    for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_gfx_name_follows_llvm_target_names() -> None:
+    assert hw_mod._gfx_name(110501) == "gfx1151"
+    assert hw_mod._gfx_name(90402) == "gfx942"
+    assert hw_mod._gfx_name(90010) == "gfx90a"
+
+
+def test_an_amd_apu_is_a_cuda_device_with_its_gtt_limit_as_memory(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    rep = inspect_hardware()
+    assert rep.device == DeviceType.CUDA
+    assert rep.device_name == "AMD GPU gfx1151 (1002:1586, ROCm)"
+    assert rep.total_memory_gb == 109.0
+    assert rep.tier == DeviceTier.FAST_ACCELERATED
+    assert resolve_device(None) == "cuda"
+
+
+def test_a_discrete_amd_gpu_reports_its_vram(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, unified=False, vram_gib=24.0, gtt_gib=31.0)
+    assert inspect_hardware().total_memory_gb == 24.0
+
+
+def test_a_cuda_override_on_an_amd_gpu_measures_it(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    rep = inspect_hardware("cuda:0")
+    assert rep.device_name.startswith("AMD GPU gfx1151")
+    assert rep.total_memory_gb == 109.0
+    assert rep.assumptions == []
+
+
+@pytest.mark.parametrize("var", ["ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"])
+@pytest.mark.parametrize("value", ["", "-1", "1", "x"])
+def test_hiding_the_amd_gpu_means_no_gpu(tmp_path, monkeypatch, var, value) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    monkeypatch.setattr(hw_mod, "_system_memory_gb", lambda: 122.0)
+    monkeypatch.setenv(var, value)
+    assert hw_mod._rocm_gpu(0) is None
+    assert inspect_hardware(None).device == DeviceType.CPU
+
+
+def test_selecting_the_amd_gpu_by_index_keeps_it(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    assert hw_mod._rocm_gpu(0) is not None
+    assert hw_mod._rocm_gpu(1) is None
+
+
+def test_available_memory_on_an_amd_apu_is_capped_by_the_gtt_room(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, gtt_gib=109.0, gtt_used_gib=9.0)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 128000000 kB\nMemAvailable: 120000000 kB\n")
+    got = hw_mod.available_memory("cuda", meminfo_path=str(meminfo))
+    assert got is not None
+    assert got.unified
+    assert got.bytes == 100 * _GIB_BYTES
+    assert "GTT" in got.source
+
+
+def test_available_memory_on_an_amd_apu_is_the_host_when_that_is_smaller(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, gtt_gib=109.0)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 128000000 kB\nMemAvailable: 10485760 kB\n")  # 10 GiB
+    got = hw_mod.available_memory("cuda", meminfo_path=str(meminfo))
+    assert got is not None
+    assert got.bytes == 10 * _GIB_BYTES
+    assert "MemAvailable" in got.source
+
+
+def test_available_memory_on_a_discrete_amd_gpu_is_its_free_vram(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, unified=False, vram_gib=24.0, vram_used_gib=4.0)
+    got = hw_mod.available_memory("cuda")
+    assert got is not None
+    assert not got.unified
+    assert got.bytes == 20 * _GIB_BYTES
+
+
+def test_no_kfd_means_no_amd_gpu(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(hw_mod, "_KFD_NODES", tmp_path / "absent")
+    assert hw_mod._rocm_gpus() == []
+    assert hw_mod._rocm_memory_gb(0) is None
