@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -304,3 +305,84 @@ def test_the_reaper_removes_only_containers_of_jobs_no_longer_running() -> None:
     removed.clear()
     failed = Reaper(docker=docker, squeue=squeue(1)).run()
     assert (removed, failed.reason) == ([], "squeue did not answer: nothing removed")
+
+
+def test_gpu_peak_is_sampled_from_the_containers_processes_and_a_failed_call_is_no_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = FakeDocker()
+    docker.running.add("run0001")
+    procs = tmp_path / "cgroup"
+    procs.mkdir()
+    (procs / "cgroup.procs").write_text("111\n112\n", encoding="utf-8")
+    readings: list[dict[int, int] | None] = [
+        {111: 3327, 999: 40000},  # another process's memory is not ours
+        None,  # nvidia-smi failed: no reading, the peak stays
+        {111: 1024, 112: 1024},
+        {111: 500},
+    ]
+    run = make_run(tmp_path, record(), docker, gpu_memory=lambda: readings.pop(0))
+    monkeypatch.setattr(ContainerRun, "_cgroup", lambda _self, _cid: procs)
+    assert run.memory().gpu_peak_gib is None  # nothing read yet: not zero
+    for _ in range(4):
+        run._sample_gpu()
+    assert run.memory().gpu_peak_gib == pytest.approx(3327 / 1024)  # the largest, not the last
+
+
+def test_the_stamp_carries_the_recipe_the_settings_and_the_cache_and_tuning_listings(tmp_path: Path) -> None:
+    cache = tmp_path / "spark-cache"
+    leaf = cache / "runtime-cache" / "sglang" / "img-1" / "model-2"
+    (leaf / "inductor").mkdir(parents=True)
+    (leaf / "inductor" / "k.bin").write_text("12345", encoding="utf-8")
+    (leaf / ".sparkrun-last-used").touch()
+    stale = cache / "runtime-cache" / "sglang" / "old" / ".sparkrun-last-used"
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    os.utime(stale, (1, 1))  # an old tree of another image: not this run's
+    (cache / "tuning" / "sglang").mkdir(parents=True)
+    (cache / "tuning" / "sglang" / "t.json").write_text("{}", encoding="utf-8")
+    recipe = {
+        "runtime": "sglang",
+        "model_revision": "abc",
+        "defaults": {"port": 1, "gpu_memory_utilization": 0.3, "max_num_seqs": 16},
+    }
+    run = make_run(tmp_path, record(), FakeDocker(), recipe=recipe, sparkrun_cache=cache)
+    run._launched_at = time.time()
+    first = run.stamp()
+    assert first["model_revision"] == "abc"
+    assert (first["memory_fraction"], first["max_sequences"]) == ("0.3", "16")
+    assert first["autotune_cache_key"] == "sglang/img-1/model-2"
+    assert len(first["recipe_sha256"]) == 64
+    assert first["tuning_hash"] != "absent"
+    (leaf / "inductor" / "k2.bin").write_text("1", encoding="utf-8")  # a new kernel changes the listing hash
+    assert run.stamp()["autotune_cache_hash"] != first["autotune_cache_hash"]
+    cacheless = make_run(
+        tmp_path,
+        record(),
+        FakeDocker(),
+        recipe={**recipe, "runtime_cache": False},
+        sparkrun_cache=cache / "none",
+    )
+    stamp = cacheless.stamp()
+    assert (stamp["autotune_cache_key"], stamp["autotune_cache_hash"], stamp["tuning_hash"]) == (
+        "off",
+        "absent",
+        "absent",
+    )
+
+
+def test_record_result_adds_the_runs_memory_and_what_it_measured(tmp_path: Path) -> None:
+    rec = record(measured=None)
+    run = make_run(tmp_path, rec, FakeDocker())
+    run._gpu_peak = 20.0
+    run._free_before, run._lowest_free = 90.0, 60.0
+    container_run.record_result(rec, MODEL, run, extra={"kind": "warm", "complete": True})
+    entry = container_run.read_record(Engine.SGLANG, rec.tag).results[-1]  # type: ignore[union-attr]
+    assert entry["memory"]["fall_gib"] == 30.0
+    assert (entry["gpu_peak_gib"], entry["kind"], entry["complete"], entry["run"]) == (
+        20.0,
+        "warm",
+        True,
+        "run0001",
+    )
+    assert MemoryNeed.recorded(container_run.read_record(Engine.SGLANG, rec.tag), MODEL) == 30.0  # type: ignore[arg-type]

@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Self
 
 from .engines import VersionRecord, docker_runner, read_record, run_command, write_record
+from .hardware import gpu_process_memory_mib
 from .launcher import MemoryGuards, NotEnoughMemoryError, ServerStartError, check_fits, kill_below_floor
 from .stack import Engine
 
@@ -70,6 +72,18 @@ POLL_S: Final = 1.0
 START_TIMEOUT_S: Final = 900.0
 STOP_TIMEOUT_S: Final = 120.0
 SQUEUE_TIMEOUT_S: Final = 30.0
+MIB_PER_GIB: Final = 1024
+#: sparkrun's own cache (``core/config.py`` ``DEFAULT_CACHE_DIR``): the runtime cache and the tuning folders.
+SPARKRUN_CACHE: Final = Path.home() / ".cache" / "sparkrun"
+RUNTIME_CACHE_SUBDIR: Final = (
+    "runtime-cache"  # core/runtime_cache.py: ``<cache>/runtime-cache/<family>/<keys>``
+)
+LAST_USED_MARKER: Final = ".sparkrun-last-used"  # touched in the run's cache leaf at every launch
+TUNING_SUBDIR: Final = "tuning"  # tuning/{sglang,vllm}.py: ``<cache>/tuning/<family>``
+ABSENT: Final = "absent"
+#: The recipe's own names for the stamp's memory fraction and maximum sequences, by sparkrun runtime.
+MEMORY_FRACTION_KEYS: Final = ("gpu_memory_utilization", "free_gpu_memory_fraction")
+MAX_SEQUENCES_KEYS: Final = ("max_num_seqs", "max_batch_size")
 
 
 class RunKind(StrEnum):
@@ -181,6 +195,9 @@ class ContainerRun:
     free_gib: Callable[[], float | None] = _available_gib
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     reaper: Reaper | None = None  # default: a ``Reaper`` on ``docker`` and the real ``squeue``
+    #: The GPU memory each process holds now, MiB by host pid (``nvidia-smi``); None when it cannot say.
+    gpu_memory: Callable[[], dict[int, int] | None] = gpu_process_memory_mib
+    sparkrun_cache: Path = SPARKRUN_CACHE
     _recipe_file: Path | None = field(default=None, init=False)
     _run_root: Path | None = field(default=None, init=False)
     _stopped: threading.Event = field(default_factory=threading.Event, init=False)
@@ -192,6 +209,8 @@ class ContainerRun:
     _host_peak: float | None = field(default=None, init=False)  # read in ``stop`` before the removal
     _sigterm_installed: bool = field(default=False, init=False)
     _oom_failing: bool | None = field(default=None, init=False)  # the last logged outcome
+    _gpu_peak: float | None = field(default=None, init=False)  # GiB, the largest reading of the guard's polls
+    _launched_at: float | None = field(default=None, init=False)  # wall clock, to find this run's cache leaf
 
     # --- before the start -------------------------------------------------------------------------
 
@@ -315,6 +334,7 @@ class ContainerRun:
         recipe = self._write_recipe(self._prepare_hub())
         self._install_sigterm()
         self._start_guard()
+        self._launched_at = time.time()
         done = run_sparkrun(
             self.sparkrun, self._run_args(recipe, need), timeout=START_TIMEOUT_S, hub_root=self._run_root
         )
@@ -375,7 +395,7 @@ class ContainerRun:
                     f"{self.record.engine.value} container",
                     alive=lambda: not self._stopped.is_set(),
                     kill=self._docker_kill,
-                    on_poll=self._raise_oom_score,
+                    on_poll=self._on_poll,
                 )
             )
             while self._killed and not self._stopped.wait(POLL_S):
@@ -383,6 +403,11 @@ class ContainerRun:
 
         self._guard = threading.Thread(target=watch, name=f"guard-{self.run_id[:8]}", daemon=True)
         self._guard.start()
+
+    def _on_poll(self) -> None:
+        """At each guard poll: the OOM score of the container's processes, and the GPU memory they hold."""
+        self._raise_oom_score()
+        self._sample_gpu()
 
     def _sample_free(self) -> float | None:
         free = self.free_gib()
@@ -409,6 +434,27 @@ class ContainerRun:
     def _cgroup(self, cid: str) -> Path:
         return Path("/sys/fs/cgroup/system.slice") / f"docker-{cid}.scope"
 
+    def _pids(self, cid: str) -> list[str]:
+        """The processes of one container, from its cgroup (host pids)."""
+        return (self._cgroup(cid) / "cgroup.procs").read_text(encoding="utf-8").split()
+
+    def _sample_gpu(self) -> None:
+        """Keep the largest GPU memory the container's processes hold (``nvidia-smi`` lists them by host pid).
+
+        A failed call, or none of the container's processes listed yet, is no reading (not zero).
+        """
+        held = self.gpu_memory()
+        if held is None:
+            return
+        mine: set[int] = set()
+        for cid in self.container_ids():
+            with contextlib.suppress(OSError):
+                mine.update(int(pid) for pid in self._pids(cid))
+        rows = [mib for pid, mib in held.items() if pid in mine]
+        if rows:
+            total = sum(rows) / MIB_PER_GIB
+            self._gpu_peak = total if self._gpu_peak is None else max(self._gpu_peak, total)
+
     def _raise_oom_score(self) -> None:
         """Give every process of the container the guards' OOM score (raising it needs no privilege)."""
         score = self.guards.server_oom_score_adj
@@ -417,7 +463,7 @@ class ContainerRun:
         done, failed = 0, []
         for cid in self.container_ids():
             try:
-                pids = (self._cgroup(cid) / "cgroup.procs").read_text(encoding="utf-8").split()
+                pids = self._pids(cid)
             except OSError as exc:
                 failed.append(f"{cid[:12]}: {exc}")
                 continue
@@ -450,19 +496,73 @@ class ContainerRun:
         if self._free_before is not None and self._lowest_free is not None:
             fall = max(0.0, self._free_before - self._lowest_free)
         peak = self._host_peak if self._stopped.is_set() else self.host_peak_gib()
-        return MemoryNeed(fall_gib=fall, host_peak_gib=peak)
+        return MemoryNeed(fall_gib=fall, gpu_peak_gib=self._gpu_peak, host_peak_gib=peak)
+
+    @property
+    def killed(self) -> str | None:
+        """Why the memory guard killed this run's container; None when it did not."""
+        return self._killed
+
+    def _setting(self, keys: Sequence[str]) -> str:
+        """The recipe's value for the first of ``keys`` it sets (the runtimes name these differently)."""
+        defaults = self.recipe.get("defaults") or {}
+        return next((str(defaults[key]) for key in keys if key in defaults), "")
+
+    def _cache_off(self) -> bool:
+        setting = self.recipe.get("runtime_cache", True)
+        return setting is False or (isinstance(setting, dict) and setting.get("enabled") is False)
+
+    def cache_leaf(self) -> Path | None:
+        """The runtime-cache folder this run used: the one whose last-used marker was touched since launch."""
+        family = self.sparkrun_cache / RUNTIME_CACHE_SUBDIR / self.record.engine.value
+        since = (self._launched_at or 0.0) - 5.0  # the marker is touched by the launch script, not by us
+        marks = [(m.stat().st_mtime, m.parent) for m in family.rglob(LAST_USED_MARKER) if m.is_file()]
+        fresh = [(when, leaf) for when, leaf in marks if when >= since]
+        return max(fresh, default=(0.0, None))[1]
 
     def stamp(self) -> dict[str, str]:
-        """What a result served by this run carries (design 3.7; E4 adds the autotune and tuning hashes)."""
+        """What a result served by this run carries (design 3.7).
+
+        The two cache hashes are of a listing (sorted relative path and size of every file), not of the
+        contents: the runtime cache holds gigabytes of compiled kernels, too slow to read at every stamp.
+        """
+        leaf = None if self._cache_off() else self.cache_leaf()
+        family = self.record.engine.value
         return {
-            "engine": self.record.engine.value,
+            "engine": family,
             "image": self.record.image,
             "tag": self.record.tag,
             "publisher": self.record.publisher.value,
             "sparkrun_version": self.record.sparkrun_version,
             "model_file": self.model,
             "run": self.run_id,
+            "recipe_sha256": hashlib.sha256(json.dumps(self.recipe, sort_keys=True).encode()).hexdigest(),
+            "model_revision": str(self.recipe.get("model_revision", "")),
+            "memory_fraction": self._setting(MEMORY_FRACTION_KEYS),
+            "max_sequences": self._setting(MAX_SEQUENCES_KEYS),
+            "autotune_cache_key": "off"
+            if self._cache_off()
+            else (
+                leaf.relative_to(self.sparkrun_cache / RUNTIME_CACHE_SUBDIR).as_posix() if leaf else ABSENT
+            ),
+            "autotune_cache_hash": listing_hash(leaf) if leaf else ABSENT,
+            "tuning_hash": listing_hash(self.sparkrun_cache / TUNING_SUBDIR / family),
         }
+
+    def dry_run(self) -> subprocess.CompletedProcess[str]:
+        """``sparkrun run --dry-run`` in the per-run Hub layout of a real start; launches nothing."""
+        try:
+            recipe = self._write_recipe(self._prepare_hub())
+            args = [*self._run_args(recipe, self.need_gib()), "--dry-run"]
+            return run_sparkrun(self.sparkrun, args, timeout=STOP_TIMEOUT_S, hub_root=self._run_root)
+        finally:
+            self._remove_files()
+
+    def _remove_files(self) -> None:
+        if self._run_root is not None:
+            shutil.rmtree(self._run_root, ignore_errors=True)
+        if self._recipe_file is not None:
+            self._recipe_file.unlink(missing_ok=True)
 
     def stop(self) -> None:
         """Stop the server and remove its containers, then log what was left; safe to call more than once."""
@@ -484,20 +584,35 @@ class ContainerRun:
         if self._sigterm_installed and threading.current_thread() is threading.main_thread():
             # None: a handler not set from Python, which cannot be put back; the default stands in
             signal.signal(signal.SIGTERM, self._previous_handler or signal.SIG_DFL)
-        if self._run_root is not None:
-            shutil.rmtree(self._run_root, ignore_errors=True)
-        if self._recipe_file is not None:
-            self._recipe_file.unlink(missing_ok=True)
+        self._remove_files()
 
 
-def record_memory(record: VersionRecord, model: str, run: ContainerRun, gpu_peak_gib: float | None) -> None:
-    """Add a run's memory to the version's record: the next start's need is then measured, not seeded."""
+def listing_hash(folder: Path) -> str:
+    """A hash of every file's relative path and size under ``folder``; "absent" if it is not there."""
+    if not folder.is_dir():
+        return ABSENT
+    rows = sorted(
+        (p.relative_to(folder).as_posix(), p.stat().st_size) for p in folder.rglob("*") if p.is_file()
+    )
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+
+
+def record_result(
+    record: VersionRecord, model: str, run: ContainerRun, *, extra: Mapping[str, object]
+) -> None:
+    """Add a run's memory and result to the version's record, so the next start's need is measured.
+
+    ``extra`` is the caller's part of the entry (``kind``, ``job``, ``result_file``, ``complete``,
+    ``figures``, ``startup_s``, ``stamp``); the GPU peak the run sampled is added from ``run.memory()``.
+    """
     latest = read_record(record.engine, record.tag) or record  # a job may have added results meanwhile
     memory = run.memory()
     entry = {
         "model": model,
-        "memory": {**dataclasses.asdict(memory), "gpu_peak_gib": gpu_peak_gib},
+        "memory": dataclasses.asdict(memory),
         "run": run.run_id,
+        "gpu_peak_gib": memory.gpu_peak_gib,
+        **extra,
     }
     write_record(latest.model_copy(update={"results": [*latest.results, entry]}))
 
