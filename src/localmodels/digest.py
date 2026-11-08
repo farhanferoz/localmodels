@@ -73,6 +73,7 @@ PYPI_JSON = "https://pypi.org/pypi/{package}/json"
 PYPI_TORCH = PYPI_JSON.format(package="torch")
 #: Its GitHub releases are one tag per hardware variant (-vulkan, -metal, ...); PyPI names the one version.
 PYPI_LLAMA_CPP_PYTHON = PYPI_JSON.format(package="llama-cpp-python")
+PYPI_RELEASE = "https://pypi.org/project/{package}/{version}/"  # the page a reader follows
 TORCH_ARCH_FILE = ".ci/manywheel/build_env_setup.py"
 AARCH64_ARCHS = re.compile(r'"aarch64"\s*:\s*\{([^}]*)\}')
 SM121 = "121"
@@ -350,7 +351,7 @@ def check_llama_cpp_python(ctx: Context) -> list[Finding]:
     if not ctx.changed("version", version):
         return []
     text = f"release {version}: a project that upgrades it gets its models re-tuned (D2, D24)"
-    return [Finding(text, PYPI_LLAMA_CPP_PYTHON)]
+    return [Finding(text, PYPI_RELEASE.format(package="llama-cpp-python", version=version))]
 
 
 def check_libraries(ctx: Context) -> list[Finding]:

@@ -118,5 +118,7 @@ def test_note_lines_follow_the_format_the_rules_command_parses(tmp_path: Path) -
     assert by_source[Source.D1] == "K1,K2,K3"
     assert by_source[Source.D8] == "K1,K2"
     assert by_source[Source.D15] == "K1,K2,K3"
+    d15 = next(m for m in parsed if m and m.group("source") == Source.D15)
+    assert d15.group("link") == "https://pypi.org/project/llama-cpp-python/0.3.36/"  # a page, not the API
     again = Context(net, SINCE, {"version": "0.3.36"})
     assert digest.check_llama_cpp_python(again) == []  # the same release is reported once
