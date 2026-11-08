@@ -144,6 +144,9 @@ SOFT_LIMIT_S: Final = HARD_LIMIT_S - STOP_MARGIN_S  # no step starts that would 
 BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
 OUT_OF_TIME: Final = "not measured: out of time"  # a step the hard limit cut short
+NO_ROOM: Final = (
+    "not tried: a run of the reference left less than the margin free"  # never loaded again (D22)
+)
 SIGTERM_EXIT: Final = 128 + signal.SIGTERM
 
 # exit codes of the command
@@ -556,6 +559,7 @@ class LlamaTune:
         self._started = clock() if started is None else started  # the command's own start, before any wait
         self.measurements: list[BaseModel] = []
         self.arms: list[ArmResult] = []  # the first run of each arm; a restart is only kept in the record
+        self.restart: ArmResult | None = None  # the reference's restart, which the memory screens read too
         self.bench: dict[int, BenchRow] = {}
         self.bench_tried = False  # llama-bench is screened and run once; refused or failed, never again
         self.guard_kill: str | None = None  # why a server's memory guard killed it; the tune then stops
@@ -593,6 +597,20 @@ class LlamaTune:
     def reference(self) -> ArmResult:
         """The reference arm (measured first)."""
         return self.arms[0]
+
+    def _reference_runs(self) -> list[ArmResult]:
+        """The reference's runs so far: its first and, once made, its restart."""
+        return [*self.arms[:1], *([self.restart] if self.restart is not None else [])]
+
+    @property
+    def reference_peak_gib(self) -> float | None:
+        """The largest peak over the reference's runs: the figure the memory screens add to."""
+        return max((run.peak_gib for run in self._reference_runs() if run.peak_gib is not None), default=None)
+
+    @property
+    def reference_fits(self) -> bool:
+        """False once a run of the reference left less than the margin free: nothing loads it again (D22)."""
+        return all(run.fits is not False for run in self._reference_runs())
 
     def _arm_cost(self, arm: ArmResult | None = None, *, checked: bool = False) -> float:
         """What one more server start is estimated at: its start, run and stop (design 6.7).
@@ -808,6 +826,7 @@ class LlamaTune:
             self._skip("reference restart", OUT_OF_BUDGET)
             return
         again = await self._serve(Settings(), self.spec.reference, checked=False)
+        self.restart = again
         self.measurements.append(again.model_copy(update={"name": "reference#restart"}))
         if again.error:
             self._skip("reference restart", f"not measured: {again.error}")
@@ -836,9 +855,13 @@ class LlamaTune:
         """Whether the reference's measured peak plus the draft file leaves the margin available; else skip.
 
         From the reference's own peak, the figure for this model at this layout, so a draft that cannot fit
-        costs no server start. Nothing to estimate (no draft file, or no figure) lets the arm run.
+        costs no server start. Nothing to estimate (no draft file, or no figure) lets the arm run, unless a
+        run of the reference already did not fit.
         """
-        peak, free = self.reference.peak_gib, self._free_gib()
+        if not self.reference_fits:
+            self._skip(name, NO_ROOM)
+            return False
+        peak, free = self.reference_peak_gib, self._free_gib()
         if peak is None or free is None or draft_file is None:
             return True
         try:
@@ -870,6 +893,12 @@ class LlamaTune:
         best = self._pick(assume_repeat=True)
         spec = best.settings if best.settings.spec not in (None, SpecType.NONE) else Settings()
         settings = Settings(n_ubatch=self.ub_star, spec=spec.spec, spec_draft_file=spec.spec_draft_file)
+        draft = 0.0
+        if spec.spec_draft_file is not None:
+            with contextlib.suppress(OSError):  # the server's own start reports a missing draft
+                draft = (await asyncio.to_thread(Path(spec.spec_draft_file).stat)).st_size / GIB
+        if not await self._fits_screen(self.ub_star, name="-ub arm", extra_gib=draft):
+            return
         await self._run_arm(
             settings, self.spec.reference, checked=bool(spec.spec and self.spec.quality_command)
         )
@@ -938,26 +967,28 @@ class LlamaTune:
         self.bench = bench_rows(result.raw_rows, self.spec.prompt_tokens)
         self.measurements.extend(self.bench.values())
 
-    async def _fits_screen(self, ubatch: int, name: str | None = None) -> bool:
+    async def _fits_screen(self, ubatch: int, name: str | None = None, extra_gib: float = 0.0) -> bool:
         """Whether a server at this ``-ub`` leaves the margin free: it keeps what cannot fit from starting.
 
         The reference's measured peak, the figure for this model as it runs, plus what ``llama-fit-params``
         projects this ``-ub`` to add over the default; the projection alone without a measured reference.
-        ``name`` is the step a refusal is recorded under (``-ub <ubatch>`` by default).
+        ``name`` is the step a refusal is recorded under (``-ub <ubatch>`` by default); ``extra_gib`` is
+        what the step loads beside the model (a draft file).
         """
         name = name or f"-ub {ubatch}"
-        if self.arms and self.reference.fits is False:  # the memory now is no reason to load it again (D22)
-            self._skip(name, "not tried: the reference itself left less than the margin free")
+        if self.arms and not self.reference_fits:  # the memory now is no reason to load it again (D22)
+            self._skip(name, NO_ROOM)
             return False
         free = self._free_gib()
         if free is None:
             self._skip(name, "not measured: memory not measured (available memory cannot be read)")
             return False
-        peak = self.reference.peak_gib if self.arms else None
+        peak = self.reference_peak_gib
         try:
             need = await self._screen(ubatch)
             if peak is not None:
                 need = peak + max(0.0, need - await self._screen(UB_REFERENCE))
+            need += extra_gib
         except LocalModelsError as exc:
             self._skip(name, f"not measured: llama-fit-params gave no projection ({exc})")
             return False
@@ -1156,7 +1187,8 @@ class LlamaTune:
             if held and pid in held:
                 host = (process_anon_mib(pid) or 0) if self._unified else 0
                 peaks.append(held[pid] + host)
-            reading = available_memory("cuda")  # not _free_gib(): it also sets the memory kind
+            # not _free_gib(), which also sets the memory kind; off the loop, as the guard shares it
+            reading = await asyncio.to_thread(available_memory, "cuda")
             if reading is not None:
                 lows.append(reading.bytes / GIB)
             await asyncio.sleep(SAMPLE_INTERVAL_S)

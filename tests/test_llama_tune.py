@@ -421,6 +421,20 @@ async def test_a_draft_that_cannot_fit_beside_the_reference_is_not_started(tmp_p
     await tune.tune()
     assert "draft-mtp:mtp.gguf" in tune.calls
 
+    # the -ub arm loads the draft beside the larger -ub: screened with both (D22). 86.5 GiB and the 3 GiB
+    # draft fit (99.5 of 100); with the -ub's 1 GiB more as well they do not
+    script["reference"] = {**script["reference"], "peak_gib": 86.5}
+    tune = FakeTune(make_spec(tmp_path, speculation=(candidate,)), script)
+
+    async def larger(ubatch: int) -> float:
+        return {512: 10.0, 1024: 10.5, 2048: 11.0}[ubatch]
+
+    tune._screen = larger  # type: ignore[method-assign]
+    await tune.tune()
+    assert tune.ub_star == 2048
+    skipped = {m.name: m.reason for m in tune.measurements if isinstance(m, NotMeasured)}
+    assert skipped["-ub arm"].startswith("not tried: about 90.5 GiB at -ub 2048")
+
 
 async def test_a_short_budget_starts_the_models_own_speculation_first_and_skips_the_rest(
     tmp_path: Path,
@@ -798,7 +812,7 @@ async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> N
     assert not any(t.startswith("llama-perplexity") for t in tune.tools)
     skipped = {m.name: m.reason for m in tune.measurements if isinstance(m, NotMeasured)}
     assert skipped["reference restart"].startswith("not tried: the reference's peak of 91.4 GiB")
-    assert skipped["llama-bench"] == "not tried: the reference itself left less than the margin free"
+    assert skipped["llama-bench"] == llama_tune.NO_ROOM
     assert record.candidate == "reference"
 
     class Killed(FakeTune):
@@ -825,6 +839,19 @@ async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> N
     with pytest.raises(LlamaTuneError, match="loads nothing more"):
         await killed.tune()
     assert killed.calls == ["reference", "reference", "draft-mtp", "ngram-mod", "draft-mtp"]
+
+    # a restart that does not fit, with no kill: nothing loads the model again either
+    class RestartTooBig(FakeTune):
+        async def _measure_server(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+            arm = await super()._measure_server(settings, files, checked=checked)
+            if self.calls.count("reference") == 2:  # 95 GiB + 10 kept free > 100 available
+                arm.peak_gib, arm.fits = 95.0, False
+            return arm
+
+    big = RestartTooBig(make_spec(tmp_path, speculation=MTP_ONLY), arm_script())
+    await big.tune()
+    assert big.calls == ["reference", "reference"]
+    assert "llama-bench" not in big.tools
 
     # a llama-bench that failed is not run again by the next -ub step
     class BenchFails(FakeTune):
