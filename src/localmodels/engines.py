@@ -147,7 +147,7 @@ class VersionSource:
     engine: Engine
     registry: str
     repository: str
-    #: The whole tag; groups ``major``, ``minor``, ``patch`` and maybe ``rc`` or ``build`` give its order.
+    #: The whole tag; groups ``major``, ``minor``, ``patch`` and maybe ``rc``, ``build`` or ``post`` order it.
     tag_pattern: re.Pattern[str]
     publisher: Publisher
 
@@ -158,7 +158,8 @@ class VersionSource:
 
 
 #: Checked 2026-11-08 (docs/research/engine-registry-search-2026-11-08.md). SGLang is exactly ``-cu130``: not
-#: ``-runtime``, ``-efa`` or another variant. TensorRT-LLM release candidates sort before their release.
+#: ``-runtime``, ``-efa`` or another variant; its ``.postN`` hotfix releases count, after their base
+#: release, and its release candidates do not. TensorRT-LLM release candidates sort before their release.
 SOURCES: Final = (
     VersionSource(
         Engine.VLLM,
@@ -178,7 +179,7 @@ SOURCES: Final = (
         Engine.SGLANG,
         DOCKER_HUB,
         "lmsysorg/sglang",
-        re.compile(r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)-cu130$"),
+        re.compile(r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:\.post(?P<post>\d+))?-cu130$"),
         Publisher.OFFICIAL,
     ),
     VersionSource(
@@ -208,7 +209,7 @@ def tag_key(source: VersionSource, tag: str) -> tuple[int, ...] | None:
         return None
     groups = match.groupdict()
     release = 1 if groups.get("rc") is None else 0
-    extra = int(groups.get("rc") or groups.get("build") or 0)
+    extra = int(groups.get("rc") or groups.get("build") or groups.get("post") or 0)
     return (int(groups["major"]), int(groups["minor"]), int(groups["patch"]), release, extra)
 
 

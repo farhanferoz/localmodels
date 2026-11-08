@@ -103,7 +103,10 @@ def test_tag_order_forms_and_the_newest_never_tried() -> None:
     assert matching_tags(trt, tags) == ["1.3.0rc3", "1.3.0rc13", "1.4.0rc3", "1.4.0rc13", "1.4.0"]
     variants = ["v0.5.23-cu130", "v0.5.23-cu130-runtime", "v0.5.23-cu130-efa", "v0.5.23", "v0.5.9-cu130"]
     sglang = source(Engine.SGLANG)
-    assert matching_tags(sglang, [*variants, "v0.5.10.post1-cu130"]) == ["v0.5.9-cu130", "v0.5.23-cu130"]
+    hotfixes = ["v0.5.10.post1-cu130", "v0.5.10-cu130", "v0.5.10rc0-cu130", "v0.5.10.post1-cu130-runtime"]
+    # an official hotfix release comes after its base; release candidates are not offered
+    expected = ["v0.5.9-cu130", "v0.5.10-cu130", "v0.5.10.post1-cu130", "v0.5.23-cu130"]
+    assert matching_tags(sglang, [*variants, *hotfixes]) == expected
     official = source(Engine.VLLM)
     community = source(Engine.VLLM, Publisher.COMMUNITY)
     mixed = ["v0.33.0", "v0.33.0-gb10.0", "v0.33.0rc1", "v0.9.0", "v0.32.0-gb10.10", "v0.32.0-gb10.2"]
