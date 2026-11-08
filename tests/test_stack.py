@@ -205,7 +205,8 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
 def test_importing_localmodels_does_not_import_the_stack_or_engines_modules() -> None:
     code = (
         "import sys, localmodels; "
-        "lazy = ('localmodels.stack', 'localmodels.engines', 'localmodels.engine_bench'); "
+        "lazy = ('localmodels.stack', 'localmodels.engines', 'localmodels.engine_bench', "
+        "'localmodels.container_run'); "
         "sys.exit(any(m in sys.modules for m in lazy))"
     )
     assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0  # noqa: S603 - fixed argv
