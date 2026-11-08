@@ -201,7 +201,7 @@ stamped in `layout.extra_flags` (for an adopted server too), and is no part of a
 `python -m localmodels.llama_tune --help` is the tune that makes such a record (the recipe command for llama.cpp; run it through slurm,
 never by hand on the card). It measures the reference first, then `-ub` (`llama-bench`, then a teacher-forced `llama-perplexity` check
 against 512 with a restart control; only for prompts of at least 512 tokens), the speculation candidates you declare and, with your own
-`--quality-command`, other quantised files, each with the server's own peak memory from `nvidia-smi`. Every llama.cpp program it runs (llama-bench, llama-perplexity) starts with the servers' OOM score and under the same memory watchdog, killed below the 10 GiB floor; any such kill ends the tune (D22). It keeps to `--soft-limit-s` by
+`--quality-command`, other quantised files, each with the server's own peak memory from `nvidia-smi`. Every llama.cpp program it runs that loads the model (llama-bench, llama-perplexity) starts with the servers' OOM score and under the same memory watchdog, killed below the 10 GiB floor; any such kill ends the tune (D22). It keeps to `--soft-limit-s` by
 starting the most valuable candidate first and skipping what would not fit, adopts a candidate only past a 5 % speed margin with every check
 passed, and writes `record.json` and its measurements to `--run-dir` (a local folder outside `~/dev`, which holds a base file of about
 16 GiB while it runs; the vocabulary is not read, so 16 GiB covers models up to about 299k tokens). `--draft-file NAME` names the file

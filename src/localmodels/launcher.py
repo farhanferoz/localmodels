@@ -128,15 +128,23 @@ class MemoryGuards(BaseModel):
 
 
 async def kill_below_floor(
-    pid: int, floor: float, poll_s: Callable[[], float], free_gib: Callable[[], float | None], what: str
+    pid: int,
+    floor: float,
+    poll_s: Callable[[], float],
+    free_gib: Callable[[], float | None],
+    what: str,
+    alive: Callable[[], bool] | None = None,
 ) -> str | None:
     """SIGKILL ``pid``'s process group the moment available memory falls below ``floor``; why, or None.
 
     Returns when the process has exited (None) or was killed (the reason). Used for llama-server and for every
     llama.cpp program a tune runs: on 2026-11-07 (slurm 2187) an unwatched llama-bench took the host's
-    memory and could not be killed once the driver had none left (D22).
+    memory and could not be killed once the driver had none left (D22). ``alive`` tells whether it still
+    runs; by default ``waitpid``, which reaps a child, so the parent of an asyncio child passes its own check
+    (``returncode is None``), or asyncio would read a reaped exit status as 255.
     """
-    while _is_pid_alive(pid):
+    running = alive or (lambda: _is_pid_alive(pid))
+    while running():
         await asyncio.sleep(poll_s())
         free = free_gib()
         if free is not None and free < floor:

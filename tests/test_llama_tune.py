@@ -686,6 +686,16 @@ async def test_every_llama_cpp_program_runs_with_the_servers_oom_score_and_memor
     with pytest.raises(LlamaTuneError, match="loads nothing more"):  # and nothing runs after it
         await tune._run_tool([sys.executable, "-c", "pass"], 10)
 
+    # the watchdog never reaps the program: asyncio read a reaped exit as 255 (35 % of quick runs here)
+    quick = LlamaTune(make_spec(tmp_path, guards=launcher.MemoryGuards(load_poll_s=0.0005)))
+    quick._free_gib = lambda: 50.0  # type: ignore[method-assign]
+    for _ in range(40):
+        await quick._run_tool(["true"], 10)
+    # a program whose errors are on its stderr alone (llama-bench) keeps them when only stdout is read
+    fails = [sys.executable, "-c", "import sys; sys.exit('failed to load model')"]
+    with pytest.raises(LlamaTuneError, match="exited 1: failed to load model"):
+        await quick._run_tool(fails, 10, with_stderr=False)
+
 
 async def test_no_step_runs_past_the_hard_limit(tmp_path: Path, fake_bin: Path) -> None:
     clock = Clock()

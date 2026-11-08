@@ -1051,28 +1051,36 @@ class LlamaTune:
         proc = await asyncio.create_subprocess_exec(
             *oom_wrapped(cmd, OOM_SCORE_ADJ),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT if with_stderr else asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.STDOUT if with_stderr else asyncio.subprocess.PIPE,
             start_new_session=True,  # the watchdog kills its whole process group
         )
         watchdog = asyncio.create_task(
             kill_below_floor(
-                proc.pid, KILL_BELOW_GIB, lambda: self.spec.guards.load_poll_s, self._free_gib, name
+                proc.pid,
+                KILL_BELOW_GIB,
+                lambda: self.spec.guards.load_poll_s,
+                self._free_gib,
+                name,
+                alive=lambda: proc.returncode is None,  # never reaps: asyncio keeps the exit status
             )
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         finally:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            if not watchdog.done():
-                watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                if (reason := await watchdog) is not None:
+            # a kill finishes the watchdog before the program's end is read; otherwise it is cancelled and not
+            # awaited, so a cancel of this task (SIGTERM) is never swallowed here
+            if watchdog.done() and not watchdog.cancelled():
+                if (reason := watchdog.result()) is not None:
                     self.guard_kill = f"{name}: {reason}"
+            else:
+                watchdog.cancel()
         self._stop_after_a_guard_kill()
         if proc.returncode != 0:
-            msg = f"{name} exited {proc.returncode}: {out.decode(errors='replace')[-300:]}"
+            said = (err or out).decode(errors="replace")  # llama-bench's errors are on its stderr alone
+            msg = f"{name} exited {proc.returncode}: {said[-300:]}"
             raise LlamaTuneError(msg)
         return out.decode(errors="replace")
 
