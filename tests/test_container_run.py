@@ -150,8 +150,9 @@ def test_a_start_is_refused_with_its_remedy(tmp_path: Path, monkeypatch: pytest.
 
 
 def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0915 - every stop path
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO, logger="localmodels.container_run")
     docker = FakeDocker()
     cgroup = tmp_path / "cgroup"
     cgroup.mkdir()
@@ -167,6 +168,7 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
             run._stopped.wait(0.01)
     inside.kill()
     assert Path(f"/proc/{inside.pid}/oom_score_adj").read_text(encoding="utf-8").strip() == "900"
+    assert "OOM score 900 set on the container's 1 processes" in caplog.text  # the allow path is logged
     inside.wait()
     with make_run(tmp_path, record(), docker) as run:
         body = json.loads(next(tmp_path.glob("localmodels-recipe-*.json")).read_text(encoding="utf-8"))

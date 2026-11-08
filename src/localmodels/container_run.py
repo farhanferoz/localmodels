@@ -191,7 +191,7 @@ class ContainerRun:
     _lowest_free: float | None = field(default=None, init=False)
     _host_peak: float | None = field(default=None, init=False)  # read in ``stop`` before the removal
     _sigterm_installed: bool = field(default=False, init=False)
-    _oom_logged: bool = field(default=False, init=False)
+    _oom_failing: bool | None = field(default=None, init=False)  # the last logged outcome
 
     # --- before the start -------------------------------------------------------------------------
 
@@ -429,8 +429,8 @@ class ContainerRun:
                     pass  # the process ended between the listing and the write
                 except OSError as exc:  # another user's process (a container not run as ours)
                     failed.append(f"pid {pid}: {exc}")
-        if not self._oom_logged and (done or failed):  # once a run: the first poll that found processes
-            self._oom_logged = True
+        if (done or failed) and bool(failed) != self._oom_failing:  # logged when the outcome changes
+            self._oom_failing = bool(failed)  # (a starting container's first processes may still be root's)
             if failed:
                 log.warning("OOM score %d not set on %s (set on %d)", score, "; ".join(failed[:3]), done)
             else:
