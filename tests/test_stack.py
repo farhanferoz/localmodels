@@ -202,6 +202,9 @@ def test_a_host_stamps_the_model_it_loaded(tmp_path: Path) -> None:
     assert host.stamp() is None
 
 
-def test_importing_localmodels_does_not_import_the_stack_module() -> None:
-    code = "import sys, localmodels; sys.exit('localmodels.stack' in sys.modules)"
+def test_importing_localmodels_does_not_import_the_stack_or_engines_modules() -> None:
+    code = (
+        "import sys, localmodels; "
+        "sys.exit(any(m in sys.modules for m in ('localmodels.stack', 'localmodels.engines')))"
+    )
     assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0  # noqa: S603 - fixed argv
