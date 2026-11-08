@@ -666,6 +666,27 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     assert fell.peak_gib == pytest.approx(11.0)
 
 
+async def test_every_llama_cpp_program_runs_with_the_servers_oom_score_and_memory_guard(
+    tmp_path: Path,
+) -> None:
+    # slurm 2187: llama-bench ran unwatched at the default OOM score; earlyoom took the tune first, then could
+    # not kill it once the driver had no memory left
+    tune = LlamaTune(make_spec(tmp_path, guards=launcher.MemoryGuards(load_poll_s=0.05)))
+    tune._free_gib = lambda: 50.0  # type: ignore[method-assign]
+    score = "print(open('/proc/self/oom_score_adj').read().strip())"
+    assert (await tune._run_tool([sys.executable, "-c", score], 10)).strip() == str(llama_tune.OOM_SCORE_ADJ)
+
+    tune._free_gib = lambda: 5.0  # type: ignore[method-assign]  # below the 10 GiB floor while it runs
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(LlamaTuneError, match="loads nothing more"):
+        await tune._run_tool([sys.executable, "-c", "import time; time.sleep(30)"], 60)
+    assert asyncio.get_running_loop().time() - started < 5  # killed at once, not at the timeout
+    assert tune.guard_kill is not None
+    assert "below the 10 GiB kill floor" in tune.guard_kill
+    with pytest.raises(LlamaTuneError, match="loads nothing more"):  # and nothing runs after it
+        await tune._run_tool([sys.executable, "-c", "pass"], 10)
+
+
 async def test_no_step_runs_past_the_hard_limit(tmp_path: Path, fake_bin: Path) -> None:
     clock = Clock()
     assert (

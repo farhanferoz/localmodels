@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 import httpx
 from pydantic import BaseModel, Field
 
-from localmodels.bench import BenchError, run_bench
+from localmodels.bench import BenchError, bench_command, parse_bench_output
 from localmodels.enums import ServingRole, WorkloadKind
 from localmodels.hardware import (
     available_memory,
@@ -59,12 +59,12 @@ from localmodels.hardware import (
     network_filesystem,
     process_anon_mib,
 )
-from localmodels.launcher import LocalServerManager, MemoryGuards
+from localmodels.launcher import LocalServerManager, MemoryGuards, kill_below_floor
 from localmodels.lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
 from localmodels.llama_builds import current_server, llama_home
 from localmodels.params import ServingParams, derive_serving_params
 from localmodels.pinned import snapshot_dir
-from localmodels.process import LocalModelsError, ServerSpec, resolve_llama_server_bin
+from localmodels.process import LocalModelsError, ServerSpec, oom_wrapped, resolve_llama_server_bin
 from localmodels.pull import _default_hub_cache
 from localmodels.retune import TUNE_LIMIT_S
 from localmodels.serving.protocol import ResultMessage
@@ -954,15 +954,19 @@ class LlamaTune:
         """One ``llama-bench`` run for every -ub (it reloads the model only when its parameters change)."""
         bench_bin = self.spec.server_bin.with_name("llama-bench")
         ubatches = ",".join(str(u) for u in (UB_REFERENCE, *UB_CANDIDATES))
+        cmd = bench_command(
+            bench_bin, self.spec.reference.path, n_prompt=self.spec.prompt_tokens, n_gen=0,
+            repetitions=BENCH_REPETITIONS, extra_flags=("-ub", ubatches),
+        )  # fmt: skip
         try:
-            result = await asyncio.to_thread(
-                run_bench, bench_bin, self.spec.reference.path, n_prompt=self.spec.prompt_tokens, n_gen=0,
-                repetitions=BENCH_REPETITIONS, timeout_s=max(self.left(), 1.0), extra_flags=("-ub", ubatches),
-            )  # fmt: skip
-        except BenchError as exc:
-            self._skip(
-                "-ub", OUT_OF_TIME if self.left() <= 0 else f"not measured: llama-bench failed ({exc})"
-            )
+            result = parse_bench_output(await self._run_tool(cmd, max(self.left(), 1.0), with_stderr=False))
+        except TimeoutError:
+            self._skip("-ub", OUT_OF_TIME)
+            return
+        except (LlamaTuneError, BenchError, OSError) as exc:
+            if self.guard_kill is not None:
+                raise
+            self._skip("-ub", f"not measured: llama-bench failed ({exc})")
             return
         self.bench = bench_rows(result.raw_rows, self.spec.prompt_tokens)
         self.measurements.extend(self.bench.values())
@@ -1032,10 +1036,28 @@ class LlamaTune:
 
     # -- the programs -----------------------------------------------------------------------------------
 
-    async def _run_tool(self, cmd: list[str], timeout_s: float) -> str:
-        """Run a llama.cpp program to completion; its output, stderr included."""
+    async def _run_tool(self, cmd: list[str], timeout_s: float, *, with_stderr: bool = True) -> str:
+        """Run a llama.cpp program to completion under the servers' memory guard; its output.
+
+        Started with the servers' OOM score and watched like a server: killed the moment available memory
+        falls below the kill floor, which ends the tune (D22: slurm 2187's llama-bench had neither).
+        ``with_stderr``: its stderr is part of the output (llama-perplexity's figures); else only stdout.
+
+        Raises:
+            LlamaTuneError: a memory guard killed a server or this program, or it exited non-zero.
+        """
+        self._stop_after_a_guard_kill()
+        name = Path(cmd[0]).name
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            *oom_wrapped(cmd, OOM_SCORE_ADJ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT if with_stderr else asyncio.subprocess.DEVNULL,
+            start_new_session=True,  # the watchdog kills its whole process group
+        )
+        watchdog = asyncio.create_task(
+            kill_below_floor(
+                proc.pid, KILL_BELOW_GIB, lambda: self.spec.guards.load_poll_s, self._free_gib, name
+            )
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
@@ -1043,8 +1065,14 @@ class LlamaTune:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
+            if not watchdog.done():
+                watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                if (reason := await watchdog) is not None:
+                    self.guard_kill = f"{name}: {reason}"
+        self._stop_after_a_guard_kill()
         if proc.returncode != 0:
-            msg = f"{Path(cmd[0]).name} exited {proc.returncode}: {out.decode(errors='replace')[-300:]}"
+            msg = f"{name} exited {proc.returncode}: {out.decode(errors='replace')[-300:]}"
             raise LlamaTuneError(msg)
         return out.decode(errors="replace")
 
@@ -1076,6 +1104,8 @@ class LlamaTune:
         except TimeoutError:
             result.error = OUT_OF_TIME
         except (LlamaTuneError, OSError, ValueError) as exc:
+            if self.guard_kill is not None:
+                raise  # a memory guard's kill ends the tune
             result.error = f"{type(exc).__name__}: {exc}"
         self.measurements.append(result)
         return result

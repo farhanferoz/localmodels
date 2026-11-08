@@ -53,6 +53,7 @@ from .process import (
     llama_option,
     llama_values,
     ngl_value,
+    oom_wrapped,
     require_key_off_loopback,
     speculates,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "StartupYieldedError",
     "StayUpConfigError",
     "SupervisorExit",
+    "kill_below_floor",
     "stay_up_problem",
     "supervise",
 ]
@@ -90,8 +92,6 @@ _MIB_PER_GIB = 1024
 _FIT_ROW_RE = re.compile(r"^(\S+) (\d+) (\d+) (\d+)\s*$", re.MULTILINE)
 _FIT_HOST_ROW = "Host"
 _FIT_PARAMS_TIMEOUT_S = 600.0
-# The score is set by a shell that then execs the server (same PID): preexec_fn is not thread-safe.
-_OOM_WRAPPER = 'echo {score} > /proc/self/oom_score_adj && exec "$0" "$@"'
 
 _FILE_FLAGS = ("-m", "--api-key-file", *DRAFT_MODEL_FLAGS)
 
@@ -125,6 +125,30 @@ class MemoryGuards(BaseModel):
     fit_params_binary: Path | None = None
     load_poll_s: float = Field(default=1.0, gt=0)
     watch_poll_s: float = Field(default=5.0, gt=0)
+
+
+async def kill_below_floor(
+    pid: int, floor: float, poll_s: Callable[[], float], free_gib: Callable[[], float | None], what: str
+) -> str | None:
+    """SIGKILL ``pid``'s process group the moment available memory falls below ``floor``; why, or None.
+
+    Returns when the process has exited (None) or was killed (the reason). Used for llama-server and for every
+    llama.cpp program a tune runs: on 2026-11-07 (slurm 2187) an unwatched llama-bench took the host's
+    memory and could not be killed once the driver had none left (D22).
+    """
+    while _is_pid_alive(pid):
+        await asyncio.sleep(poll_s())
+        free = free_gib()
+        if free is not None and free < floor:
+            reason = f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
+            log.error("killing %s PID %d: %s", what, pid, reason)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            return reason
+    return None
 
 
 def stay_up_problem(guards: MemoryGuards, resident_allowance_gib: float | None) -> str | None:
@@ -638,21 +662,13 @@ class LocalServerManager:
 
     async def _watch_memory(self, pid: int, floor: float) -> None:
         """SIGKILL the server's process group the moment available memory falls below ``floor``."""
-        while _is_pid_alive(pid):
-            await asyncio.sleep(self.guards.watch_poll_s if self._ready else self.guards.load_poll_s)
-            free = self.free_gib()
-            if free is not None and free < floor:
-                self.killed_reason = (
-                    f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
-                )
-                log.error("killing llama-server PID %d: %s", pid, self.killed_reason)
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
-                except OSError:
-                    with contextlib.suppress(OSError):
-                        os.kill(pid, signal.SIGKILL)
-                self._set_loaded(loaded=False)
-                return
+        reason = await kill_below_floor(
+            pid, floor, lambda: self.guards.watch_poll_s if self._ready else self.guards.load_poll_s,
+            self.free_gib, "llama-server",
+        )  # fmt: skip
+        if reason is not None:
+            self.killed_reason = reason
+            self._set_loaded(loaded=False)
 
     def _cancel_watchdog(self) -> None:
         if self._watchdog is not None:
@@ -877,7 +893,7 @@ class LocalServerManager:
         await self._prepare_launch()
         args = build_args(self.binary, self.spec, self.params, self._server_flags)
         if self.guards.server_oom_score_adj is not None:
-            args = ["sh", "-c", _OOM_WRAPPER.format(score=self.guards.server_oom_score_adj), *args]
+            args = oom_wrapped(args, self.guards.server_oom_score_adj)
 
         publishes = self.contention is Contention.STAY_UP or self.params.n_gpu_layers != 0
         if self.contention is Contention.STAY_UP:

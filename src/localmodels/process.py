@@ -119,6 +119,15 @@ class ServerSpec:
     api_key_file: Path | None = None
 
 
+# The score is set by a shell that then execs the program (same PID): preexec_fn is not thread-safe.
+_OOM_WRAPPER = 'echo {score} > /proc/self/oom_score_adj && exec "$0" "$@"'
+
+
+def oom_wrapped(args: list[str], score: int) -> list[str]:
+    """``args`` started through a shell that first sets their OOM score, so the kernel's killer picks them."""
+    return ["sh", "-c", _OOM_WRAPPER.format(score=score), *args]
+
+
 def ngl_value(params: ServingParams) -> str:
     """The ``-ngl`` value for these parameters: every layer (``-1``) is passed as 99."""
     return "99" if params.n_gpu_layers == -1 else str(params.n_gpu_layers)

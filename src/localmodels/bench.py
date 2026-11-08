@@ -57,6 +57,38 @@ def _parse_rows(rows: list[dict[str, Any]]) -> BenchResult:
     return BenchResult(prompt_tok_s=prompt_tok_s, decode_tok_s=decode_tok_s, raw_rows=rows)
 
 
+def bench_command(
+    bench_bin: Path,
+    model_path: Path,
+    *,
+    n_prompt: int = 512,
+    n_gen: int = 128,
+    repetitions: int = 3,
+    extra_flags: tuple[str, ...] = (),
+) -> list[str]:
+    """``llama-bench -m model_path -p n_prompt -n n_gen -r repetitions -o json`` and ``extra_flags``."""
+    return [
+        str(bench_bin),
+        *("-m", str(model_path), "-p", str(n_prompt), "-n", str(n_gen), "-r", str(repetitions)),
+        *("-o", "json"),
+        *extra_flags,
+    ]
+
+
+def parse_bench_output(stdout: str) -> BenchResult:
+    """The throughput rows of llama-bench's ``-o json`` output.
+
+    Raises:
+        BenchError: the output is not llama-bench's JSON.
+    """
+    try:
+        rows = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        msg = f"could not parse llama-bench JSON output: {exc}"
+        raise BenchError(msg) from exc
+    return _parse_rows(rows)
+
+
 def run_bench(
     bench_bin: Path,
     model_path: Path,
@@ -72,20 +104,14 @@ def run_bench(
 
     ``quiet_card``, when given, is held around the run so that stay-up services have unloaded first.
     """
-    cmd = [
-        str(bench_bin),
-        "-m",
-        str(model_path),
-        "-p",
-        str(n_prompt),
-        "-n",
-        str(n_gen),
-        "-r",
-        str(repetitions),
-        "-o",
-        "json",
-        *extra_flags,
-    ]
+    cmd = bench_command(
+        bench_bin,
+        model_path,
+        n_prompt=n_prompt,
+        n_gen=n_gen,
+        repetitions=repetitions,
+        extra_flags=extra_flags,
+    )
     try:
         with quiet_card if quiet_card is not None else contextlib.nullcontext():
             proc = subprocess.run(  # noqa: S603 — bench_bin is caller-resolved, not user input
@@ -97,9 +123,4 @@ def run_bench(
     if proc.returncode != 0:
         msg = f"{' '.join(cmd)} exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
         raise BenchError(msg)
-    try:
-        rows = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        msg = f"could not parse llama-bench JSON output: {exc}"
-        raise BenchError(msg) from exc
-    return _parse_rows(rows)
+    return parse_bench_output(proc.stdout)
