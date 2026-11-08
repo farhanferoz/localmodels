@@ -549,11 +549,15 @@ class ContainerRun:
             "tuning_hash": listing_hash(self.sparkrun_cache / TUNING_SUBDIR / family),
         }
 
-    def dry_run(self) -> subprocess.CompletedProcess[str]:
-        """``sparkrun run --dry-run`` in the per-run Hub layout of a real start; launches nothing."""
+    def dry_run(self, *, verbose: bool = False) -> subprocess.CompletedProcess[str]:
+        """``sparkrun run --dry-run`` in the per-run Hub layout of a real start; launches nothing.
+
+        ``verbose`` adds sparkrun's ``-vvv``, the only level at which a dry run prints its ``docker run``
+        command (checked on v0.4.2).
+        """
         try:
             recipe = self._write_recipe(self._prepare_hub())
-            args = [*self._run_args(recipe, self.need_gib()), "--dry-run"]
+            args = [*(["-vvv"] if verbose else []), *self._run_args(recipe, self.need_gib()), "--dry-run"]
             return run_sparkrun(self.sparkrun, args, timeout=STOP_TIMEOUT_S, hub_root=self._run_root)
         finally:
             self._remove_files()

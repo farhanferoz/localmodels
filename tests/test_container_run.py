@@ -198,6 +198,13 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert not root.exists()
     # sampled without a kill floor, and the cgroup's peak kept from before the container went
     assert run.memory() == MemoryNeed(fall_gib=0.0, host_peak_gib=2.0)
+    # a dry run (the sparkrun move's check) launches nothing, leaves no file, and asks for -vvv when told:
+    # only that level prints the docker run line the check compares
+    make_run(tmp_path, record(), docker).dry_run(verbose=True)
+    dry = (tmp_path / "sparkrun.log").read_text(encoding="utf-8").splitlines()[-1]
+    assert " -vvv run " in dry
+    assert dry.endswith("--dry-run")
+    assert not root.exists()
 
     docker = FakeDocker()  # an interrupt during the start still stops what it began
     real_run = container_run.run_sparkrun

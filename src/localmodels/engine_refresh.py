@@ -69,7 +69,6 @@ from .engines import (
     sources_for,
     switch,
     tag_key,
-    tried_tags,
     versions_dir,
     write_record,
 )
@@ -118,6 +117,7 @@ PULL_MEM: Final = "4G"
 PULL_CPUS: Final = 2
 PULL_TIMEOUT_S: Final = 1800.0
 MIN_FREE_DISK_GB: Final = 100
+TOOL_FETCH_TIMEOUT_S: Final = 600.0  # uvx fetching llama-benchy into its cache
 GB: Final = 1000**3
 PPL_MARGIN: Final = 0.01  # D18's perplexity rule: the noise arms' largest ratio plus this
 SAME_TOP_MARGIN: Final = 0.006  # D18: 0.6 points between the limit and the accepted switch
@@ -519,6 +519,28 @@ _NORMALISE: Final = (
 )
 
 
+DOCKER_RUN_MARK: Final = "docker run command:"  # sparkrun's -vvv dry run: executors/docker.py's debug line
+SERVE_MARK: Final = "Serve command:"
+
+
+def launch_lines(text: str) -> str:
+    """What a verbose dry run says would start: each ``docker run`` command and the serve command, normalised.
+
+    The other lines (progress, timings, debug notes) differ between sparkrun versions without changing what
+    runs. When neither line is there (sparkrun changed its output), the whole text is compared instead, so a
+    format change counts as a difference (and gets the GPU comparison), never as a match.
+    """
+    lines = text.splitlines()
+    picked: list[str] = []
+    for number, line in enumerate(lines):
+        for mark in (DOCKER_RUN_MARK, SERVE_MARK):
+            if mark in line:
+                rest = line.split(mark, 1)[1].strip()
+                follow = lines[number + 1].strip() if number + 1 < len(lines) else ""
+                picked.append(f"{mark} {rest or follow}")
+    return normalise("\n".join(dict.fromkeys(picked)) if picked else text)
+
+
 def normalise(text: str) -> str:
     """``text`` with every run-specific value (versions, ids, uuids, times, temporary paths) replaced."""
     for pattern, replacement in _NORMALISE:
@@ -566,6 +588,15 @@ def list_sparkrun_tags(*, runner: engines.Runner | None = None) -> TagListing:
         return TagListing(reason=f"git ls-remote exited {done.returncode}: {done.stderr.strip()[-200:]}")
     tags = {line.rpartition("refs/tags/")[2] for line in done.stdout.splitlines()}
     return TagListing(tags=tuple(sorted(t for t in tags if version_key(t) is not None)))
+
+
+def judged_tags(engine: Engine) -> set[str]:
+    """The tags the walk does not offer again: judged by a gate, or whose pull failed (D12's tried rule).
+
+    A version that was pulled but never judged (its measure job did not get the card, or was stopped before
+    its verdict) is offered again: it was not tried, only queued.
+    """
+    return {r.tag for r in records(engine) if r.gate is not GateVerdict.NOT_RUN or not r.image}
 
 
 def newest_sparkrun(tags: Iterable[str]) -> str | None:
@@ -868,10 +899,15 @@ class MeasureJob(JobRunner):
                 f"{self.tag}: its image is not on disk ({record.reason or 'not pulled'})"
             )
             return
-        models = [self.only_model] if self.only_model else list(recipes_for(self.engine))
-        if not models:
-            self.result.not_measured = f"{recipes_dir(self.engine)} holds no valid recipe"
+        # The gate and the switch are the measurement model's (design 4.2); each other recipe file (an
+        # approved one) is measured in its own APPROVED job, so an approved file never blocks a switch.
+        model = self.only_model or (None if self.mode is MeasureMode.APPROVED else MEASUREMENT_MODEL)
+        if model is None or model not in recipes_for(self.engine):
+            self.result.not_measured = (
+                f"{recipes_dir(self.engine)} holds no valid recipe for {model or 'a model'}"
+            )
             return
+        models = [model]
         current = link_target(versions_dir(self.engine))
         if self.mode is MeasureMode.CANDIDATE:
             self._candidate(record, models, current)
@@ -1145,14 +1181,19 @@ SAME_CLIENT_FLAGS: Final = ("-fa", "on", "--cache-ram", "0")
 SAME_CLIENT_PHASES: Final = tuple(p for p in engine_bench.Phase if p is not engine_bench.Phase.TEACHER_FORCED)
 
 
-def same_client_path(commit: str, container_model: str) -> Path:
-    """Where llama.cpp's same-client run beside ``container_model`` is kept for build ``commit``."""
-    return engines_dir() / Engine.LLAMA_CPP.value / "same-client" / commit / f"{_slug(container_model)}.json"
+def same_client_path(commit: str, gguf: refresh.Model) -> Path:
+    """Where llama.cpp's same-client run of the file ``gguf`` is kept for build ``commit``.
+
+    Keyed by the llama.cpp file, not by the container model it is set beside: two projects may pair one
+    container file with different llama.cpp files.
+    """
+    name = f"{_slug(gguf.repository)}@{gguf.revision}--{gguf.filename}.json"
+    return engines_dir() / Engine.LLAMA_CPP.value / "same-client" / commit / name
 
 
-def same_client_record(commit: str, container_model: str) -> EngineRun | None:
-    """llama.cpp's run on the container engines' client for ``commit``; None if none (E5 reads it)."""
-    return read_model(same_client_path(commit, container_model), engine_bench.EngineRun)
+def same_client_record(commit: str, gguf: refresh.Model) -> EngineRun | None:
+    """llama.cpp's run of ``gguf`` on the container engines' client at ``commit``; None if none."""
+    return read_model(same_client_path(commit, gguf), engine_bench.EngineRun)
 
 
 def _free_port() -> int:
@@ -1228,7 +1269,7 @@ class SameClientJob(JobRunner):
             self.result.not_measured = "llama.cpp has no current build"
             return
         for container_model, pin in SAME_CLIENT_FILES.items():
-            if same_client_record(commit, container_model) is not None:
+            if same_client_record(commit, pin) is not None:
                 self.result.steps[container_model] = STEP_OK
                 continue
             file = refresh.model_file(pin)
@@ -1242,7 +1283,7 @@ class SameClientJob(JobRunner):
             except (ServerStartError, httpx.HTTPError, OSError) as exc:
                 self.result.steps[container_model] = f"{NOT_MEASURED}{type(exc).__name__}: {exc}"
                 continue
-            write_model(same_client_path(commit, container_model), measured)
+            write_model(same_client_path(commit, pin), measured)
             write_model(self.folder / f"{_slug(container_model)}.json", measured)
             self.result.steps[container_model] = STEP_OK
 
@@ -1355,7 +1396,7 @@ class PullJob:
     whatever came of the pull; exit 1 only when the record cannot be written.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - the job's inputs and the seams tests replace
         self,
         run: Path,
         engine: Engine,
@@ -1366,8 +1407,10 @@ class PullJob:
         pull: engines.Runner | None = None,
         sparkrun: Callable[[str], Path] = ensure_sparkrun,
         free_bytes: Callable[[str], int] | None = None,
+        tools: engines.Runner | None = None,
     ) -> None:
         self.engine, self.tag, self.publisher = engine, tag, publisher
+        self.tools = tools or (lambda cmd: run_command(cmd, timeout=TOOL_FETCH_TIMEOUT_S))
         self.folder = engine_folder(run, engine, tag)
         self.docker = docker
         self.pull = pull or (lambda cmd: run_command(cmd, timeout=PULL_TIMEOUT_S))
@@ -1475,7 +1518,23 @@ class PullJob:
             sys.stderr.write(f"cannot write the record of {self.engine.value} {self.tag}: {exc}\n")
             return EXIT_ERROR
         sys.stdout.write(f"pull {self.engine.value} {self.tag}: {problem or 'ok'}\n")
+        self.fetch_tools()
         return EXIT_OK
+
+    def fetch_tools(self) -> None:
+        """Put the pinned llama-benchy in uv's cache now, on the CPU.
+
+        The measure job's benchy phase then neither downloads it on the GPU's time nor fails a bootstrap for
+        want of the network. A failure is only logged: the phase fetches it itself.
+        """
+        done = self.tools(["uvx", engine_bench.BENCHY_PACKAGE, "--help"])
+        if done.returncode != 0:
+            log.warning(
+                "fetching %s failed (exit %d): %s",
+                engine_bench.BENCHY_PACKAGE,
+                done.returncode,
+                done.stderr.strip()[-200:],
+            )
 
 
 # --- the job commands (argv) -----------------------------------------------------------------------
@@ -1568,7 +1627,7 @@ def measure_job_argv(
 ) -> list[str]:
     """The GPU measure job of one version (``--class restart``, 40-minute stop, ``--mem`` the whole need)."""
     tags = [t for t in (link_target(versions_dir(engine)), tag) if t]
-    need = job_need_gib(engine, tags, [model] if model else list(recipes_for(engine)))
+    need = job_need_gib(engine, tags, [model or MEASUREMENT_MODEL])
     command = [
         *refresh._refresh_command(home, "engine-measure"),  # noqa: SLF001
         *("--run", str(run), "--engine", engine.value, "--tag", tag, "--mode", mode.value),
@@ -1726,13 +1785,13 @@ class EngineWalk:
                 self._plan(engine, source)
         commit = current_commit(llama_home(self.home))
         self.same_client = commit is not None and any(
-            same_client_record(commit, model) is None for model in SAME_CLIENT_FILES
+            same_client_record(commit, gguf) is None for gguf in SAME_CLIENT_FILES.values()
         )
 
     @staticmethod
     def _dry_run_output(binary: Path, record: VersionRecord, model: str, recipe: dict[str, Any]) -> str:
-        done = ContainerRun(record, model, recipe, binary, GUARDS, kind=RunKind.REFRESH).dry_run()
-        return f"exit {done.returncode}\n{normalise(done.stdout)}\n{normalise(done.stderr)}"
+        done = ContainerRun(record, model, recipe, binary, GUARDS, kind=RunKind.REFRESH).dry_run(verbose=True)
+        return f"exit {done.returncode}\n{launch_lines(done.stdout + chr(10) + done.stderr)}"
 
     def _sparkrun_move(self) -> None:
         """Design 2: a newer sparkrun is adopted only after the dry runs of every realized recipe agree."""
@@ -1789,7 +1848,7 @@ class EngineWalk:
         if listing.reason:
             plan.reason = f"tag list unreadable: {listing.reason}"
             return
-        tag = newest_untried(source, listing.tags, tried_tags(engine))
+        tag = newest_untried(source, listing.tags, judged_tags(engine))
         if tag is None:
             plan.reason = "no new tag"
             return
@@ -1800,6 +1859,10 @@ class EngineWalk:
         plan.mode = mode.value
         self._pull(engine, tag, source.publisher)
         measure = self._measure(engine, tag, mode)
+        if official:  # each approved file on what is then `current` (refused there unless this tag became it)
+            for model in recipes_for(engine):
+                if model != MEASUREMENT_MODEL:
+                    self._measure(engine, tag, MeasureMode.APPROVED, model)
         if not (official and mode is MeasureMode.BOOTSTRAP):
             return  # a community build is measured and recorded, never calibrated
         key = tag_key(source, tag)
@@ -1834,13 +1897,13 @@ class EngineWalk:
             lambda after: pull_argv(self.script, self.run, engine, tag, publisher, self.home, after),
         )
 
-    def _measure(self, engine: Engine, tag: str, mode: MeasureMode) -> JobSpec:
+    def _measure(self, engine: Engine, tag: str, mode: MeasureMode, model: str | None = None) -> JobSpec:
         return self._add(
             EngineJob.MEASURE,
             engine,
             tag,
             lambda after: measure_job_argv(
-                self.script, self.run, engine, tag, mode, home=self.home, after=after
+                self.script, self.run, engine, tag, mode, home=self.home, after=after, model=model
             ),
         )
 

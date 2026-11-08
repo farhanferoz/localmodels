@@ -21,6 +21,7 @@ loaded only then; the job subcommands ``engine-pull``, ``engine-measure``, ``eng
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -63,6 +64,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from .llama_tune import KlStats
+
+log = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -697,6 +700,14 @@ def _submit_jobs(
     return submitter.submit(JobName.MEASURE, measure_argv(script, run, after, args.home))
 
 
+def _walk_failed(record: RunRecord, step: str, exc: Exception) -> None:
+    """Record and log that the container engines' walk failed; the llama.cpp part goes on without it."""
+    why = f"engine walk failed while {step}: {type(exc).__name__}: {exc}"
+    record.engine_reports.append(why)
+    sys.stderr.write(f"{why}\n")
+    log.error("engine walk failed while %s", step, exc_info=exc)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Decide what is due and submit the jobs; ``--dry-run`` only prints the commands.
 
@@ -719,9 +730,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             run.mkdir(parents=True, exist_ok=True)  # the jobs' --workdir and --log: there before they queue
         submitter = JobSubmitter(record, dry_run=args.dry_run)
         walk = EngineWalk(args, run, record, submitter, script)
-        walk.decide()
+        walked = True
+        try:
+            walk.decide()
+        except Exception as exc:  # noqa: BLE001 - one broken part never stops the other: llama.cpp's jobs go
+            _walk_failed(record, "deciding", exc)
+            walked = False
         measure = None if idle else _submit_jobs(args, script, run, submitter, candidate)
-        walk.submit(llama_measure_job=measure)
+        if walked:
+            try:
+                walk.submit(llama_measure_job=measure)
+            except Exception as exc:  # noqa: BLE001 - recorded and logged, as above
+                _walk_failed(record, "submitting", exc)
         if idle and not submitter.count:
             sys.stdout.write(f"skipped: {record.skipped}\n")
         else:

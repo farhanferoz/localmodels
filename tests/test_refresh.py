@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Self
 import pytest
 
 from localmodels import digest, engine_bench, engine_refresh, refresh, rules
-from localmodels.atomic import read_model, write_model
+from localmodels.atomic import read_model, write_model, write_text_atomically
 from localmodels.cli import main
 from localmodels.container_run import ContainerStartError, MemoryNeed
 from localmodels.digest import Context
@@ -238,7 +238,8 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due( 
     seen = engine_bench.EngineRun(
         engine="llama.cpp", model="m", url="u", started="t"
     )  # same-client is answered
-    write_model(engine_refresh.same_client_path(CURRENT, engine_refresh.MEASUREMENT_MODEL), seen)
+    gguf = engine_refresh.SAME_CLIENT_FILES[engine_refresh.MEASUREMENT_MODEL]
+    write_model(engine_refresh.same_client_path(CURRENT, gguf), seen)
     for kind in refresh.REMEASURED_KINDS:  # answered: a holding record on this stack
         rules.write_record(
             rules.RuleRecord(
@@ -451,6 +452,25 @@ def test_measure_stops_when_the_card_does_not_go_quiet(world: World, monkeypatch
     assert rules.read_record("K1") is None
 
 
+def test_a_broken_engine_walk_never_stops_the_llama_cpp_refresh(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_self: object) -> None:
+        msg = "registry layout changed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(engine_refresh.EngineWalk, "decide", broken)
+    assert main(["refresh", "--home", str(world.home), "run"]) == 0
+    build, measure = world.submitted.read_text().splitlines()  # llama.cpp's jobs went; no engine job
+    assert ("--name refresh-build" in build, "--name refresh-measure" in measure) == (True, True)
+    run_dir = refresh.newest_run()
+    assert run_dir is not None
+    record = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
+    assert record.engine_reports == [
+        "engine walk failed while deciding: RuntimeError: registry layout changed"
+    ]
+
+
 def test_status_prints_the_newest_run(world: World, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["refresh", "status"]) == 0
     assert "no refresh run" in capsys.readouterr().out
@@ -646,6 +666,12 @@ def put(
     return record
 
 
+def approved_recipe(engine: Engine, model: str = "org/approved") -> None:
+    """A recipe file for a second model, as an approval installs one."""
+    recipe = {**engine_refresh.BASE_RECIPES[engine], "model": model}
+    write_text_atomically(engine_refresh.recipe_file(engine, model), json.dumps(recipe))
+
+
 class Served:
     """What ``ContainerRun`` offers a job once the server is up."""
 
@@ -729,6 +755,7 @@ def test_a_candidate_is_measured_interleaved_judged_and_switched_only_on_a_pass(
 ) -> None:
     put(Engine.VLLM, "v0.32.0", gate=GateVerdict.PASSED, current=True)
     put(Engine.VLLM, "v0.33.0")
+    approved_recipe(Engine.VLLM)  # an approved file: measured in its own job, never part of the gate
     candidate = engine_refresh.MeasureMode.CANDIDATE
     recorded = measure_job(world, fleet, Engine.VLLM, "v0.33.0", candidate)
     # warm starts (current, candidate), then rounds current, candidate, current, candidate; REFRESH runs
@@ -978,12 +1005,17 @@ def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_li
             "lmsysorg/sglang": ["v0.5.22-cu130", "v0.5.22-runtime"],
         }
     )
+    approved_recipe(Engine.VLLM)
     record = walk(world, fetch=fetch, llama_measure_job="900")
-    _pull, measure, community_pull, community_measure, same_client = submitted(world)
+    _pull, measure, approved, community_pull, community_measure, same_client = submitted(world)
     assert (
         "--tag v0.33.0 --mode candidate" in measure
     )  # official, with a current: a candidate, no calibration
     assert "--after 101" in measure
+    assert "--mode candidate --model" not in measure  # the gate is the measurement model's alone
+    # the approved file on what is then current, in its own job (a community build never becomes current)
+    assert "--tag v0.33.0 --mode approved --model org/approved" in approved
+    assert "--after 102" in approved
     assert "--tag v0.33.0-gb10.0 --publisher community" in community_pull
     assert "--tag v0.33.0-gb10.0 --mode candidate" in community_measure  # measured, recorded, never switched
     assert "--after 900" in same_client  # after llama.cpp's measure job, not the chain's last
@@ -1016,6 +1048,16 @@ def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_li
     broken = walk(world, fetch=offline)
     assert broken.engines[0].reason.startswith("tag list unreadable: registry-1.docker.io/vllm/vllm-openai")
     assert len(submitted(world)) == 1  # only the same-client job: nothing to pull
+
+    world.submitted.unlink()
+    put(Engine.SGLANG, "v0.5.23-cu130")  # pulled, never judged (its measure job never got the card)
+    sglang = tag_fetch({"lmsysorg/sglang": ["v0.5.22-cu130", "v0.5.23-cu130"]})
+    again = walk(world, fetch=sglang)
+    assert next(p.tag for p in again.engines if p.engine == "sglang") == "v0.5.23-cu130"  # offered again
+    world.submitted.unlink()
+    put(Engine.SGLANG, "v0.5.23-cu130", gate=GateVerdict.FAILED)  # judged: tried (D12)
+    judged = walk(world, fetch=sglang)
+    assert next(p.reason for p in judged.engines if p.engine == "sglang") == "no new tag"
 
 
 def test_the_sparkrun_move_needs_identical_dry_runs_or_a_comparison_job_the_candidates_wait_for(
@@ -1072,6 +1114,23 @@ def test_the_sparkrun_dry_runs_compare_after_the_run_specific_values_are_removed
     )
     assert engine_refresh.normalise(old) == engine_refresh.normalise(new)
     assert engine_refresh.normalise(old) != engine_refresh.normalise(new.replace("18102", "18103"))
+    # a -vvv dry run: the docker run line and the serve command count; the debug chatter does not
+    docker = (
+        "12:59:44 [DEBUG] sparkrun.orchestration.executors.docker: docker run command: docker run -d "
+        "--name sparkrun_6eed2e11934cb7a3_49960de5880e_solo --label sparkrun.intent_id=6eed2e11934cb7a3 "
+        "-v /home/u/.cache/sparkrun/runtime-cache/vllm/m-3c74a3cb:/cache/runtime img bash"
+    )
+    serve = "12:59:44 [DEBUG] sparkrun.runtimes.base: Serve command: vllm serve m --port 18102"
+    chatter = "12:59:44 [DEBUG] probing host (0.12s)"
+    one = f"{docker}\n{chatter}\n{serve}\nServe command:\n  vllm serve m --port 18102\n"
+    two = one.replace("6eed2e11934cb7a3_49960de5880e", "aaaaaaaaaaaaaaaa_bbbbbbbbbbbb").replace(
+        "probing host (0.12s)", "probing the host differently"
+    )
+    assert engine_refresh.launch_lines(one) == engine_refresh.launch_lines(two)
+    assert "docker run -d" in engine_refresh.launch_lines(one)
+    mounted = one.replace(":/cache/runtime", ":/cache/runtime -v /etc/x:/x")
+    assert engine_refresh.launch_lines(one) != engine_refresh.launch_lines(mounted)  # a new mount differs
+    assert engine_refresh.launch_lines("other output") == "other output"  # no launch lines: compared whole
     assert (
         engine_refresh.newest_sparkrun(["v0.4.9", "v0.4.10", "v0.5.0rc1", "x"]) == "v0.4.10"
     )  # numeric order
@@ -1123,6 +1182,7 @@ def pull_job(world: World, tmp_path: Path, docker: Docker, **kw: Any) -> engine_
         pull=docker,
         sparkrun=lambda _v: realize,
         free_bytes=kw.pop("free_bytes", lambda _path: 500 * 10**9),
+        tools=docker,
     )
 
 
@@ -1136,6 +1196,7 @@ def test_the_pull_job_records_the_digest_and_realized_recipes_and_a_failed_pull_
     assert (record.pulled, record.image, record.sparkrun_version) == (True, f"repo/vllm@{DIGEST}", "v0.4.2")
     assert json.loads(record.recipes[MODEL])["model"] == MODEL
     assert ["docker", "pull", "vllm/vllm-openai:v0.33.0"] in docker.calls
+    assert ["uvx", engine_bench.BENCHY_PACKAGE, "--help"] in docker.calls  # benchy fetched on the CPU
 
     failing = Docker(fail_pull=True)
     put(Engine.VLLM, "v0.34.0", pulled=False, image=False)
@@ -1147,6 +1208,7 @@ def test_the_pull_job_records_the_digest_and_realized_recipes_and_a_failed_pull_
         docker=failing,
         pull=failing,
         free_bytes=lambda _p: 10**12,
+        tools=failing,
     )
     assert job.execute() == 0  # exit 0 whatever the outcome: the chain goes on
     tried = read_record(Engine.VLLM, "v0.35.0")
@@ -1200,10 +1262,13 @@ def test_the_same_client_job_measures_llama_cpp_once_per_build(world: World, fle
     for _ in range(2):
         assert engine_refresh.SameClientJob(world.run_dir, str(world.home), harness=harness).execute() == 0
     assert len(calls) == 1  # the second run found the record for this build
-    record = engine_refresh.same_client_record(CURRENT, MODEL)
-    assert record is not None
-    assert engine_refresh.same_client_path(CURRENT, MODEL).name == "nvidia--Qwen3-30B-A3B-NVFP4.json"
-    assert engine_refresh.same_client_record("deadbeef0", MODEL) is None
+    gguf = engine_refresh.SAME_CLIENT_FILES[MODEL]
+    assert engine_refresh.same_client_record(CURRENT, gguf) is not None
+    # keyed by the llama.cpp file (two projects may pair one container file with different llama.cpp files)
+    assert engine_refresh.same_client_path(CURRENT, gguf).name == (
+        f"Qwen--Qwen3-30B-A3B-GGUF@{gguf.revision}--Qwen3-30B-A3B-Q4_K_M.gguf.json"
+    )
+    assert engine_refresh.same_client_record("deadbeef0", gguf) is None
 
 
 def test_the_digest_lines_say_what_each_engine_did(world: World, capsys: pytest.CaptureFixture[str]) -> None:
