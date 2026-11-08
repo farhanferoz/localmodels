@@ -219,7 +219,7 @@ def tag_key(source: VersionSource, tag: str) -> tuple[int, ...] | None:
 def matching_tags(source: VersionSource, tags: Iterable[str]) -> list[str]:
     """The tags that have the source's exact form (variants such as ``-runtime`` do not), oldest first."""
     keyed = {tag: key for tag in set(tags) if (key := tag_key(source, tag)) is not None}
-    return sorted(keyed, key=lambda tag: keyed[tag])
+    return sorted(keyed, key=lambda tag: (keyed[tag], tag))  # the text breaks a tie (v0.05.1 and v0.5.1)
 
 
 def newest_untried(source: VersionSource, tags: Iterable[str], tried: Collection[str]) -> str | None:
@@ -479,16 +479,28 @@ def keep_list(engine: Engine, pins: Collection[Pin] = ()) -> dict[str, list[str]
 type Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
-def docker_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run a docker command; a missing binary or a timeout is an exit status, not an exception."""
+def run_command(
+    command: Sequence[str], *, timeout: float = DOCKER_TIMEOUT_SECONDS, env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run one external command (docker, squeue, sparkrun, git, uv) and never raise.
+
+    A missing binary or a timeout is an exit status, not an exception: the caller always gets an answer.
+    """
     try:
         return subprocess.run(  # noqa: S603 - argv list, no shell
-            list(command), check=False, capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS
+            list(command), check=False, capture_output=True, text=True, timeout=timeout, env=env
         )
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(list(command), RUNNER_NOT_FOUND, "", str(exc))
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(list(command), RUNNER_TIMEOUT, "", "timed out")
+        return subprocess.CompletedProcess(
+            list(command), RUNNER_TIMEOUT, "", f"timed out after {timeout:g} s"
+        )
+
+
+def docker_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """``run_command`` with Docker's timeout: the default runner of everything here."""
+    return run_command(command)
 
 
 @dataclass
@@ -510,10 +522,11 @@ def prune(
     """
     kept = keep_list(engine, pins)
     report = PruneReport(removed=[], kept=kept, failed=[])
+    kept_images = {r.image for r in records(engine) if r.tag in kept and r.image}
     for folder in unreferenced(versions_dir(engine), keep=kept, by_prefix=False, keep_previous=False):
         record = read_model(folder / RECORD_FILE, VersionRecord)
-        if record is None or not record.pulled or not record.image:
-            continue
+        if record is None or not record.pulled or not record.image or record.image in kept_images:
+            continue  # nothing on disk, or the same image is a kept version's too
         label = f"{record.tag} ({record.image})"
         if dry_run:
             report.removed.append(label)
@@ -593,8 +606,15 @@ def cmd_prompts_install(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_reap(args: argparse.Namespace) -> int:
+    """`engines reap`: the container reaper (``container_run``, loaded on use)."""
+    from .container_run import cmd_reap as run  # noqa: PLC0415 - loaded only when used
+
+    return run(args)
+
+
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Add ``engines list|switch|prune|measure|prompts install`` to the ``localmodels`` command."""
+    """Add ``engines list|switch|prune|measure|prompts install|reap`` to the ``localmodels`` command."""
     engines = subparsers.add_parser(
         "engines", help="serving engines: container engine versions and the measuring harness"
     )
@@ -650,3 +670,6 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     install_p.add_argument("--dir", default=None, help="target folder (default: <state dir>/engines/prompts)")
     install_p.set_defaults(fn=cmd_prompts_install)
+    commands.add_parser(
+        "reap", help="remove engine containers whose slurm job is no longer running"
+    ).set_defaults(fn=cmd_reap)

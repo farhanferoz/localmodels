@@ -134,6 +134,9 @@ async def kill_below_floor(
     free_gib: Callable[[], float | None],
     what: str,
     alive: Callable[[], bool] | None = None,
+    *,
+    kill: Callable[[], None] | None = None,
+    on_poll: Callable[[], None] | None = None,
 ) -> str | None:
     """SIGKILL ``pid``'s process group the moment available memory falls below ``floor``; why, or None.
 
@@ -141,22 +144,47 @@ async def kill_below_floor(
     llama.cpp program a tune runs: on 2026-11-07 (slurm 2187) an unwatched llama-bench took the host's
     memory and could not be killed once the driver had none left (D22). ``alive`` tells whether it still
     runs; by default ``waitpid``, which reaps a child, so the parent of an asyncio child passes its own check
-    (``returncode is None``), or asyncio would read a reaped exit status as 255.
+    (``returncode is None``), or asyncio would read a reaped exit status as 255. ``kill`` replaces the
+    SIGKILL of ``pid`` (``container_run`` kills a container through Docker); ``on_poll`` runs at each poll.
     """
     running = alive or (lambda: _is_pid_alive(pid))
     while running():
         await asyncio.sleep(poll_s())
+        if on_poll is not None:
+            on_poll()
         free = free_gib()
         if free is not None and free < floor:
             reason = f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
             log.error("killing %s PID %d: %s", what, pid, reason)
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except OSError:
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
+            (kill or (lambda: _kill_group(pid)))()
             return reason
     return None
+
+
+def _kill_group(pid: int) -> None:
+    """SIGKILL ``pid``'s process group, or ``pid`` alone when it has none."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def check_fits(what: str, need_gib: float, free_gib: float | None, reserve_gib: float) -> None:
+    """Refuse a load whose memory need plus the host reserve exceeds available memory (D22).
+
+    ``ServerStartError`` when available memory cannot be read, ``NotEnoughMemoryError`` when it is short.
+    """
+    need = need_gib + reserve_gib
+    if free_gib is None:
+        msg = f"available memory cannot be read, so {what}'s fit cannot be checked; not loading it"
+        raise ServerStartError(msg)
+    if need > free_gib:
+        msg = (
+            f"{what} needs {need:.1f} GiB (its projected or measured memory plus a {reserve_gib:g} GiB host "
+            f"reserve) but {free_gib:.1f} GiB is available; not loading it"
+        )
+        raise NotEnoughMemoryError(msg)
 
 
 def stay_up_problem(guards: MemoryGuards, resident_allowance_gib: float | None) -> str | None:
@@ -580,16 +608,7 @@ class LocalServerManager:
 
     def _check_fits(self, projection: float, free: float | None, reserve: float) -> None:
         """Refuse to load when the projection plus the host reserve exceeds available memory."""
-        need = projection + reserve
-        if free is None:
-            msg = "available memory cannot be read, so the model's fit cannot be checked; not loading it"
-            raise ServerStartError(msg)
-        if need > free:
-            msg = (
-                f"{self.spec.model_path.name} needs {need:.1f} GiB (its projected or measured memory plus a "
-                f"{reserve:g} GiB host reserve) but {free:.1f} GiB is available; not loading it"
-            )
-            raise NotEnoughMemoryError(msg)
+        check_fits(self.spec.model_path.name, projection, free, reserve)
 
     def _caller_sets_cache_ram(self) -> bool:
         return llama_option(self.extra_flags, self.extra_env, CACHE_RAM_FLAGS, CACHE_RAM_ENV) is not None

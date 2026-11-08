@@ -298,6 +298,14 @@ def test_prune_removes_only_what_the_keep_list_does_not_name(
     after = prune(Engine.TRTLLM, pins=pins, dry_run=True, runner=docker)
     assert [item.split()[0] for item in after.removed] == ["1.1.0"]  # 1.0.0 is already off disk
 
+    current = read_record(Engine.TRTLLM, "1.4.0rc3")
+    assert current is not None
+    write_record(
+        current.model_copy(update={"tag": "1.4.1rc1"})
+    )  # a retag of current's image, on no keep list
+    twin = prune(Engine.TRTLLM, pins=pins, dry_run=True, runner=docker)
+    assert not any(item.startswith("1.4.1rc1") for item in twin.removed)  # the kept image is never removed
+
     assert main(["engines", "prune", "--dry-run"]) == 0
     assert "kept trtllm 1.4.0rc3: current, used by follower, used by study" in capsys.readouterr().out
 
