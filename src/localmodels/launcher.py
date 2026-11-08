@@ -150,14 +150,14 @@ async def kill_below_floor(
     running = alive or (lambda: _is_pid_alive(pid))
     while running():
         await asyncio.sleep(poll_s())
-        if on_poll is not None:
-            on_poll()
         free = free_gib()
         if free is not None and free < floor:
             reason = f"available memory fell to {free:.1f} GiB, below the {floor:g} GiB kill floor"
             log.error("killing %s PID %d: %s", what, pid, reason)
             (kill or (lambda: _kill_group(pid)))()
             return reason
+        if on_poll is not None:  # after the floor is decided: its own work (a docker call) may be slow
+            on_poll()
     return None
 
 

@@ -26,6 +26,7 @@ import dataclasses
 import functools
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -147,8 +148,9 @@ class MemoryNeed:
     @classmethod
     def recorded(cls, record: VersionRecord, model: str) -> float | None:
         """The largest whole need any run of ``model`` on this version recorded (results' ``memory``)."""
+        names = {f.name for f in dataclasses.fields(cls)}
         needs = [
-            cls(**dict(result["memory"])).gib  # type: ignore[call-overload]
+            cls(**{k: v for k, v in result["memory"].items() if k in names}).gib  # type: ignore[attr-defined]
             for result in record.results
             if result.get("model") == model and isinstance(result.get("memory"), dict)
         ]
@@ -187,6 +189,9 @@ class ContainerRun:
     _previous_handler: Any = field(default=None, init=False)
     _free_before: float | None = field(default=None, init=False)
     _lowest_free: float | None = field(default=None, init=False)
+    _host_peak: float | None = field(default=None, init=False)  # read in ``stop`` before the removal
+    _sigterm_installed: bool = field(default=False, init=False)
+    _oom_logged: bool = field(default=False, init=False)
 
     # --- before the start -------------------------------------------------------------------------
 
@@ -205,7 +210,17 @@ class ContainerRun:
         return SEED_NEED_GIB[self.record.engine]
 
     def _refuse_unready(self) -> None:
-        if not self.record.image or not self.record.pulled:
+        if not os.environ.get("SLURM_JOB_ID"):
+            msg = (
+                "a container engine starts only inside a slurm job (GPU work goes through slurm, and the "
+                "reaper keeps a container only while its job runs): submit it with preflight's submit.py"
+            )
+            raise ContainerStartError(msg)
+        on_disk = (  # the daemon's word, not only the record's: an image removed by hand is gone
+            bool(self.record.image)
+            and self.docker(["docker", "image", "inspect", self.record.image]).returncode == 0
+        )
+        if not self.record.pulled or not on_disk:
             msg = (
                 f"{self.record.engine.value} {self.record.tag}: its image is not on disk; pull it first with "
                 f"`localmodels engines pull {self.record.engine.value} {self.record.tag}` (a CPU job), never "
@@ -272,23 +287,29 @@ class ContainerRun:
             self._free_before,
             reserve,
         )
+        try:  # from here on, whatever ends the start (an interrupt included) stops what it began
+            self._start(need)
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def _start(self, need: float) -> None:
+        """Write the recipe, install the stop paths and the guard, and start; raises when it did not start."""
         recipe = self._write_recipe(self._prepare_hub())
         self._install_sigterm()
         self._start_guard()
         done = run_sparkrun(
-            self.sparkrun, self._run_args(recipe), timeout=START_TIMEOUT_S, hub_root=self._run_root
+            self.sparkrun, self._run_args(recipe, need), timeout=START_TIMEOUT_S, hub_root=self._run_root
         )
         if done.returncode != 0 or self._killed:
-            self.stop()
             why = self._killed or f"sparkrun run exited {done.returncode}: {done.stderr.strip()[-500:]}"
             raise ContainerStartError(why)
-        free = self.free_gib()
-        if self.guards.host_reserve_gib is not None and (free is None or free < self.guards.host_reserve_gib):
-            self.stop()
-            reserve = self.guards.host_reserve_gib
-            msg = f"the server left {free} GiB available, below the {reserve:g} GiB host reserve"
+        free = self._sample_free()  # the reading after the load counts toward the fall
+        floor = self.guards.host_reserve_gib
+        if floor is not None and (free is None or free < floor):
+            msg = f"the server left {free} GiB available, below the {floor:g} GiB host reserve"
             raise NotEnoughMemoryError(msg)
-        return self
 
     def __exit__(
         self, kind: type[BaseException] | None, exc: BaseException | None, tb: types.TracebackType | None
@@ -296,29 +317,35 @@ class ContainerRun:
         """Stop the server, whatever ended the block."""
         self.stop()
 
-    def _run_args(self, recipe: Path) -> list[str]:
-        return ["run", str(recipe), "--tp", "1", "--hosts", "localhost", "--no-follow", "--offline"]
+    def _run_args(self, recipe: Path, need_gib: float) -> list[str]:
+        return [
+            "run", str(recipe), "--tp", "1", "--hosts", "localhost", "--no-follow", "--offline",
+            "--memory-limit", f"{math.ceil(need_gib)}G",  # docker --memory: binary units, the whole need
+        ]  # fmt: skip
 
     def _install_sigterm(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return  # signal handlers are the main thread's; a worker thread's run relies on the reaper
         previous = signal.getsignal(signal.SIGTERM)
         self._previous_handler = previous
+        self._sigterm_installed = True
 
         def on_term(signum: int, frame: types.FrameType | None) -> None:
             self.stop()
             if callable(previous):
                 previous(signum, frame)
-            elif previous == signal.SIG_DFL:
+            elif previous != signal.SIG_IGN:  # the default, or a handler not set from Python (None)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 os.kill(os.getpid(), signal.SIGTERM)
 
         signal.signal(signal.SIGTERM, on_term)
 
     def _start_guard(self) -> None:
-        if self.guards.kill_below_gib is None:
-            return
-        floor = self.guards.kill_below_gib
+        """Watch memory for the whole run: sample it, raise the OOM score, kill below the floor.
+
+        Without a floor it still samples (the recorded fall) and scores: a floor of 0, never reached.
+        """
+        floor = self.guards.kill_below_gib or 0.0
 
         def watch() -> None:
             self._killed = asyncio.run(
@@ -333,6 +360,8 @@ class ContainerRun:
                     on_poll=self._raise_oom_score,
                 )
             )
+            while self._killed and not self._stopped.wait(POLL_S):
+                self._docker_kill()  # sparkrun may still be starting one: kill whatever the run makes
 
         self._guard = threading.Thread(target=watch, name=f"guard-{self.run_id[:8]}", daemon=True)
         self._guard.start()
@@ -350,7 +379,10 @@ class ContainerRun:
         done = self.docker(
             ["docker", "ps", "-aq", "--no-trunc", "--filter", f"label={RUN_LABEL}={self.run_id}"]
         )
-        return done.stdout.split() if done.returncode == 0 else []
+        if done.returncode != 0:  # unknown, not none: whatever runs is the reaper's to remove
+            log.warning("container run %s: docker ps failed (%s)", self.run_id, done.stderr.strip()[:200])
+            return []
+        return done.stdout.split()
 
     def _docker_kill(self) -> None:
         for cid in self.container_ids():
@@ -364,11 +396,27 @@ class ContainerRun:
         score = self.guards.server_oom_score_adj
         if score is None:
             return
+        done, failed = 0, []
         for cid in self.container_ids():
-            with contextlib.suppress(OSError):
-                for pid in (self._cgroup(cid) / "cgroup.procs").read_text(encoding="utf-8").split():
-                    with contextlib.suppress(OSError):
-                        Path(f"/proc/{pid}/oom_score_adj").write_text(str(score), encoding="utf-8")
+            try:
+                pids = (self._cgroup(cid) / "cgroup.procs").read_text(encoding="utf-8").split()
+            except OSError as exc:
+                failed.append(f"{cid[:12]}: {exc}")
+                continue
+            for pid in pids:
+                try:
+                    Path(f"/proc/{pid}/oom_score_adj").write_text(str(score), encoding="utf-8")
+                    done += 1
+                except FileNotFoundError:
+                    pass  # the process ended between the listing and the write
+                except OSError as exc:  # another user's process (a container not run as ours)
+                    failed.append(f"pid {pid}: {exc}")
+        if not self._oom_logged and (done or failed):  # once a run: the first poll that found processes
+            self._oom_logged = True
+            if failed:
+                log.warning("OOM score %d not set on %s (set on %d)", score, "; ".join(failed[:3]), done)
+            else:
+                log.info("OOM score %d set on the container's %d processes", score, done)
 
     def host_peak_gib(self) -> float | None:
         """The container's host-side memory peak (its cgroup's ``memory.peak``), GiB; None when unreadable."""
@@ -383,7 +431,8 @@ class ContainerRun:
         fall = None
         if self._free_before is not None and self._lowest_free is not None:
             fall = max(0.0, self._free_before - self._lowest_free)
-        return MemoryNeed(fall_gib=fall, host_peak_gib=self.host_peak_gib())
+        peak = self._host_peak if self._stopped.is_set() else self.host_peak_gib()
+        return MemoryNeed(fall_gib=fall, host_peak_gib=peak)
 
     def stamp(self) -> dict[str, str]:
         """What a result served by this run carries (design 3.7; E4 adds the autotune and tuning hashes)."""
@@ -401,6 +450,7 @@ class ContainerRun:
         """Stop the server and remove its containers, then log what was left; safe to call more than once."""
         if self._stopped.is_set():
             return
+        self._host_peak = self.host_peak_gib()  # the cgroup goes with the container
         self._stopped.set()
         if self._recipe_file is not None:
             run_sparkrun(
@@ -413,8 +463,9 @@ class ContainerRun:
             self.docker(["docker", "rm", "-f", cid])
         left = self.container_ids()
         log.info("container run %s stopped; containers left: %s", self.run_id, left or "none")
-        if self._previous_handler is not None and threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGTERM, self._previous_handler)
+        if self._sigterm_installed and threading.current_thread() is threading.main_thread():
+            # None: a handler not set from Python, which cannot be put back; the default stands in
+            signal.signal(signal.SIGTERM, self._previous_handler or signal.SIG_DFL)
         if self._run_root is not None:
             shutil.rmtree(self._run_root, ignore_errors=True)
         if self._recipe_file is not None:
@@ -469,7 +520,8 @@ class Reaper:
 
     def jobs(self) -> dict[str, tuple[str, datetime | None]] | None:
         """Every job slurm holds: id -> (state, start); None when the listing failed."""
-        done = self.squeue(["squeue", "-h", "-a", "-o", "%i|%T|%S"])
+        # %A, not %i: an array task's own id, as its SLURM_JOB_ID (and so its label) carries it
+        done = self.squeue(["squeue", "-h", "-a", "-o", "%A|%T|%S"])
         if done.returncode != 0:
             return None
         jobs: dict[str, tuple[str, datetime | None]] = {}
@@ -515,6 +567,9 @@ class Reaper:
             log.warning("reaper: %s", report.reason)
             return report
         for box in self.containers():
+            if not box.job.isdigit():  # not one of ours (ours start only inside a job): never guessed at
+                report.kept.append(f"{box.cid[:12]}: label {JOB_LABEL}={box.job!r} is not a slurm job id")
+                continue
             state, started = jobs.get(box.job, (None, None))
             why = None
             if state is None:

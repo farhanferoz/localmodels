@@ -76,6 +76,7 @@ HTTP_UNAUTHORIZED: Final = 401
 NO_SUCH_IMAGE: Final = "No such image"
 DOCKER_TIMEOUT_SECONDS: Final = 600.0
 RUNNER_NOT_FOUND: Final = 127
+RUNNER_CANNOT_RUN: Final = 126  # found, but not executable (the shell's code)
 RUNNER_TIMEOUT: Final = 124
 
 _IMAGE: Final = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
@@ -484,14 +485,16 @@ def run_command(
 ) -> subprocess.CompletedProcess[str]:
     """Run one external command (docker, squeue, sparkrun, git, uv) and never raise.
 
-    A missing binary or a timeout is an exit status, not an exception: the caller always gets an answer.
+    A missing or unrunnable binary or a timeout is an exit status, not an exception: the caller always gets
+    an answer (a stop path that raised would leave its container behind).
     """
     try:
         return subprocess.run(  # noqa: S603 - argv list, no shell
             list(command), check=False, capture_output=True, text=True, timeout=timeout, env=env
         )
-    except FileNotFoundError as exc:
-        return subprocess.CompletedProcess(list(command), RUNNER_NOT_FOUND, "", str(exc))
+    except OSError as exc:  # not found, not executable, ...
+        code = RUNNER_NOT_FOUND if isinstance(exc, FileNotFoundError) else RUNNER_CANNOT_RUN
+        return subprocess.CompletedProcess(list(command), code, "", str(exc))
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             list(command), RUNNER_TIMEOUT, "", f"timed out after {timeout:g} s"
