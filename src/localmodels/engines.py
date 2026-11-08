@@ -575,6 +575,12 @@ def cmd_switch(args: argparse.Namespace) -> int:
         sys.stderr.write(f"not switching: {problem}\n")
         return EXIT_ERROR
     sys.stdout.write(f"{engine.value} {CURRENT} -> {args.version}\n")
+    switched = read_record(engine, args.version)
+    if switched is not None and not switched.pulled:
+        sys.stdout.write(
+            f"{engine.value} {args.version}: its image is not on disk; pull it with "
+            f"`localmodels engines pull {engine.value} {args.version}` (a CPU job) before a job uses it\n"
+        )
     return EXIT_OK
 
 
@@ -616,8 +622,22 @@ def cmd_reap(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_pull(args: argparse.Namespace) -> int:
+    """`engines pull`: submit the CPU job that pulls one version (``engine_refresh``, loaded on use)."""
+    from .engine_refresh import cmd_engines_pull as run  # noqa: PLC0415 - loaded only when used
+
+    return run(args)
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """`engines calibrate`: submit the pull and calibration jobs for an engine's `current`."""
+    from .engine_refresh import cmd_engines_calibrate as run  # noqa: PLC0415 - as above
+
+    return run(args)
+
+
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Add ``engines list|switch|prune|measure|prompts install|reap`` to the ``localmodels`` command."""
+    """Add ``engines list|switch|pull|calibrate|prune|measure|prompts install|reap`` to ``localmodels``."""
     engines = subparsers.add_parser(
         "engines", help="serving engines: container engine versions and the measuring harness"
     )
@@ -637,6 +657,17 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         f"(kept in {OVERRIDE_FILE})",
     )
     switch_p.set_defaults(fn=cmd_switch)
+
+    pull_p = commands.add_parser("pull", help="submit the CPU job that pulls one version's image")
+    pull_p.add_argument("engine", choices=[e.value for e in CONTAINER_ENGINES])
+    pull_p.add_argument("version", help="tag, as `engines list` prints it")
+    pull_p.set_defaults(fn=cmd_pull)
+
+    calibrate_p = commands.add_parser(
+        "calibrate", help="submit the jobs that calibrate an engine's quality limits on its `current`"
+    )
+    calibrate_p.add_argument("engine", choices=[e.value for e in CONTAINER_ENGINES])
+    calibrate_p.set_defaults(fn=cmd_calibrate)
 
     prune_p = commands.add_parser(
         "prune", help="remove the images that are not current, pinned or named in users.toml"

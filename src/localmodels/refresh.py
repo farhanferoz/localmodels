@@ -12,6 +12,10 @@ Folders: a run's files live in ``$LOCALMODELS_REFRESH_DIR/<YYYY-MM-DDTHHMM>/`` (
 ``$LOCALMODELS_STATE_DIR/refresh/state.json``. Design: docs/research/engine-refresh-design-2026-11-07.md.
 
 Nothing here runs a llama.cpp program except ``measure``, which holds the GPU lease quiet while it does.
+
+``run`` also walks the container engines (vLLM, SGLang, TensorRT-LLM) through ``engine_refresh``, which is
+loaded only then; the job subcommands ``engine-pull``, ``engine-measure``, ``engine-calibrate``,
+``same-client`` and ``sparkrun-compare`` belong to it (docs/research/engine-registry-design-2026-11-08.md).
 """
 
 from __future__ import annotations
@@ -75,6 +79,7 @@ RUN_ID_FORMAT: Final = "%Y-%m-%dT%H%M"
 _RUN_ID = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}$")
 PROJECT: Final = "localmodels"  # the slurm project of both jobs
 LEASE_PROJECT: Final = "localmodels-refresh"  # the name on the quiet request
+NOTHING_TO_DO: Final = "nothing to do"  # the front of ``RunRecord.skipped`` when no part has work
 JOB_PLACEHOLDER: Final = "<build job id>"  # what a dry run shows for the id of a job it did not submit
 LS_REMOTE_TIMEOUT_S: Final = 60
 
@@ -165,6 +170,12 @@ _BENCH_NAMES: Final = SPEED_FIGURES[:3]
 _BATCHED_NAMES: Final = SPEED_FIGURES[3:]
 
 
+def model_file(pin: Model) -> Path | None:
+    """The model file in the Hub cache; None when it is not there."""
+    path = snapshot_dir(pin.repository, pin.revision, _default_hub_cache()) / pin.filename
+    return path if path.is_file() else None
+
+
 # ---------------------------------------------------------------------------------------------------------
 # Folders and files
 
@@ -214,6 +225,17 @@ class JobRecord(BaseModel):
     error: str = ""
 
 
+class EnginePlan(BaseModel):
+    """What the engine walk decided for one version source (strings: ``engine_refresh`` owns the enums)."""
+
+    engine: str
+    repository: str
+    publisher: str
+    tag: str = ""  # the candidate; empty when there is none
+    mode: str = ""  # bootstrap or candidate, when there is one
+    reason: str = ""  # why there is no candidate, or what else the plan notes
+
+
 class RunRecord(BaseModel):
     """``run.json``: what ``run`` found and submitted."""
 
@@ -227,6 +249,8 @@ class RunRecord(BaseModel):
     cancelled: list[str] = Field(default_factory=list)  # refresh jobs that could never start, cancelled
     queued: list[str] = Field(default_factory=list)  # live refresh jobs that made this run skip
     jobs: list[JobRecord] = Field(default_factory=list)
+    engines: list[EnginePlan] = Field(default_factory=list)  # the container engines' candidates
+    engine_reports: list[str] = Field(default_factory=list)  # reaper, prune and sparkrun-move reports
 
 
 class BuildResult(BaseModel):
@@ -485,7 +509,14 @@ def _measure_command(home: str | None, run: Path) -> list[str]:
 
 
 def _submit(
-    script: Path, run: Path, name: JobName, what: str, flags: Sequence[str], command: Sequence[str]
+    script: Path,
+    run: Path,
+    name: str,
+    what: str,
+    flags: Sequence[str],
+    command: Sequence[str],
+    *,
+    log_stem: str | None = None,
 ) -> list[str]:
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
@@ -496,7 +527,7 @@ def _submit(
         "--name", name,
         "--what", what,
         "--workdir", str(run),  # a systemd user service starts in the home folder
-        "--log", str(run / f"{name.removeprefix('refresh-')}.log"),
+        "--log", str(run / f"{log_stem or name.removeprefix('refresh-')}.log"),
         *flags,
         "--",
         *command,
@@ -606,7 +637,7 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
     due = any(a.kind in REMEASURED_KINDS and a.state in unanswered for a in found)
     script = retune._script()  # noqa: SLF001 - `$LOCALMODELS_SUBMIT`, and the tests' tripwire
     if candidate is None and not due and not args.force_measure:
-        record.skipped = f"nothing to do ({record.no_candidate}; K1-K3 answered)"
+        record.skipped = f"{NOTHING_TO_DO} ({record.no_candidate}; K1-K3 answered)"
     elif script is None:
         record.skipped = f"no submit script (${retune.SUBMIT_ENV} is empty)"
     elif args.urgent and candidate is not None and built_folder(home, candidate.commit) is None:
@@ -617,15 +648,40 @@ def _decide(args: argparse.Namespace, home: Path, record: RunRecord) -> tuple[Ca
     return candidate, script
 
 
+class JobSubmitter:
+    """Submits the jobs of one run, or prints them in a dry run; ``failed`` says whether one was refused."""
+
+    def __init__(self, record: RunRecord, *, dry_run: bool) -> None:
+        self.record = record
+        self.dry_run = dry_run
+        self.failed = False
+        self.count = 0  # jobs submitted or, in a dry run, printed
+
+    def submit(
+        self, name: str, argv: list[str], how: Callable[[list[str]], tuple[str, str]] | None = None
+    ) -> str | None:
+        """Submit ``argv`` (through ``how``, default ``submit.py``); the job id, or None if not queued."""
+        self.count += 1
+        if self.dry_run:
+            sys.stdout.write(f"{shlex.join(argv)}\n")
+            return JOB_PLACEHOLDER
+        from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
+
+        job, why = (how or retune._run_submit)(argv)  # noqa: SLF001
+        self.record.jobs.append(JobRecord(name=name, argv=argv, job=job, error=why))
+        self.failed |= bool(why)
+        sys.stdout.write(f"{name}: {'job ' + job if job else 'not submitted: ' + why}\n")
+        return job or None
+
+
 def _submit_jobs(
-    args: argparse.Namespace, script: Path, run: Path, record: RunRecord, candidate: Candidate | None
-) -> bool:
-    """Submit the build job (a candidate not built yet), then the measure job; whether one failed.
+    args: argparse.Namespace, script: Path, run: Path, submitter: JobSubmitter, candidate: Candidate | None
+) -> str | None:
+    """Submit the build job (a candidate not built yet), then the measure job; the measure job's id.
 
     A candidate whose build is already finished gets its ``build.json`` written here instead of a build job.
+    The id is None when the measure job was not queued (``submitter.failed`` then says so).
     """
-    from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
-
     built = built_folder(llama_home(args.home), candidate.commit) if candidate is not None else None
     if candidate is not None and built is not None:
         if args.dry_run:
@@ -634,43 +690,43 @@ def _submit_jobs(
             done = BuildResult(tag=candidate.tag, commit=built.name, ok=True, error="already built")
             write_model(run / BUILD_FILE, done)
     after: str | None = None
-    failed = False
-
-    def submit(name: JobName, argv: list[str], how: Callable[[list[str]], tuple[str, str]]) -> None:
-        nonlocal after, failed
-        if args.dry_run:
-            sys.stdout.write(f"{shlex.join(argv)}\n")
-            after = JOB_PLACEHOLDER
-            return
-        job, why = how(argv)
-        record.jobs.append(JobRecord(name=name, argv=argv, job=job, error=why))
-        failed |= bool(why)
-        after = job or None
-        sys.stdout.write(f"{name}: {'job ' + job if job else 'not submitted: ' + why}\n")
-
     if candidate is not None and built is None:
-        submit(JobName.BUILD, build_argv(script, run, candidate.tag, args.home), retune._run_submit)  # noqa: SLF001
+        after = submitter.submit(JobName.BUILD, build_argv(script, run, candidate.tag, args.home))
     if args.urgent:
-        submit(JobName.MEASURE, urgent_argv(script, run, args.home), _run_urgent)
-    else:
-        submit(JobName.MEASURE, measure_argv(script, run, after, args.home), retune._run_submit)  # noqa: SLF001
-    return failed
+        return submitter.submit(JobName.MEASURE, urgent_argv(script, run, args.home), _run_urgent)
+    return submitter.submit(JobName.MEASURE, measure_argv(script, run, after, args.home))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Decide what is due and submit the build and measure jobs; ``--dry-run`` only prints the commands."""
+    """Decide what is due and submit the jobs; ``--dry-run`` only prints the commands.
+
+    The llama.cpp part decides first; the container engines are walked next (``engine_refresh``), inside
+    the same skip rules. A run is skipped as "nothing to do" only when neither part submits a job.
+    """
     now = datetime.now(UTC)
     run = refresh_dir() / now.strftime(RUN_ID_FORMAT)
     record = RunRecord(time=now.isoformat(timespec="seconds"))
     candidate, script = _decide(args, llama_home(args.home), record)
+    idle = record.skipped.startswith(NOTHING_TO_DO)  # the llama.cpp part has nothing; the engines may
     failed = False
-    if record.skipped or script is None:
+    if (record.skipped and not idle) or script is None:
         sys.stdout.write(f"skipped: {record.skipped}\n")
         failed = record.skipped.startswith("--urgent")  # asked for and not done: say so in the exit code
     else:
+        from .engine_refresh import EngineWalk  # noqa: PLC0415 - loaded only when the walk runs
+
         if not args.dry_run:
             run.mkdir(parents=True, exist_ok=True)  # the jobs' --workdir and --log: there before they queue
-        failed = _submit_jobs(args, script, run, record, candidate)
+        submitter = JobSubmitter(record, dry_run=args.dry_run)
+        walk = EngineWalk(args, run, record, submitter, script)
+        walk.decide()
+        measure = None if idle else _submit_jobs(args, script, run, submitter, candidate)
+        walk.submit(llama_measure_job=measure)
+        if idle and not submitter.count:
+            sys.stdout.write(f"skipped: {record.skipped}\n")
+        else:
+            record.skipped = ""
+        failed = submitter.failed
     if not args.dry_run and not record.queued:  # a run still in progress keeps its folder the newest
         run.mkdir(parents=True, exist_ok=True)
         write_model(run / RUN_FILE, record)
@@ -754,6 +810,47 @@ def parse_batched(text: str, prefix: str) -> dict[str, float]:
     return figures
 
 
+class SpeedJudgement(NamedTuple):
+    """The speed gate's answer: what failed, the largest relative slowdown, and every figure's rounds."""
+
+    failures: list[str]
+    slowdown: float
+    figures: dict[str, dict[str, list[float]]]
+
+
+def judge_speed(
+    names: Sequence[str],
+    baseline: Sequence[Mapping[str, float | None]],
+    candidate: Sequence[Mapping[str, float | None]],
+    *,
+    report_missing: bool = True,
+) -> SpeedJudgement:
+    """D13's speed rule on the means of the rounds, shared by the llama.cpp gate and the container gate.
+
+    A figure fails when ``(mean(base) - mean(cand)) / mean(base) > max(MIN_SLOWDOWN, (max(base) - min(base))
+    / min(base))`` (a NaN fails); one missing (or ``None``) in any round of either side fails as "not
+    measured: <name>" unless ``report_missing`` is off (the caller already reports the steps that failed).
+    """
+    failures: list[str] = []
+    figures: dict[str, dict[str, list[float]]] = {}
+    slowdowns: list[float] = []
+    for name in names:
+        base = [v for r in baseline if (v := r.get(name)) is not None]
+        cand = [v for r in candidate if (v := r.get(name)) is not None]
+        if len(base) < ROUNDS or len(cand) < ROUNDS:
+            if report_missing:
+                failures.append(f"not measured: {name}")
+            continue
+        figures[name] = {"baseline": base, "candidate": cand}
+        mean = statistics.fmean(base)
+        slower = (mean - statistics.fmean(cand)) / mean
+        slowdowns.append(slower)
+        tolerance = max(MIN_SLOWDOWN, (max(base) - min(base)) / min(base))
+        if math.isnan(slower) or slower > tolerance:  # a NaN figure is no measurement
+            failures.append(f"{name} {_percent(slower)} slower than baseline (limit {_percent(tolerance)})")
+    return SpeedJudgement(failures, max(slowdowns, default=0.0), figures)
+
+
 def judge_candidate(
     baseline: Sequence[Mapping[str, float]],
     candidate: Sequence[Mapping[str, float]],
@@ -775,22 +872,9 @@ def judge_candidate(
     quality: list[str] = []
     for step, why in skipped.items():
         (quality if step.startswith("cmp-k3") else speed).append(f"not measured: {step}: {why}")
-    figures: dict[str, dict[str, list[float]]] = {}
-    slowdowns: list[float] = []
-    for name in SPEED_FIGURES:
-        base = [r[name] for r in baseline if name in r]
-        cand = [r[name] for r in candidate if name in r]
-        if len(base) < ROUNDS or len(cand) < ROUNDS:
-            if not skipped:
-                speed.append(f"not measured: {name}")
-            continue
-        figures[name] = {"baseline": base, "candidate": cand}
-        mean = statistics.fmean(base)
-        slower = (mean - statistics.fmean(cand)) / mean
-        slowdowns.append(slower)
-        tolerance = max(MIN_SLOWDOWN, (max(base) - min(base)) / min(base))
-        if math.isnan(slower) or slower > tolerance:  # a NaN figure is no measurement
-            speed.append(f"{name} {_percent(slower)} slower than baseline (limit {_percent(tolerance)})")
+    judged = judge_speed(SPEED_FIGURES, baseline, candidate, report_missing=not skipped)
+    speed += judged.failures
+    figures = judged.figures
     if control is None or scored is None:
         if not any(step.startswith("cmp-k3") for step in skipped):
             quality.append("not measured: K3 comparison")
@@ -800,12 +884,11 @@ def judge_candidate(
         agreement = judge_ub(scored, control, UB_LIMITS)
         if not agreement.passed:
             quality.append(f"K3 outside its limits: {agreement.detail}")
-    slowdown = max(slowdowns, default=0.0)
     return Verdict(
         passed=not speed and not quality,
         speed_failures=speed,
         quality_failures=quality,
-        slowdown=slowdown,
+        slowdown=judged.slowdown,
         figures=figures,
         notes=", ".join(
             f"{name} {statistics.fmean(f['baseline']):.4g} -> {statistics.fmean(f['candidate']):.4g}"
@@ -883,8 +966,7 @@ class Measurer:
 
     def model(self, pin: Model) -> Path | None:
         """The model file in the Hub cache; None when it is not there."""
-        path = snapshot_dir(pin.repository, pin.revision, _default_hub_cache()) / pin.filename
-        return path if path.is_file() else None
+        return model_file(pin)
 
     def tool(self, step: str, argv: Sequence[str | Path]) -> tuple[str, str] | None:
         """Run one tool call: (stdout, stderr), also kept in ``<step>.out`` and ``.err``; None on failure."""
@@ -1221,6 +1303,10 @@ def cmd_status(_args: argparse.Namespace) -> int:
         )
         out.writelines(f"  removed build {removed}\n" for removed in view.run.removed_builds)
         out.writelines(f"  {line}\n" for line in view.run.stale_rules)
+        if view.run.engines or view.run.engine_reports:
+            from .engine_refresh import engine_lines  # noqa: PLC0415 - loaded only when there is a walk to show
+
+            out.writelines(f"  {line}\n" for line in engine_lines(view))
     if view.result is not None:
         out.writelines(
             f"  {step}: {outcome}\n" for step, outcome in view.result.steps.items() if outcome != STEP_OK
@@ -1228,6 +1314,27 @@ def cmd_status(_args: argparse.Namespace) -> int:
         if line := rules_line(view):
             out.write(f"  {line}\n")
     return EXIT_OK
+
+
+#: Each engine job's own flags as (flag, required); every one also takes ``--run``.
+JOB_FLAGS: Final = {
+    "engine-pull": (("--engine", True), ("--tag", True), ("--publisher", True)),
+    "engine-measure": (("--engine", True), ("--tag", True), ("--mode", True), ("--model", False)),
+    "engine-calibrate": (("--engine", True), ("--tag", True), ("--adjacent", True)),
+    "same-client": (),
+    "sparkrun-compare": (("--old", True), ("--new", True)),
+}
+
+
+def _engine_job(function: str) -> Callable[[argparse.Namespace], int]:
+    """The command that runs ``engine_refresh.cmd_<function>``, loading that module only when it runs."""
+
+    def run(args: argparse.Namespace) -> int:
+        from . import engine_refresh  # noqa: PLC0415 - the container engines are loaded only when used
+
+        return int(getattr(engine_refresh, f"cmd_{function}")(args))
+
+    return run
 
 
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -1268,3 +1375,17 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     measure.set_defaults(fn=cmd_measure)
 
     commands.add_parser("status", help="print the newest run").set_defaults(fn=cmd_status)
+
+    jobs = {
+        "engine-pull": ("(a job) pull one container engine image and realize its recipes", "pull"),
+        "engine-measure": ("(a job) measure a container engine version; switch on a pass", "measure"),
+        "engine-calibrate": ("(a job) calibrate a container engine's quality limits", "calibrate"),
+        "same-client": ("(a job) measure llama.cpp on the container engines' client", "same_client"),
+        "sparkrun-compare": ("(a job) compare two sparkrun versions on every engine", "sparkrun_compare"),
+    }
+    for command, (help_, function) in jobs.items():
+        job = commands.add_parser(command, help=help_)
+        job.add_argument("--run", required=True, help="the run folder")
+        for flag, required in JOB_FLAGS[command]:
+            job.add_argument(flag, required=required)
+        job.set_defaults(fn=_engine_job(function))

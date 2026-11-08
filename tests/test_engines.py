@@ -322,3 +322,17 @@ def test_engines_command_switches_and_lists(capsys: pytest.CaptureFixture[str]) 
         "projects: none"
     )
     assert record_path(Engine.SGLANG, "v0.5.22-cu130").is_file()
+
+
+def test_switch_names_the_pull_command_when_the_image_is_not_on_disk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make(Engine.VLLM, "v0.33.0", pulled=False)  # a rollback to `previous`: record and digest only
+    assert main(["engines", "switch", "vllm", "v0.33.0"]) == 0
+    assert (
+        "vllm v0.33.0: its image is not on disk; pull it with `localmodels engines pull vllm v0.33.0` "
+        "(a CPU job) before a job uses it" in capsys.readouterr().out
+    )
+    make(Engine.VLLM, "v0.34.0")
+    assert main(["engines", "switch", "vllm", "v0.34.0"]) == 0
+    assert "pull it with" not in capsys.readouterr().out

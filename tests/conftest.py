@@ -39,3 +39,22 @@ def gpu_with_its_own_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     does, so without this every test's server arguments would depend on the host the tests run on.
     """
     monkeypatch.setattr("localmodels.launcher._gpu_shares_host_ram", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def container_engines_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The container engine walk of ``refresh run`` reaches no network and no Docker in a test.
+
+    Every tag listing fails (so nothing is submitted), sparkrun lists no tags, and the reaper removes
+    nothing. A test of the walk passes its own fakes.
+    """
+    from localmodels import engine_refresh  # noqa: PLC0415 - loaded here, not for every importer of conftest
+    from localmodels.engines import TagListing  # noqa: PLC0415
+
+    def no_network(*_args: object, **_kwargs: object) -> None:
+        msg = "network in a test"
+        raise OSError(msg)
+
+    monkeypatch.setattr("localmodels.engines.urllib_fetch", no_network)
+    monkeypatch.setattr(engine_refresh, "list_sparkrun_tags", TagListing)
+    monkeypatch.setattr(engine_refresh, "reap_leftovers", list)

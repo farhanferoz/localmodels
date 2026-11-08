@@ -430,7 +430,12 @@ def check_refresh(_ctx: Context) -> list[Finding]:
     if view is None:
         return []
     link = str(view.folder)
-    return [Finding(text, link) for text in (headline(view), rules_line(view)) if text]
+    lines = [headline(view), rules_line(view)]
+    if view.run is not None and (view.run.engines or view.run.engine_reports):
+        from .engine_refresh import engine_lines  # noqa: PLC0415 - the container engines load only when a run walked them
+
+        lines += engine_lines(view)
+    return [Finding(text, link) for text in lines if text]
 
 
 def check_host(ctx: Context) -> list[Finding]:
