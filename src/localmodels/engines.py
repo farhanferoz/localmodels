@@ -518,11 +518,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
                 *([CURRENT] if record.tag == current else []),
                 *([PREVIOUS] if record.tag == previous else []),
                 *(["image on disk"] if record.pulled else []),
-                *(
-                    ["switched by override"]
-                    if (versions_dir(engine) / record.tag / OVERRIDE_FILE).is_file()
-                    else []
-                ),
+                *(["switched by override"] if (folder / record.tag / OVERRIDE_FILE).is_file() else []),
             ]
             projects = named_by(record.tag, current, users, by_prefix=False)
             sys.stdout.write(
