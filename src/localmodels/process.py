@@ -119,6 +119,11 @@ class ServerSpec:
     api_key_file: Path | None = None
 
 
+def ngl_value(params: ServingParams) -> str:
+    """The ``-ngl`` value for these parameters: every layer (``-1``) is passed as 99."""
+    return "99" if params.n_gpu_layers == -1 else str(params.n_gpu_layers)
+
+
 def build_args(
     binary: str | Path,
     spec: ServerSpec,
@@ -130,13 +135,12 @@ def build_args(
     ``extra_flags`` carries a caller's own additions (e.g. service_c's ``--spec-type`` options)
     appended after the shared flags, so a caller never has to reimplement this function to add one.
     """
-    ngl = "99" if params.n_gpu_layers == -1 else str(params.n_gpu_layers)
     return [
         str(binary),
         "-m",
         str(spec.model_path),
         "-ngl",
-        ngl,
+        ngl_value(params),
         "-c",
         str(params.n_ctx),
         "-np",

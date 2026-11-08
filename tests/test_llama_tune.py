@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from localmodels import launcher, llama_tune
+from localmodels import settings as settings_module
 from localmodels.enums import DeviceType, ServingRole, WorkloadKind
 from localmodels.hardware import AvailableMemory
 from localmodels.lease import GpuLease
@@ -25,6 +26,7 @@ from localmodels.llama_tune import (
     FileSet,
     KlResult,
     LlamaTune,
+    LlamaTuneError,
     NotMeasured,
     Planned,
     Priority,
@@ -47,7 +49,7 @@ from localmodels.pinned import PinnedFile, snapshot_dir
 from localmodels.process import _is_pid_alive
 from localmodels.serving.tune import Agreement
 from localmodels.settings import ModelIdentity, SettingsRecord, adopt, read_store, record_path
-from localmodels.stack import Settings, SpecType
+from localmodels.stack import LlamaLayout, Settings, SpecType
 
 FIXTURES = Path(__file__).parent / "fixtures" / "llama_tune"
 K1, K3 = WorkloadKind.K1, WorkloadKind.K3
@@ -543,7 +545,8 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 """
 FAKE_FIT_PARAMS = """#!{python}
-print("llama_params_fit: projected to use 4341 MiB of device memory")
+print("CUDA0 4000 300 41")
+print("Host 0 0 0")  # the `--fit-print on` lines: model, context and compute in MiB
 """
 
 
@@ -738,7 +741,20 @@ async def test_the_command_holds_the_card_writes_the_record_and_adopts_only_what
     assert commanded == ["enter", "tune", "exit"]  # the card is held for the whole tune and let go after it
     written = json.loads((tmp_path / "run" / "record.json").read_text())
     assert bool(written.get("partial")) is (exit_code == 1)
-    assert bool(read_store(record_path(MODEL, K1)).records) is adopted
+    records = read_store(record_path(MODEL, K1)).records
+    assert bool(records) is adopted
+    if adopted:  # the start check reads the chosen server's measured peak and the layout it ran at (D22)
+        peak = settings_module._measured_peak(records[0])
+        runs = [
+            m
+            for m in records[0].llama_measurements
+            if m.get("name", "").split("#")[0] == records[0].candidate
+        ]
+        params = make_spec(tmp_path).params
+        assert peak is not None
+        assert peak.gib == max(m["peak_gib"] for m in runs)
+        here = LlamaLayout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+        assert peak.layout == here
 
 
 async def test_a_cancelled_tune_keeps_what_it_measured_and_deletes_its_base_file(tmp_path: Path) -> None:
@@ -755,6 +771,34 @@ async def test_a_cancelled_tune_keeps_what_it_measured_and_deletes_its_base_file
     kept = json.loads((tmp_path / "run" / "record.json").read_text())
     assert kept["partial"] is True
     assert {m["step"] for m in kept["llama_measurements"]} >= {"layout", "teacher-forced", "server"}
+
+
+async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> None:
+    # slurm 2187 (2026-11-07): the reference left less than the margin and was restarted; its guard killed
+    # the restart and llama-bench then loaded the same model; the host ran out of memory and rebooted
+    script = arm_script()
+    script["reference"] = {**script["reference"], "peak_gib": 91.4}  # 91.4 + 10 kept free > 100 GiB
+    tune, record = await measured(tmp_path, script, speculation=MTP_ONLY)
+    assert tune.calls == ["reference"]
+    assert "llama-bench" not in tune.tools
+    assert not any(t.startswith("llama-perplexity") for t in tune.tools)
+    skipped = {m.name: m.reason for m in tune.measurements if isinstance(m, NotMeasured)}
+    assert skipped["reference restart"].startswith("not tried: the reference's peak of 91.4 GiB")
+    assert skipped["llama-bench"].startswith("not tried: about 91.4 GiB at -ub 2048")
+    assert record.candidate == "reference"
+
+    class Killed(FakeTune):
+        async def _serve(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+            arm = await super()._serve(settings, files, checked=checked)
+            if self.calls.count("reference") == 2:  # what the real _serve records when the guard killed it
+                self.guard_kill = arm.error = "available memory fell to 9.5 GiB, below the 10 GiB kill floor"
+            return arm
+
+    killed = Killed(make_spec(tmp_path, speculation=MTP_ONLY), arm_script())
+    with pytest.raises(LlamaTuneError, match="loads nothing more"):
+        await killed.tune()
+    assert (killed.calls, killed.tools) == (["reference", "reference"], [])
+    assert json.loads((tmp_path / "run" / "record.json").read_text())["partial"] is True
 
 
 async def test_the_reference_is_timed_twice_whenever_a_candidate_is_planned(tmp_path: Path) -> None:

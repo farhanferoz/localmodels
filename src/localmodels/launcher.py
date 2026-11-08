@@ -52,6 +52,7 @@ from .process import (
     llama_flags,
     llama_option,
     llama_values,
+    ngl_value,
     require_key_off_loopback,
     speculates,
 )
@@ -83,8 +84,11 @@ __all__ = [
 _HTTP_OK = 200
 _GIB = 1024**3
 _MIB_PER_GIB = 1024
-# llama-fit-params prints this only at verbosity 4 (measured by service_c, 2026-10-07).
-_PROJECTION_RE = re.compile(r"projected to use (\d+) MiB of device memory")
+# ``llama-fit-params --fit-print on`` prints one line per GPU and one for the host: "<name> <model> <context>
+# <compute>" in MiB (common/fit.cpp ``common_fit_print``; in both kept builds, 80d2c0c2c and 5aeac37a3,
+# read 2026-11-08). The host line is named "Host".
+_FIT_ROW_RE = re.compile(r"^(\S+) (\d+) (\d+) (\d+)\s*$", re.MULTILINE)
+_FIT_HOST_ROW = "Host"
 _FIT_PARAMS_TIMEOUT_S = 600.0
 # The score is set by a shell that then execs the server (same PID): preexec_fn is not thread-safe.
 _OOM_WRAPPER = 'echo {score} > /proc/self/oom_score_adj && exec "$0" "$@"'
@@ -463,7 +467,8 @@ class LocalServerManager:
             ubatch = llama_option(flags, self.extra_env, UBATCH_FLAGS, UBATCH_ENV)
             draft = llama_option(flags, self.extra_env, DRAFT_MODEL_FLAGS, DRAFT_MODEL_ENV)
             kinds = ",".join(llama_values(flags, self.extra_env, (SPEC_TYPE_FLAG,), SPEC_TYPE_ENV))
-        total = await self._fit_gib(self.spec.model_path, ubatch)
+        shares = _gpu_shares_host_ram()  # read once for every file projected
+        total = await self._fit_gib(self.spec.model_path, ubatch, shares=shares)
         if draft is not None and SpecType.DRAFT_MTP in (kinds or "").split(","):
             try:
                 total += (await asyncio.to_thread(Path(draft).stat)).st_size / _GIB
@@ -471,40 +476,62 @@ class LocalServerManager:
                 msg = f"the draft file cannot be read ({exc}); not loading a model it has not projected"
                 raise ServerStartError(msg) from exc
         elif draft is not None:
-            total += await self._fit_gib(Path(draft), ubatch)
+            total += await self._fit_gib(Path(draft), ubatch, shares=shares)
         return total
 
-    async def _fit_gib(self, model_path: Path, ubatch: str | None) -> float:
-        """One ``llama-fit-params`` projection of ``model_path`` at this server's context, in GiB."""
+    async def _fit_gib(self, model_path: Path, ubatch: str | None, *, shares: bool) -> float:
+        """One ``llama-fit-params`` projection of ``model_path`` at this server's layout, in GiB.
+
+        It counts the memory the server draws from: on a GPU that shares the host's RAM every line, GPU and
+        host (llama.cpp places part of a model on the host: 28 of Flash-Next's 89 GiB, 2026-11-08, which a
+        GPU-only figure missed); on a GPU with its own memory the GPU lines; without the GPU the host line.
+        """
         fit = self.guards.fit_params_binary or Path(self.binary).with_name("llama-fit-params")
         cmd = [
             str(fit),
-            "-m",
-            str(model_path),
-            "-c",
-            str(self.params.n_ctx),
-            "-np",
-            str(self.params.n_parallel),
+            *("-m", str(model_path), "-ngl", ngl_value(self.params)),
+            *("-c", str(self.params.n_ctx), "-np", str(self.params.n_parallel)),
             *([UBATCH_FLAGS[0], ubatch] if ubatch is not None else []),
-            "-lv",
-            "4",
+            *("--fit-print", "on"),
         ]
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=_FIT_PARAMS_TIMEOUT_S)
         except (OSError, TimeoutError) as exc:
             msg = f"llama-fit-params could not run ({exc}); not loading a model it has not projected"
             raise ServerStartError(msg) from exc
-        match = _PROJECTION_RE.search(out.decode(errors="replace"))
-        if match is None:
+        rows = {
+            name: int(model) + int(context) + int(compute)
+            for name, model, context, compute in _FIT_ROW_RE.findall(out.decode(errors="replace"))
+        }
+        if proc.returncode != 0 or _FIT_HOST_ROW not in rows:
             msg = (
                 f"llama-fit-params printed no projection for {model_path.name} "
                 f"(exit {proc.returncode}); not loading a model it has not projected"
             )
             raise ServerStartError(msg)
-        return int(match.group(1)) / _MIB_PER_GIB
+        host = rows.pop(_FIT_HOST_ROW)
+        if shares:  # the GPU's memory is the host's RAM
+            mib = host + sum(rows.values())
+        elif self.params.n_gpu_layers != 0:
+            mib = sum(rows.values())
+        else:
+            mib = host
+        return mib / _MIB_PER_GIB
+
+    def _measured_peak_gib(self) -> float | None:
+        """The peak memory the answer's tune measured, when it ran this server's layout; else None (D22).
+
+        The figure is the model as it runs, which llama.cpp's projection can miss (CUDA's own buffers, the
+        prompt cache); it can only raise the need, so a peak from an older build is still a safe floor.
+        """
+        record = self.settings.record if self.settings is not None else None
+        peak = record.peak if record is not None else None
+        params = self.params
+        here = LlamaLayout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+        return peak.gib if peak is not None and peak.layout == here else None
 
     def _check_fits(self, projection: float, free: float | None, reserve: float) -> None:
         """Refuse to load when the projection plus the host reserve exceeds available memory."""
@@ -514,7 +541,7 @@ class LocalServerManager:
             raise ServerStartError(msg)
         if need > free:
             msg = (
-                f"{self.spec.model_path.name} needs {need:.1f} GiB (llama.cpp's projection plus a "
+                f"{self.spec.model_path.name} needs {need:.1f} GiB (its projected or measured memory plus a "
                 f"{reserve:g} GiB host reserve) but {free:.1f} GiB is available; not loading it"
             )
             raise NotEnoughMemoryError(msg)
@@ -552,6 +579,13 @@ class LocalServerManager:
         problem = "available memory cannot be read"
         try:
             projection = await self._projected_gib()
+            peak = self._measured_peak_gib()
+            if peak is not None and peak > projection:
+                log.info(
+                    "memory need: %.1f GiB, the peak its tune measured (llama.cpp projects %.1f GiB)",
+                    peak, projection,
+                )  # fmt: skip
+                projection = peak
         except ServerStartError as exc:
             if reserve is not None:
                 raise

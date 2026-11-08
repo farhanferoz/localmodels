@@ -21,6 +21,7 @@ import re
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Self
 
@@ -43,6 +44,7 @@ from localmodels.serving.tune import (
 from localmodels.stack import (
     UNKNOWN,
     Engine,
+    LlamaLayout,
     LoadOptions,
     RetunePolicy,
     ServerStamp,
@@ -151,6 +153,16 @@ class ModelIdentity(BaseModel):
         return hashlib.sha256(text.encode()).hexdigest()[:_KEY_CHARS]
 
 
+class Step(StrEnum):
+    """What a llama.cpp tune measurement in a record's ``llama_measurements`` is."""
+
+    BENCH = "bench"
+    KL = "teacher-forced"
+    SERVER = "server"
+    NOT_MEASURED = "not-measured"
+    LAYOUT = "layout"
+
+
 class SettingsRecord(BaseModel):
     """The stored result of one tune on one machine (schema 1). Unknown fields are ignored."""
 
@@ -201,6 +213,13 @@ class TuneRecipe(BaseModel):
     text: Path | None = None  # llama.cpp: a text for the teacher-forced check
 
 
+class MeasuredPeak(BaseModel):
+    """The most memory a llama.cpp tune saw the chosen settings' server hold, and the layout it ran at."""
+
+    gib: float
+    layout: LlamaLayout  # its context, slot count and pool; no flags
+
+
 class RecordRef(BaseModel):
     """Where an answer's record is and how it was made."""
 
@@ -213,6 +232,7 @@ class RecordRef(BaseModel):
     build: str | None
     recipe_project: str | None
     changed_from: str | None = None  # the previous choice's name when a re-tune changed it
+    peak: MeasuredPeak | None = None  # the chosen server's measured memory, from a llama.cpp tune
 
 
 class RuleRef(BaseModel):
@@ -899,6 +919,31 @@ def _decide_tune(
     return outcome.note
 
 
+def _measured_peak(record: SettingsRecord) -> MeasuredPeak | None:
+    """The chosen candidate's peak memory over its runs in a llama.cpp tune; None when none was measured.
+
+    Read from the record's untyped steps (``llama_tune``'s "layout" and "server" entries; a restart is named
+    ``<candidate>#restart``), so a record of another shape gives None rather than an error.
+    """
+    steps = record.llama_measurements
+    layout = next((m for m in steps if m.get("step") == Step.LAYOUT), None)
+    names = {record.candidate, f"{record.candidate}#restart"}
+    peaks = [
+        m["peak_gib"]
+        for m in steps
+        if m.get("step") == Step.SERVER
+        and m.get("name") in names
+        and isinstance(m.get("peak_gib"), (int, float))
+    ]
+    if layout is None or not peaks:
+        return None
+    try:
+        fields = {k: layout.get(k) for k in ("n_ctx", "n_parallel", "kv_unified")}
+        return MeasuredPeak(gib=max(peaks), layout=LlamaLayout(**fields))
+    except ValidationError:
+        return None
+
+
 def _from_record(
     answer: SettingsAnswer,
     record: SettingsRecord,
@@ -917,6 +962,7 @@ def _from_record(
         build=record.build,
         recipe_project=record.recipe_project,
         changed_from=record.previous,
+        peak=_measured_peak(record),
     )
     build, libraries = compared
     answer.stale = _stale_lines(record, fingerprint(), build, libraries)

@@ -42,7 +42,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import IntEnum, StrEnum
+from enum import IntEnum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
@@ -76,6 +76,7 @@ from localmodels.settings import (
     ModelIdentity,
     SettingsAnswer,
     SettingsRecord,
+    Step,
     adopt,
     read_store,
     record_path,
@@ -157,16 +158,6 @@ DEFAULT_HEADROOM_GIB: Final = 4.0  # as service_b's tune uses (commands/tune.py:
 
 class LlamaTuneError(LocalModelsError):
     """The tune cannot give a result: the reference could not be measured."""
-
-
-class Step(StrEnum):
-    """What a measurement in the record is."""
-
-    BENCH = "bench"
-    KL = "teacher-forced"
-    SERVER = "server"
-    NOT_MEASURED = "not-measured"
-    LAYOUT = "layout"
 
 
 class Priority(IntEnum):
@@ -566,6 +557,8 @@ class LlamaTune:
         self.measurements: list[BaseModel] = []
         self.arms: list[ArmResult] = []  # the first run of each arm; a restart is only kept in the record
         self.bench: dict[int, BenchRow] = {}
+        self.bench_refused = False  # llama-bench's memory screen refused it: the -ub steps measure nothing
+        self.guard_kill: str | None = None  # why a server's memory guard killed it; the tune then stops
         self.kl: dict[int, KlResult] = {}
         self.ub_star: int | None = None  # the larger -ub that passed, once one has
         self.start_s = 0.0  # the reference's start (t0), measured once
@@ -729,11 +722,13 @@ class LlamaTune:
         try:
             await self._measure_reference()
             for step in self._plan():
+                self._stop_after_a_guard_kill()
                 cost = step.cost()  # 0: nothing to do now, and not worth a line in the record
                 if cost and not fits_budget(self.elapsed(), cost, self.spec.soft_limit_s):
                     self._skip(step.name, OUT_OF_BUDGET)
                     continue
                 await step.run()
+            self._stop_after_a_guard_kill()
             chosen = await self._decide()
         except (asyncio.CancelledError, LlamaTuneError) as exc:
             self.write_partial("stopped by a signal" if isinstance(exc, asyncio.CancelledError) else str(exc))
@@ -761,6 +756,19 @@ class LlamaTune:
         }
         (self.spec.run_dir / "record.json").write_text(json.dumps(partial, indent=2), encoding="utf-8")
 
+    def _stop_after_a_guard_kill(self) -> None:
+        """End the tune once a memory guard killed a server: the next load would meet memory still held.
+
+        On 2026-11-07 (slurm 2187) the step after such a kill started llama-bench on the same model; the
+        machine ran out of memory, the process could not be killed in the GPU driver and the host rebooted.
+
+        Raises:
+            LlamaTuneError: a server was killed by its memory guard.
+        """
+        if self.guard_kill is not None:
+            msg = f"a server's memory guard killed it ({self.guard_kill}); the tune loads nothing more"
+            raise LlamaTuneError(msg)
+
     def _wants_candidates(self) -> bool:
         """Whether any candidate may be measured, so that the reference is worth timing twice (design 5.5)."""
         spec = self.spec
@@ -786,6 +794,15 @@ class LlamaTune:
         reference.eligible = True
         self.stop_s = reference.stop_s or 0.0
         if not self._wants_candidates():
+            return
+        if reference.fits is False:
+            assert reference.peak_gib is not None  # noqa: S101 - narrowing for mypy: a verdict needs a peak
+            assert reference.free_gib is not None  # noqa: S101 - and the memory available before it
+            self._skip(
+                "reference restart",
+                f"not tried: the reference's peak of {reference.peak_gib:.1f} GiB left less than the "
+                f"{self.margin_gib:g} GiB kept free of {reference.free_gib:.1f} GiB available",
+            )
             return
         if not fits_budget(self.elapsed(), self._arm_cost(), self.spec.soft_limit_s):
             self._skip("reference restart", OUT_OF_BUDGET)
@@ -867,8 +884,8 @@ class LlamaTune:
 
     async def _ub_step(self, ubatch: int) -> None:
         name = f"-ub {ubatch}"
-        if not self.bench:
-            await self._run_bench()
+        if not await self._bench_once():
+            return
         row, base = self.bench.get(ubatch), self.bench.get(UB_REFERENCE)
         if row is None or base is None:
             self._skip(name, "not measured: llama-bench gave no prompt-reading row for it")
@@ -892,6 +909,21 @@ class LlamaTune:
         if result.agreement is not None and result.agreement.passed:
             self.ub_star = ubatch
 
+    async def _bench_once(self) -> bool:
+        """Run llama-bench the first time a -ub step needs it; False when its memory screen refused it.
+
+        llama-bench loads the model at every -ub it times, the largest last, and has no memory guard: on
+        2026-11-07 (slurm 2187) it loaded a model that did not fit and could not be killed (D22).
+        """
+        if self.bench_refused:
+            return False
+        if not self.bench:
+            if not await self._fits_screen(max(UB_CANDIDATES), name="llama-bench"):
+                self.bench_refused = True
+                return False
+            await self._run_bench()
+        return True
+
     async def _run_bench(self) -> None:
         """One ``llama-bench`` run for every -ub (it reloads the model only when its parameters change)."""
         bench_bin = self.spec.server_bin.with_name("llama-bench")
@@ -909,13 +941,14 @@ class LlamaTune:
         self.bench = bench_rows(result.raw_rows, self.spec.prompt_tokens)
         self.measurements.extend(self.bench.values())
 
-    async def _fits_screen(self, ubatch: int) -> bool:
+    async def _fits_screen(self, ubatch: int, name: str | None = None) -> bool:
         """Whether a server at this ``-ub`` leaves the margin free: it keeps what cannot fit from starting.
 
         The reference's measured peak, the figure for this model as it runs, plus what ``llama-fit-params``
         projects this ``-ub`` to add over the default; the projection alone without a measured reference.
+        ``name`` is the step a refusal is recorded under (``-ub <ubatch>`` by default).
         """
-        name = f"-ub {ubatch}"
+        name = name or f"-ub {ubatch}"
         free = self._free_gib()
         if free is None:
             self._skip(name, "not measured: memory not measured (available memory cannot be read)")
@@ -1095,6 +1128,9 @@ class LlamaTune:
                 stopping = self._clock()
                 await manager.stop()
                 arm.stop_s = self._clock() - stopping
+                if manager.killed_reason is not None:
+                    self.guard_kill = manager.killed_reason
+                    arm.error = f"killed by its memory guard: {manager.killed_reason}"
         if peaks:
             arm.peak_gib = max(peaks) / MIB_PER_GIB
         arm.fits = fit_verdict(arm.peak_gib, arm.free_gib, self.margin_gib)

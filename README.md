@@ -70,8 +70,11 @@ different accelerator; only a model server's own process imports PyTorch.
   argv, and starts/stops/supervises one server instance per `LocalServerManager`. `Contention`
   lets a caller choose to refuse when another project holds the GPU, or wait for it.
   `MemoryGuards` (all off unless passed) adds a kill floor on available memory, a host reserve checked
-  against `llama-fit-params`' projection before the load and the memory left after it, and the server's
-  `oom_score_adj`.
+  against the model's memory need before the load and the memory left after it, and the server's
+  `oom_score_adj`. The need is `llama-fit-params --fit-print on`'s projection of the memory the server draws
+  from (on a GPU that shares the host's RAM its GPU and host parts together; on a GPU with its own memory the
+  GPU part; without GPU layers the host part), or, when the settings answer's record holds the peak its
+  tune measured at the same context, slot count and pool, that peak if larger (D22).
 - Layouts by role (opt-in): `derive_serving_params(device, total_mem_gb, role=ServingRole.INTERACTIVE)` (or `BULK`)
   lays `llama-server` out as one shared pool (`-kvu`) with 4 (interactive) or 16 (bulk) slots and a fixed context
   (`n_ctx_cap`, default 32,768), never derived from free memory (`localmodels rules show K1`, `K2`). Without a role
@@ -191,7 +194,7 @@ adds `-ub` and the speculative-decoding flags, each as a group the caller's own 
 `overridden`), checks memory at that `-ub` and with the draft model, and restarts a running server whose arguments differ instead of adopting it
 (unless another project's lease holds that port). The command line the server runs is `build_args(..., manager.effective_flags)` (the caller's `extra_flags` and the answer's flags) and then the prompt-cache cap below, not `manager.extra_flags`.
 On a GPU that shares the host's RAM (a DGX Spark's, found by `available_memory`), `LocalServerManager` also passes `--cache-ram` = available memory
-minus `llama-fit-params`' projection minus the larger of the guards' `host_reserve_gib` and `kill_below_gib`, between 0 and llama.cpp's own
+minus the model's memory need (above) minus the larger of the guards' `host_reserve_gib` and `kill_below_gib`, between 0 and llama.cpp's own
 8,192 MiB (0 when the projection cannot be made and no host reserve is set; the start is refused when one is); a GPU with its own memory, a server
 without GPU layers, and a caller's own `--cache-ram` or `LLAMA_ARG_CACHE_RAM` keep llama.cpp's default or the caller's value (D20). The cap is logged,
 stamped in `layout.extra_flags` (for an adopted server too), and is no part of a running server's identity: a server whose cap differs is adopted, not restarted.

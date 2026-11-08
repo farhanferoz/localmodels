@@ -6,6 +6,7 @@ import asyncio
 import os
 import stat
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,7 +18,8 @@ from localmodels.launcher import LocalServerManager, MemoryGuards, ServerStartEr
 from localmodels.lease import GpuLease
 from localmodels.pinned import PinnedFile
 from localmodels.process import ServerSpec, build_args
-from localmodels.stack import Engine, Settings, SpecType
+from localmodels.settings import MeasuredPeak, RecordRef
+from localmodels.stack import Engine, LlamaLayout, Settings, SpecType
 from tests.test_launcher import _answer, _cpu_params, _gpu_params, _make_fake_server
 
 if TYPE_CHECKING:
@@ -26,12 +28,12 @@ if TYPE_CHECKING:
     from localmodels.params import ServingParams
 
 PORT = 8187
-PROJECTED_GIB = 20  # what the fake llama-fit-params prints (20480 MiB)
+PROJECTED_GIB = 20  # what the fake llama-fit-params prints (20480 MiB, on the GPU)
 
 
-def _fit_params(bin_path: Path, output: str = "projected to use 20480 MiB of device memory") -> None:
+def _fit_params(bin_path: Path, output: str = "CUDA0 20000 400 80\nHost 0 0 0") -> None:
     script = bin_path.with_name("llama-fit-params")
-    script.write_text(f"#!/bin/sh\necho '{output}'\n")
+    script.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
 
 
@@ -96,6 +98,58 @@ async def test_load_refused_when_projection_plus_reserve_exceeds_available(tmp_p
         with pytest.raises(ServerStartError, match=r"needs 32\.0 GiB .* 31\.0 GiB is available"):
             await manager.start()
         assert not (tmp_path / "pids" / f"{PORT}.pid").exists()
+
+
+@pytest.mark.parametrize(
+    ("shares", "cpu", "counted"),
+    [
+        pytest.param(True, False, 30, id="shared-memory-gpu-counts-gpu-and-host"),
+        pytest.param(False, False, 20, id="gpu-with-own-memory-counts-the-gpu"),
+        pytest.param(False, True, 10, id="no-gpu-counts-the-host"),
+    ],
+)
+async def test_the_projection_counts_the_memory_the_server_draws_from(
+    tmp_path: Path,
+    calls: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    shares: bool,
+    cpu: bool,
+    counted: int,
+) -> None:
+    # llama.cpp put Flash-Next 62 GiB on the GPU and 28 GiB on the host; the GPU line alone let it start
+    monkeypatch.setattr(launcher, "_gpu_shares_host_ram", lambda: shares)
+    async with httpx.AsyncClient() as http:
+        manager = _manager(
+            tmp_path, http, MemoryGuards(host_reserve_gib=12), _steady(counted + 11),
+            params=_cpu_params() if cpu else None,
+        )  # fmt: skip
+        _fit_params(Path(manager.binary), "CUDA0 20000 400 80\nHost 10000 200 40")
+        with pytest.raises(ServerStartError, match=rf"needs {counted + 12}\.0 GiB"):
+            await manager.start()
+        assert calls[0][3:5] == ["-ngl", "0" if cpu else "99"]
+
+
+async def test_a_peak_its_tune_measured_at_the_same_layout_raises_the_need(tmp_path: Path) -> None:
+    def tuned(n_ctx: int) -> Any:
+        answer = _answer(spec=SpecType.NONE)
+        answer.record = RecordRef(
+            path="r.json", measured_at=datetime.now(UTC), hardware="h", candidate="reference", quality="",
+            stack=None, build=None, recipe_project=None,
+            peak=MeasuredPeak(gib=PROJECTED_GIB + 9, layout=LlamaLayout(n_ctx=n_ctx, n_parallel=1)),
+        )  # fmt: skip
+        return answer
+
+    guards = MemoryGuards(host_reserve_gib=12)
+    async with httpx.AsyncClient() as http:
+        same = _manager(tmp_path, http, guards, _steady(PROJECTED_GIB + 20), settings=tuned(8192))
+        with pytest.raises(
+            ServerStartError, match=r"needs 41\.0 GiB"
+        ):  # the 29 GiB peak, not the 20 projected
+            await same.start()
+        # another context: the peak is not this server's, so the projection decides and it starts
+        other = _manager(tmp_path, http, guards, _steady(PROJECTED_GIB + 20), health=1, settings=tuned(4096))
+        await other.start()
+        await other.stop()
 
 
 async def test_load_refused_when_there_is_no_projection(tmp_path: Path) -> None:
@@ -175,7 +229,7 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         await plain.start()
         await plain.stop()
         fit, server = calls
-        assert fit[1:] == ["-m", model, "-c", "8192", "-np", "1", "-lv", "4"]
+        assert fit[1:] == ["-m", model, "-ngl", "99", "-c", "8192", "-np", "1", "--fit-print", "on"]
         assert server == build_args(plain.binary, plain.spec, plain.params)
         assert plain.stamp().settings is None
 
@@ -197,7 +251,7 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         await asked.stop()
         added = ("-ub", "2048", "--spec-type", "draft-mtp", "--spec-draft-model", str(draft))
         fit, server = calls
-        assert (fit[2], fit[-4:]) == (model, ["-ub", "2048", "-lv", "4"])
+        assert (fit[2], fit[-4:]) == (model, ["-ub", "2048", "--fit-print", "on"])
         assert server == build_args(asked.binary, asked.spec, asked.params, added)
         stamped = asked.stamp()
         assert stamped.layout is not None
@@ -215,7 +269,7 @@ async def test_a_settings_answer_reaches_the_server_flags_the_fit_check_and_the_
         await kept.start()
         await kept.stop()
         assert len(calls) == 2
-        assert calls[0][-4:] == ["-ub", "256", "-lv", "4"]
+        assert calls[0][-4:] == ["-ub", "256", "--fit-print", "on"]
         assert calls[1] == build_args(kept.binary, kept.spec, kept.params, theirs)
         stamped = kept.stamp()
         assert stamped.settings is not None
@@ -265,7 +319,7 @@ async def test_a_draft_model_is_projected_on_its_own_and_an_mtp_head_counts_as_i
         await alone.start()
         await alone.stop()
         assert [c[2] for c in calls[:2]] == [model, str(draft)]
-        assert all(c[-4:] == ["-ub", "2048", "-lv", "4"] for c in calls[:2])
+        assert all(c[-4:] == ["-ub", "2048", "--fit-print", "on"] for c in calls[:2])
 
 
 async def test_a_stamp_says_what_the_answer_gave_and_what_the_callers_flags_or_the_served_file_set_aside(
