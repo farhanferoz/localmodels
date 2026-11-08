@@ -13,10 +13,12 @@ from localmodels.cli import main
 from localmodels.engines import (
     SOURCES,
     GateVerdict,
+    Pin,
     Publisher,
     Response,
     VersionRecord,
     VersionSource,
+    keep_list,
     list_tags,
     matching_tags,
     newest_untried,
@@ -212,7 +214,12 @@ def pulled(tag: str) -> bool | None:
     return None if record is None else record.pulled
 
 
-def test_prune_removes_only_what_the_keep_list_does_not_name(capsys: pytest.CaptureFixture[str]) -> None:
+def test_prune_removes_only_what_the_keep_list_does_not_name(
+    state: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    study = state / "study" / "pin.json"
+    write_text_atomically(study, "{}")
+    pins = [Pin("1.1.0", study)]
     folder = versions_dir(Engine.TRTLLM)
     for tag in ("1.3.0", "1.4.0rc3", "1.4.0", "1.2.0", "1.1.0", "1.0.0"):
         make(Engine.TRTLLM, tag)
@@ -228,16 +235,16 @@ def test_prune_removes_only_what_the_keep_list_does_not_name(capsys: pytest.Capt
         busy = "1.0.0" in command[2]
         return subprocess.CompletedProcess(command, 1 if busy else 0, "", "daemon is busy" if busy else "")
 
-    dry = prune(Engine.TRTLLM, pins=["1.1.0"], dry_run=True, runner=docker)
+    dry = prune(Engine.TRTLLM, pins=pins, dry_run=True, runner=docker)
     assert run == []
     assert dry.kept == {
-        "1.1.0": ["pinned"],
+        "1.1.0": [f"pinned by {study}"],
         "1.2.0": ["used by long"],
         "1.4.0rc3": ["current", "used by follower", "used by study"],
     }  # 1.4.0 is not named by "1.4.0rc3"; previous 1.3.0 is its record and digest only
     assert sorted(item.split()[0] for item in dry.removed) == ["1.0.0", "1.3.0", "1.4.0"]
 
-    report = prune(Engine.TRTLLM, pins=["1.1.0"], runner=docker)
+    report = prune(Engine.TRTLLM, pins=pins, runner=docker)
     assert sorted(item.split()[0] for item in report.removed) == ["1.3.0", "1.4.0"]
     assert [c[:2] for c in run] == [["docker", "rmi"]] * 3
     assert len(report.failed) == 1
@@ -254,9 +261,14 @@ def test_prune_removes_only_what_the_keep_list_does_not_name(capsys: pytest.Capt
     }  # records stay: they are the tried list
 
     gone = subprocess.CompletedProcess([], 1, "", "Error response from daemon: No such image: x")
-    again = prune(Engine.TRTLLM, pins=["1.1.0"], runner=lambda _c: gone)
+    again = prune(Engine.TRTLLM, pins=pins, runner=lambda _c: gone)
     assert [item.split()[0] for item in again.removed] == ["1.0.0"]  # already gone counts as removed
     assert pulled("1.0.0") is False
+
+    study.unlink()  # the study's pin file is gone: its pin no longer keeps 1.1.0, and prune may remove it
+    assert "1.1.0" not in keep_list(Engine.TRTLLM, pins)
+    after = prune(Engine.TRTLLM, pins=pins, dry_run=True, runner=docker)
+    assert [item.split()[0] for item in after.removed] == ["1.1.0"]  # 1.0.0 is already off disk
 
     assert main(["engines", "prune", "--dry-run"]) == 0
     assert "kept trtllm 1.4.0rc3: current, used by follower, used by study" in capsys.readouterr().out

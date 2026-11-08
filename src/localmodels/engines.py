@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
     from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 RECORD_FILE: Final = "record.json"
 VERSIONS_DIRNAME: Final = "versions"
@@ -409,18 +412,38 @@ def switch(engine: Engine, tag: str, *, override: str = "") -> str | None:
     )
 
 
-def keep_list(engine: Engine, pins: Collection[str] = ()) -> dict[str, list[str]]:
+class Pin(NamedTuple):
+    """A study's pin of one engine version: the version and the pin file that holds the pin."""
+
+    version: str
+    file: Path
+
+
+def keep_list(engine: Engine, pins: Collection[Pin] = ()) -> dict[str, list[str]]:
     """The tags whose image stays on disk, each with why: ``current``, a pin or a ``users.toml`` name.
 
-    ``previous`` is not here: it is kept as its record and digest only.
+    A pin keeps its version only while its pin file exists (checked now; a dropped pin is logged).
+    ``previous``
+    is not here: it is kept as its record and digest only.
     """
     folder = versions_dir(engine)
     current, users = link_target(folder), read_users_in(folder)
+    pinned: dict[str, list[str]] = {}
+    for pin in pins:
+        if pin.file.exists():
+            pinned.setdefault(pin.version, []).append(f"pinned by {pin.file}")
+        else:
+            log.info(
+                "%s %s: pin file %s is gone, the pin no longer keeps the version",
+                engine,
+                pin.version,
+                pin.file,
+            )
     kept: dict[str, list[str]] = {}
     for version in version_folders(folder):
         why = [
             *([CURRENT] if version.name == current else []),
-            *(["pinned"] if version.name in pins else []),
+            *pinned.get(version.name, []),
             *(f"used by {project}" for project in named_by(version.name, current, users, by_prefix=False)),
         ]
         if why:
@@ -455,7 +478,7 @@ class PruneReport:
 
 
 def prune(
-    engine: Engine, *, pins: Collection[str] = (), dry_run: bool = False, runner: Runner = docker_runner
+    engine: Engine, *, pins: Collection[Pin] = (), dry_run: bool = False, runner: Runner = docker_runner
 ) -> PruneReport:
     """Remove the images of every version that is not ``current``, pinned or named in ``users.toml``.
 
@@ -464,7 +487,7 @@ def prune(
     """
     kept = keep_list(engine, pins)
     report = PruneReport(removed=[], kept=kept, failed=[])
-    for folder in unreferenced(versions_dir(engine), keep=pins, by_prefix=False, keep_previous=False):
+    for folder in unreferenced(versions_dir(engine), keep=kept, by_prefix=False, keep_previous=False):
         record = read_model(folder / RECORD_FILE, VersionRecord)
         if record is None or not record.pulled or not record.image:
             continue
