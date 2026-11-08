@@ -53,8 +53,10 @@ from .stack import Engine
 
 if TYPE_CHECKING:
     import argparse
+    import email.message
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
     from pathlib import Path
+    from typing import IO
 
 log = logging.getLogger(__name__)
 
@@ -76,9 +78,9 @@ DOCKER_TIMEOUT_SECONDS: Final = 600.0
 RUNNER_NOT_FOUND: Final = 127
 RUNNER_TIMEOUT: Final = 124
 
-_IMAGE: Final = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+_IMAGE: Final = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 #: A tag is a folder name: no separator, no leading dot.
-_TAG: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_TAG: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _CHALLENGE_PARAM: Final = re.compile(r'(\w+)="([^"]*)"')
 _LINK_NEXT: Final = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?', re.IGNORECASE)
 
@@ -126,7 +128,7 @@ class VersionRecord(BaseModel):
     @field_validator("image")
     @classmethod
     def _digest_form(cls, image: str) -> str:
-        if image and not _IMAGE.match(image):
+        if image and not _IMAGE.fullmatch(image):
             msg = f"image must be repo@sha256:<64 hex digits>, got {image!r}"
             raise ValueError(msg)
         return image
@@ -134,7 +136,7 @@ class VersionRecord(BaseModel):
     @field_validator("tag")
     @classmethod
     def _folder_name(cls, tag: str) -> str:
-        if not _TAG.match(tag):
+        if not _TAG.fullmatch(tag):
             msg = f"tag {tag!r} is not a plain folder name"
             raise ValueError(msg)
         return tag
@@ -160,33 +162,34 @@ class VersionSource:
 #: Checked 2026-11-08 (docs/research/engine-registry-search-2026-11-08.md). SGLang is exactly ``-cu130``: not
 #: ``-runtime``, ``-efa`` or another variant; its ``.postN`` hotfix releases count, after their base
 #: release, and its release candidates do not. TensorRT-LLM release candidates sort before their release.
+#: One version core for every tag form (matched whole, ``fullmatch``): ASCII digits, at most nine each.
+_NUM: Final = "[0-9]{1,9}"
+_VERSION: Final = rf"(?P<major>{_NUM})\.(?P<minor>{_NUM})\.(?P<patch>{_NUM})"
+
+
 SOURCES: Final = (
     VersionSource(
-        Engine.VLLM,
-        DOCKER_HUB,
-        "vllm/vllm-openai",
-        re.compile(r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$"),
-        Publisher.OFFICIAL,
+        Engine.VLLM, DOCKER_HUB, "vllm/vllm-openai", re.compile(rf"v{_VERSION}"), Publisher.OFFICIAL
     ),
     VersionSource(
         Engine.VLLM,
         "ghcr.io",
         "timothystewart6/vllm-gb10",
-        re.compile(r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)-gb10\.(?P<build>\d+)$"),
+        re.compile(rf"v{_VERSION}-gb10\.(?P<build>{_NUM})"),
         Publisher.COMMUNITY,
     ),
     VersionSource(
         Engine.SGLANG,
         DOCKER_HUB,
         "lmsysorg/sglang",
-        re.compile(r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:\.post(?P<post>\d+))?-cu130$"),
+        re.compile(rf"v{_VERSION}(?:\.post(?P<post>{_NUM}))?-cu130"),
         Publisher.OFFICIAL,
     ),
     VersionSource(
         Engine.TRTLLM,
         "nvcr.io",
         "nvidia/tensorrt-llm/release",
-        re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:rc(?P<rc>\d+))?$"),
+        re.compile(rf"{_VERSION}(?:rc(?P<rc>{_NUM}))?"),
         Publisher.OFFICIAL,
     ),
 )
@@ -204,7 +207,7 @@ def sources_for(engine: Engine) -> list[VersionSource]:
 
 def tag_key(source: VersionSource, tag: str) -> tuple[int, ...] | None:
     """The sort key of ``tag`` (numbers, not text: rc3 < rc13 < release); None if it is not the form."""
-    match = source.tag_pattern.match(tag)
+    match = source.tag_pattern.fullmatch(tag) if isinstance(tag, str) else None
     if match is None:
         return None
     groups = match.groupdict()
@@ -254,6 +257,25 @@ class TagListing:
     reason: str | None = None
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib would carry the registry token to the new address, whatever its host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,  # noqa: ARG002 - urllib's signature
+        headers: email.message.Message,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        """Raise instead of building the next request."""
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} refused", headers, fp)
+
+
+_OPENER: Final = urllib.request.build_opener(NoRedirect)
+
+
 def urllib_fetch(url: str, headers: Mapping[str, str], timeout: float) -> Response:
     """One GET over https with the standard library; an HTTP error status is an answer, not an exception."""
     if urllib.parse.urlsplit(url).scheme != "https":
@@ -261,7 +283,7 @@ def urllib_fetch(url: str, headers: Mapping[str, str], timeout: float) -> Respon
         raise ValueError(msg)
     request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310 - https checked above
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as reply:  # noqa: S310 - same request
+        with _OPENER.open(request, timeout=timeout) as reply:
             return Response(reply.status, _lower(reply.headers.items()), reply.read(MAX_BODY_BYTES + 1))
     except urllib.error.HTTPError as err:
         return Response(err.code, _lower(err.headers.items()), err.read(MAX_BODY_BYTES + 1))
@@ -316,7 +338,7 @@ def list_tags(
             if reply.status != HTTP_OK or len(reply.body) > MAX_BODY_BYTES:
                 msg = f"{url}: HTTP {reply.status}, {len(reply.body)} bytes"
                 raise _ListingError(msg)  # noqa: TRY301
-            seen.update(json.loads(reply.body).get("tags") or [])
+            seen.update(tag for tag in json.loads(reply.body).get("tags") or [] if isinstance(tag, str))
             link = _LINK_NEXT.search(reply.headers.get("link", ""))
             if link is None:
                 return TagListing(tags=tuple(sorted(seen)))
@@ -326,7 +348,7 @@ def list_tags(
                 raise _ListingError(msg)  # noqa: TRY301
         msg = f"more than {MAX_PAGES} pages"
         raise _ListingError(msg)  # noqa: TRY301
-    except (OSError, ValueError, AttributeError, http.client.HTTPException, _ListingError) as exc:
+    except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException, _ListingError) as exc:
         return TagListing(reason=f"{host}/{source.repository}: {type(exc).__name__}: {exc}")
 
 
@@ -352,7 +374,7 @@ def record_path(engine: Engine, tag: str) -> Path:
 
 def read_record(engine: Engine, tag: str) -> VersionRecord | None:
     """The record of ``tag``; None when it is missing or unreadable."""
-    if not _TAG.match(tag):
+    if not _TAG.fullmatch(tag):
         return None
     return read_model(record_path(engine, tag), VersionRecord)
 
@@ -406,7 +428,7 @@ def switch(engine: Engine, tag: str, *, override: str = "") -> str | None:
         return f"{path} is missing or not a version record"
     return switch_version(
         versions_dir(engine) / tag,
-        unfinished=None,
+        unfinished=None if record.image else f"{path} names no image digest: there is nothing to run",
         refused="; ".join(switch_refusals(record, path)) or None,
         measured=record.gate is not GateVerdict.NOT_RUN,
         override=override,
@@ -498,7 +520,8 @@ def prune(
             continue
         done = runner(["docker", "rmi", record.image])
         if done.returncode == 0 or NO_SUCH_IMAGE in done.stderr:
-            write_record(record.model_copy(update={"pulled": False}))
+            latest = read_model(folder / RECORD_FILE, VersionRecord) or record  # a job may have added results
+            write_record(latest.model_copy(update={"pulled": False}))
             report.removed.append(label)
         else:
             report.failed.append(f"{label}: {done.stderr.strip() or f'exit {done.returncode}'}")

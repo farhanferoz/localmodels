@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,6 +15,7 @@ from localmodels.cli import main
 from localmodels.engines import (
     SOURCES,
     GateVerdict,
+    NoRedirect,
     Pin,
     Publisher,
     Response,
@@ -115,6 +118,8 @@ def test_tag_order_forms_and_the_newest_never_tried() -> None:
     assert newest_untried(trt, tags, tried={"1.3.0rc13"}) == "1.4.0"
     assert newest_untried(trt, tags, tried={"1.4.0"}) is None  # the newest failed: wait for a newer tag
     assert newest_untried(trt, ["latest"], tried=set()) is None
+    odd = ["1.4.0\n", "1." + "9" * 5000 + ".0", "\u0661.4.0"]  # newline, a huge number, a non-ASCII digit
+    assert matching_tags(trt, odd) == []
     assert [s.publisher for s in sources_for(Engine.VLLM)] == [Publisher.OFFICIAL, Publisher.COMMUNITY]
     assert sglang.reference == "lmsysorg/sglang"
     assert community.reference == "ghcr.io/timothystewart6/vllm-gb10"
@@ -169,6 +174,16 @@ def test_tag_listing_returns_the_reason_instead_of_raising() -> None:
     def refused(url: str, headers: Mapping[str, str], timeout: float) -> Response:
         return Response(401, {}, b"")
 
+    def odd_tags(url: str, headers: Mapping[str, str], timeout: float) -> Response:
+        return Response(200, {}, json.dumps({"tags": [1, {"a": 1}, "1.4.0"]}).encode())
+
+    assert list_tags(SOURCES[0], fetch=odd_tags).tags == ("1.4.0",)  # non-strings are skipped, never raised
+    redirected = urllib.request.Request(
+        "https://registry-1.docker.io/v2/x", headers={"Authorization": "Bearer t"}
+    )
+    with pytest.raises(urllib.error.HTTPError):  # a redirect is refused: the token never follows it elsewhere
+        NoRedirect().redirect_request(redirected, None, 307, "moved", {}, "https://elsewhere.example/x")
+
     for fetch, words in ((down, "timed out"), (garbage, "JSONDecodeError"), (refused, "no usable token")):
         listing = list_tags(SOURCES[0], fetch=fetch)
         assert listing.tags == ()
@@ -210,6 +225,16 @@ def test_switch_refuses_an_unpassed_or_community_version_unless_overridden() -> 
     assert switch(Engine.VLLM, "v0.33.0-gb10.0", override="owner: use the machine build") is None
     assert (folder / "current").readlink().name == "v0.33.0-gb10.0"
     assert switch(Engine.PYTORCH, "x") is not None  # not a container engine
+    assert switch(Engine.VLLM, "current") is not None  # a link name is not a version
+    assert switch(Engine.VLLM, "previous") is not None
+    assert (folder / "previous").readlink().name == "v0.32.0"
+    imageless = VersionRecord(
+        engine=Engine.VLLM, tag="v0.34.0", publisher=Publisher.OFFICIAL, gate=GateVerdict.FAILED
+    )
+    write_record(imageless)
+    assert (
+        switch(Engine.VLLM, "v0.34.0", override="owner: go") is not None
+    )  # nothing to run: no override helps
 
 
 def pulled(tag: str) -> bool | None:

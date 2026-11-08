@@ -310,6 +310,8 @@ def switch_version(
     refused: it is written to ``override.json`` in the version folder. It never stands in for a comparison
     that was not made (``measured`` false). The version ``current`` left becomes ``previous``.
     """
+    if version.name in (CURRENT, PREVIOUS) or version.is_symlink():
+        return f"{version.name} is a link, not a version: name the version itself"
     if unfinished is not None:
         return unfinished
     if refused is not None:

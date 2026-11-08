@@ -87,6 +87,9 @@ def test_switch_is_refused_until_a_comparison_passed(
     comparison.with_name("kept.json").rename(comparison)
     assert main(base) == 0
     assert (tmp_path / "builds" / "current").readlink().name == "abc1234"
+    for link in ("current", "previous"):  # a link name is not a version: no self-loop, no lost rollback
+        assert switch(tmp_path, link) is not None
+    assert (tmp_path / "builds" / "current").readlink().name == "abc1234"
 
     make_build(tmp_path, "def5678")  # the owner switches although the comparison failed: recorded, not hidden
     failed = tmp_path / "builds" / "def5678" / "comparison.json"
