@@ -2,7 +2,8 @@
 
 No language model is involved: every source is checked with a fixed local check (``gh api``, PyPI JSON, plain
 HTTP requests, host files) and filtered by paths and keywords, so a run is reproducible from ``.raw``.
-Sources: strand B's table D1-D13 (``research-2026-10-18/b-community/report.md`` section 3.2), and D14, a
+Sources: strand B's table D1-D13 (``research-2026-10-18/b-community/report.md`` section 3.2), D15 (new
+llama-cpp-python releases, D24), and D14, a
 local one (no network): the newest ``localmodels refresh`` run.
 
 Output, in the output directory: ``<date>.md`` (the note), ``.raw/<date>.json`` (every finding and failure)
@@ -68,7 +69,10 @@ SPARK_DOCS = (
     "https://docs.nvidia.com/dgx/dgx-spark/known-issues.html",
 )
 NGC_VLLM_NOTES = "https://docs.nvidia.com/deeplearning/frameworks/vllm-release-notes/index.html"
-PYPI_TORCH = "https://pypi.org/pypi/torch/json"
+PYPI_JSON = "https://pypi.org/pypi/{package}/json"
+PYPI_TORCH = PYPI_JSON.format(package="torch")
+#: Its GitHub releases are one tag per hardware variant (-vulkan, -metal, ...); PyPI names the one version.
+PYPI_LLAMA_CPP_PYTHON = PYPI_JSON.format(package="llama-cpp-python")
 TORCH_ARCH_FILE = ".ci/manywheel/build_env_setup.py"
 AARCH64_ARCHS = re.compile(r'"aarch64"\s*:\s*\{([^}]*)\}')
 SM121 = "121"
@@ -108,7 +112,7 @@ TAGS = re.compile(r"<[^>]+>|\s+")
 
 
 class Source(StrEnum):
-    """The digest's sources: D1-D13 look outside, D14 is this host's own refresh run."""
+    """The digest's sources: D1-D13 and D15 look outside, D14 is this host's own refresh run."""
 
     D1 = "D1"
     D2 = "D2"
@@ -124,6 +128,7 @@ class Source(StrEnum):
     D12 = "D12"
     D13 = "D13"
     D14 = "D14"
+    D15 = "D15"
 
 
 ALL_KINDS = tuple(WorkloadKind)
@@ -309,9 +314,14 @@ def check_llama_discussions(ctx: Context) -> list[Finding]:
     return found
 
 
+def _pypi_version(ctx: Context, url: str) -> str:
+    """The newest release PyPI lists at ``url`` (a package's JSON page)."""
+    return str(json.loads(ctx.net.get(url))["info"]["version"])
+
+
 def check_pytorch(ctx: Context) -> list[Finding]:
     """D4: a new PyTorch minor, 121 in the aarch64 arch set, and new GB10 issues."""
-    version = json.loads(ctx.net.get(PYPI_TORCH))["info"]["version"]
+    version = _pypi_version(ctx, PYPI_TORCH)
     minor = ".".join(version.split(".")[:2])
     found = []
     if ctx.changed("minor", minor):
@@ -332,6 +342,15 @@ def check_pytorch(ctx: Context) -> list[Finding]:
     for issue in ctx.net.gh_json(f"search/issues?q={query}")["items"]:
         found.append(Finding(f"issue: {issue['title']}", issue["html_url"]))  # noqa: PERF401
     return found
+
+
+def check_llama_cpp_python(ctx: Context) -> list[Finding]:
+    """D15: a new llama-cpp-python release; projects upgrade it themselves (D24), then re-tune (D2)."""
+    version = _pypi_version(ctx, PYPI_LLAMA_CPP_PYTHON)
+    if not ctx.changed("version", version):
+        return []
+    text = f"release {version}: a project that upgrades it gets its models re-tuned (D2, D24)"
+    return [Finding(text, PYPI_LLAMA_CPP_PYTHON)]
 
 
 def check_libraries(ctx: Context) -> list[Finding]:
@@ -459,6 +478,7 @@ SOURCES: dict[Source, SourceSpec] = {
     Source.D12: SourceSpec("model releases", MODEL_KINDS, check_models),
     Source.D13: SourceSpec("this host", ALL_KINDS, check_host),
     Source.D14: SourceSpec("llama.cpp refresh", LLAMA_KINDS, check_refresh, local=True),
+    Source.D15: SourceSpec("llama-cpp-python", LLAMA_KINDS, check_llama_cpp_python),
 }
 
 

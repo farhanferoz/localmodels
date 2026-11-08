@@ -106,7 +106,8 @@ def test_failed_source_is_listed_and_does_not_stop_the_run(tmp_path: Path) -> No
 
 def test_note_lines_follow_the_format_the_rules_command_parses(tmp_path: Path) -> None:
     net = FixtureNet(forum=True, llama=True)
-    state = {"last_run": SINCE}
+    net.pages[digest.PYPI_LLAMA_CPP_PYTHON] = json.dumps({"info": {"version": "0.3.36"}})
+    state = {"last_run": SINCE, Source.D15: {"version": "0.3.35"}}  # a release since the last run
     (tmp_path / ".state.json").write_text(json.dumps(state))
     digest.run_digest(net, tmp_path, NOW)
     lines = [ln for ln in (tmp_path / "2026-11-01.md").read_text().splitlines() if ln.startswith("- [")]
@@ -116,3 +117,6 @@ def test_note_lines_follow_the_format_the_rules_command_parses(tmp_path: Path) -
     by_source = {m.group("source"): m.group("kinds") for m in parsed if m}
     assert by_source[Source.D1] == "K1,K2,K3"
     assert by_source[Source.D8] == "K1,K2"
+    assert by_source[Source.D15] == "K1,K2,K3"
+    again = Context(net, SINCE, {"version": "0.3.36"})
+    assert digest.check_llama_cpp_python(again) == []  # the same release is reported once
