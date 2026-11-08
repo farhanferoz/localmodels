@@ -310,54 +310,6 @@ def _build_settings_parser(subparsers: argparse._SubParsersAction[argparse.Argum
     check_p.set_defaults(fn=cmd_settings_check)
 
 
-def cmd_engines_measure(args: argparse.Namespace) -> int:
-    """`engines measure`: the harness against a running server."""
-    from .engine_bench import cmd_measure  # noqa: PLC0415 - engine_bench is imported only when it is used
-
-    return cmd_measure(args)
-
-
-def cmd_engines_prompts_install(args: argparse.Namespace) -> int:
-    """`engines prompts install`: the pinned measuring inputs into the state directory."""
-    from .engine_bench import cmd_prompts_install  # noqa: PLC0415 - as above
-
-    return cmd_prompts_install(args)
-
-
-def _build_engines_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    engines_p = subparsers.add_parser("engines", help="serving engines: the measuring harness")
-    commands = engines_p.add_subparsers(dest="engines_command", required=True)
-    measure_p = commands.add_parser("measure", help="run the measuring phases against a running server")
-    measure_p.add_argument("--url", required=True, help="the server, e.g. http://127.0.0.1:18101")
-    measure_p.add_argument(
-        "--engine", required=True, help="llama.cpp, vllm, sglang, ... (picks the scoring path)"
-    )
-    measure_p.add_argument("--out", required=True, help="where to write the record (JSON)")
-    measure_p.add_argument("--model", default="auto", help="served model id, or auto to read /v1/models")
-    measure_p.add_argument(
-        "--extra-json", default="", help="extra request fields, e.g. '{\"cache_prompt\": false}'"
-    )
-    measure_p.add_argument(
-        "--stamp", action="append", default=[], metavar="KEY=VALUE", help="a stamp field (repeat)"
-    )
-    measure_p.add_argument(
-        "--startup-s", type=float, default=None, help="start until ready, measured by the caller"
-    )
-    measure_p.add_argument(
-        "--phases", default="", help="comma list: warm,prefill,decode,conc,judge,quality,..."
-    )
-    measure_p.add_argument("--tokenizer", default=None, help="tokenizer for llama-benchy")
-    measure_p.add_argument("--tiny", action="store_true", help="tiny sizes, for testing against a stub")
-    measure_p.set_defaults(fn=cmd_engines_measure)
-    prompts_p = commands.add_parser("prompts", help="the pinned measuring inputs")
-    prompts_commands = prompts_p.add_subparsers(dest="prompts_command", required=True)
-    install_p = prompts_commands.add_parser(
-        "install", help="copy D16's inputs into the state directory, by hash"
-    )
-    install_p.add_argument("--dir", default=None, help="target folder (default: <state dir>/engines/prompts)")
-    install_p.set_defaults(fn=cmd_engines_prompts_install)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Build the `localmodels` argparse parser: `setup`, `serve`, `lease ...`, `rules ...`, `settings ...`."""
     parser = argparse.ArgumentParser(prog="localmodels")
@@ -371,7 +323,6 @@ def build_parser() -> argparse.ArgumentParser:
     register_engines(subparsers)
     register_refresh(subparsers)
     _build_settings_parser(subparsers)
-    _build_engines_parser(subparsers)
     return parser
 
 

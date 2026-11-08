@@ -579,9 +579,25 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return status
 
 
+def cmd_measure(args: argparse.Namespace) -> int:
+    """`engines measure`: the measuring harness against a running server (``engine_bench``, loaded on use)."""
+    from .engine_bench import cmd_measure as run  # noqa: PLC0415 - the harness is loaded only when used
+
+    return run(args)
+
+
+def cmd_prompts_install(args: argparse.Namespace) -> int:
+    """`engines prompts install`: the pinned measuring inputs into the state directory."""
+    from .engine_bench import cmd_prompts_install as run  # noqa: PLC0415 - as above
+
+    return run(args)
+
+
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Add ``engines list|switch|prune`` to the ``localmodels`` command."""
-    engines = subparsers.add_parser("engines", help="container engine versions (vLLM, SGLang, TensorRT-LLM)")
+    """Add ``engines list|switch|prune|measure|prompts install`` to the ``localmodels`` command."""
+    engines = subparsers.add_parser(
+        "engines", help="serving engines: container engine versions and the measuring harness"
+    )
     commands = engines.add_subparsers(dest="engines_command", required=True)
 
     commands.add_parser("list", help="the versions, their gate verdicts and `current`").set_defaults(
@@ -604,3 +620,33 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     prune_p.add_argument("--dry-run", action="store_true", help="list what would be removed")
     prune_p.set_defaults(fn=cmd_prune)
+
+    measure_p = commands.add_parser("measure", help="run the measuring phases against a running server")
+    measure_p.add_argument("--url", required=True, help="the server, e.g. http://127.0.0.1:18101")
+    measure_p.add_argument(
+        "--engine", required=True, help="llama.cpp, vllm, sglang, ... (picks the scoring path)"
+    )
+    measure_p.add_argument("--out", required=True, help="where to write the record (JSON)")
+    measure_p.add_argument("--model", default="auto", help="served model id, or auto to read /v1/models")
+    measure_p.add_argument(
+        "--extra-json", default="", help="extra request fields, e.g. '{\"cache_prompt\": false}'"
+    )
+    measure_p.add_argument(
+        "--stamp", action="append", default=[], metavar="KEY=VALUE", help="a stamp field (repeat)"
+    )
+    measure_p.add_argument(
+        "--startup-s", type=float, default=None, help="start until ready, measured by the caller"
+    )
+    measure_p.add_argument(
+        "--phases", default="", help="comma list: warm,prefill,decode,conc,judge,quality,..."
+    )
+    measure_p.add_argument("--tokenizer", default=None, help="tokenizer for llama-benchy")
+    measure_p.add_argument("--tiny", action="store_true", help="tiny sizes, for testing against a stub")
+    measure_p.set_defaults(fn=cmd_measure)
+    prompts_p = commands.add_parser("prompts", help="the pinned measuring inputs")
+    prompts_commands = prompts_p.add_subparsers(dest="prompts_command", required=True)
+    install_p = prompts_commands.add_parser(
+        "install", help="copy D16's inputs into the state directory, by hash"
+    )
+    install_p.add_argument("--dir", default=None, help="target folder (default: <state dir>/engines/prompts)")
+    install_p.set_defaults(fn=cmd_prompts_install)
