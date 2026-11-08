@@ -60,6 +60,10 @@ class Engine(StrEnum):
         "llama-cpp-python"  # carries its own llama.cpp: a llama-server record never applies to it
     )
     PYTORCH = "pytorch"
+    #: The container engines start through sparkrun inside localmodels' own wrapper (``engines.py``).
+    VLLM = "vllm"
+    SGLANG = "sglang"
+    TRTLLM = "trtllm"
 
 
 class SpecType(StrEnum):

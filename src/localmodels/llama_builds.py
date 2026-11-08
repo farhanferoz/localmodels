@@ -203,20 +203,30 @@ def cmd_build(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def read_users(home: Path) -> dict[str, str]:
-    """``[projects]`` of ``users.toml``: project -> commit or ``current``; empty when there is no file."""
-    path = builds_dir(home) / USERS_FILE
+def read_users_in(folder: Path) -> dict[str, str]:
+    """``[projects]`` of ``folder/users.toml``: project -> version or ``current``; empty without a file."""
+    path = folder / USERS_FILE
     if not path.is_file():
         return {}
     with path.open("rb") as handle:
         projects = tomllib.load(handle).get("projects", {})
-    return {str(name): str(commit) for name, commit in projects.items()}
+    return {str(name): str(version) for name, version in projects.items()}
+
+
+def read_users(home: Path) -> dict[str, str]:
+    """``[projects]`` of the builds' ``users.toml``: project -> commit or ``current``; {} without a file."""
+    return read_users_in(builds_dir(home))
+
+
+def link_target(folder: Path, link_name: str = CURRENT) -> str | None:
+    """The version ``folder/link_name`` points to; None when there is no link."""
+    link = folder / link_name
+    return link.resolve().name if link.is_symlink() else None
 
 
 def current_commit(home: Path, link_name: str = CURRENT) -> str | None:
     """The build the ``current`` link (or ``link_name``) points to; None when there is no link."""
-    link = builds_dir(home) / link_name
-    return link.resolve().name if link.is_symlink() else None
+    return link_target(builds_dir(home), link_name)
 
 
 def _point(folder: Path, link_name: str, target: str) -> None:
@@ -227,12 +237,16 @@ def _point(folder: Path, link_name: str, target: str) -> None:
     staging.replace(folder / link_name)
 
 
-def build_folders(home: Path) -> list[Path]:
-    """The per-commit build folders (not the ``current`` link), sorted by name."""
-    folder = builds_dir(home)
+def version_folders(folder: Path) -> list[Path]:
+    """The per-version folders of ``folder`` (not the ``current`` and ``previous`` links), sorted by name."""
     if not folder.is_dir():
         return []
     return sorted(p for p in folder.iterdir() if p.is_dir() and not p.is_symlink())
+
+
+def build_folders(home: Path) -> list[Path]:
+    """The per-commit build folders (not the ``current`` link), sorted by name."""
+    return version_folders(builds_dir(home))
 
 
 def folder_for(home: Path, commit: str) -> Path | None:
@@ -240,12 +254,19 @@ def folder_for(home: Path, commit: str) -> Path | None:
     return next((folder for folder in build_folders(home) if commit.startswith(folder.name)), None)
 
 
-def named_by(commit: str, current: str | None, users: Mapping[str, str]) -> list[str]:
-    """The projects that name ``commit`` (a longer hash of it counts) or follow ``current`` while it is."""
+def named_by(
+    version: str, current: str | None, users: Mapping[str, str], *, by_prefix: bool = True
+) -> list[str]:
+    """The projects that name ``version`` or follow ``current`` while it is.
+
+    A commit is named by a longer hash of it (``by_prefix``); a tag only by itself, since ``1.4.0`` is a
+    prefix of ``1.4.0rc3``.
+    """
     return sorted(
         project
         for project, named in users.items()
-        if named.startswith(commit) or (named == FOLLOWS_CURRENT and commit == current)
+        if (named.startswith(version) if by_prefix else named == version)
+        or (named == FOLLOWS_CURRENT and version == current)
     )
 
 
@@ -279,6 +300,34 @@ def comparison_passed(build: Path) -> str | None:
     return None if passed else f"{path} does not record passed: true"
 
 
+def switch_version(
+    version: Path, *, unfinished: str | None, refused: str | None, measured: bool, override: str = ""
+) -> str | None:
+    """Move ``current`` beside ``version`` to it; None, or why it was not moved.
+
+    ``unfinished`` is why the version cannot be run at all (nothing overrides it); ``refused`` is why its
+    comparison does not allow the switch. ``override`` is the owner's decision to switch although it was
+    refused: it is written to ``override.json`` in the version folder. It never stands in for a comparison
+    that was not made (``measured`` false). The version ``current`` left becomes ``previous``.
+    """
+    if unfinished is not None:
+        return unfinished
+    if refused is not None:
+        if not override or not measured:
+            return refused
+        record = {
+            "override": override,
+            "at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "refused": refused,
+        }
+        write_text_atomically(version / OVERRIDE_FILE, json.dumps(record, indent=2) + "\n")
+    before = link_target(version.parent)
+    if before is not None and before != version.name:
+        _point(version.parent, PREVIOUS, before)
+    _point(version.parent, CURRENT, version.name)
+    return None
+
+
 def switch(home: Path, commit: str, *, override: str = "") -> str | None:
     """Move ``current`` to a finished build whose comparison passed; None, or why it was not moved.
 
@@ -287,23 +336,13 @@ def switch(home: Path, commit: str, *, override: str = "") -> str | None:
     that was not made. The build ``current`` left becomes ``previous``.
     """
     build = builds_dir(home) / commit
-    if not server_binary(build).is_file():
-        return f"{build} is not a finished build"
-    problem = comparison_passed(build)
-    if problem is not None:
-        if not override or not (build / COMPARISON_FILE).is_file():
-            return problem
-        record = {
-            "override": override,
-            "at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "refused": problem,
-        }
-        write_text_atomically(build / OVERRIDE_FILE, json.dumps(record, indent=2) + "\n")
-    before = current_commit(home)
-    if before is not None and before != build.name:
-        _point(build.parent, PREVIOUS, before)
-    _point(build.parent, CURRENT, build.name)
-    return None
+    return switch_version(
+        build,
+        unfinished=None if server_binary(build).is_file() else f"{build} is not a finished build",
+        refused=comparison_passed(build),
+        measured=(build / COMPARISON_FILE).is_file(),
+        override=override,
+    )
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
@@ -316,18 +355,28 @@ def cmd_switch(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def unreferenced(
+    folder: Path, *, keep: Collection[str] = (), by_prefix: bool = True, keep_previous: bool = True
+) -> list[Path]:
+    """The version folders that are not ``current``, ``previous``, in ``keep`` or named by a user.
+
+    ``keep_previous`` false leaves ``previous`` to the caller (a container engine keeps its record only).
+    """
+    current, users = link_target(folder), read_users_in(folder)
+    kept = {current, *keep, *([link_target(folder, PREVIOUS)] if keep_previous else [])}
+    return [
+        version
+        for version in version_folders(folder)
+        if version.name not in kept and not named_by(version.name, current, users, by_prefix=by_prefix)
+    ]
+
+
 def prune_builds(home: Path, *, keep: Collection[str] = (), dry_run: bool = False) -> list[Path]:
     """The build folders that are not ``current``, ``previous``, in ``keep`` or named by a project: deleted.
 
     With ``dry_run`` they are only listed.
     """
-    current, users = current_commit(home), read_users(home)
-    kept = {current, current_commit(home, PREVIOUS), *keep}
-    doomed = [
-        folder
-        for folder in build_folders(home)
-        if folder.name not in kept and not named_by(folder.name, current, users)
-    ]
+    doomed = unreferenced(builds_dir(home), keep=keep)
     if not dry_run:
         for folder in doomed:
             shutil.rmtree(folder)
