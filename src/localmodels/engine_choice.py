@@ -21,12 +21,14 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .engines import Approval, VersionRecord, approvals_for, read_record, versions_dir
+from .engines import Approval, VersionRecord, read_approvals, read_record, versions_dir
 from .enums import WorkloadKind
 from .llama_builds import current_commit, link_target, llama_home
 from .stack import Engine
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from .settings import ModelIdentity, PinEntry
 
 #: The figures are measured at 1 and 16 requests in flight and nothing between: below 16, llama.cpp
@@ -131,47 +133,55 @@ class _Verdict:
         return f"{self.approval.engine.value} {self.approval.file_pin}: {verdict}: {self.why}"
 
 
-def _reading_seconds(figures: dict[str, float | None]) -> float | None:
-    """Tokens per second of reading the prompt, from the largest prompt size measured; None when none.
+class _Rates(NamedTuple):
+    """Tokens per second: writing at 16 requests at once, and reading the prompt."""
+
+    write_tps: float
+    read_tps: float
+
+
+def _rates(figures: dict[str, float | None]) -> _Rates | None:
+    """The two rates the job time needs; None when either is missing or zero (it would divide by zero).
 
     Prompt reading is measured on one request at a time (nothing is measured for it at 16 in flight), so
-    this is the single-request figure, used for both sides alike.
+    it is the single-request figure of the largest prompt size measured, used for both sides alike.
     """
     sizes = {int(m[1]): name for name in figures if (m := READ_FIGURE.fullmatch(name))}
-    value = figures.get(sizes[max(sizes)]) if sizes else None
-    return value or None
+    read = figures.get(sizes[max(sizes)]) if sizes else None
+    write = figures.get(WRITE_FIGURE)
+    return _Rates(write, read) if write and read else None
 
 
-def _writing(figures: dict[str, float | None]) -> float | None:
-    value = figures.get(WRITE_FIGURE)
-    return value or None
-
-
-def _job_seconds(job: JobShape, write_tps: float, read_tps: float) -> float:
-    """The job's time at these rates: writing at 16 at once, reading the prompts one request's rate."""
-    return job.requests * job.output_tokens / write_tps + job.requests * job.prompt_tokens / read_tps
+def _job_seconds(job: JobShape, rates: _Rates) -> float:
+    """The job's time at these rates: writing at 16 at once, reading the prompts at one request's rate."""
+    writing = job.requests * job.output_tokens / rates.write_tps
+    return writing + job.requests * job.prompt_tokens / rates.read_tps
 
 
 class _Run(NamedTuple):
-    """The speed figures of one finished run and the seconds it took to start."""
+    """The speed of one finished run and the seconds it took to start."""
 
-    figures: dict[str, float | None]
+    rates: _Rates
     startup_s: float
 
 
-def _complete_run(record: VersionRecord, model: str) -> _Run | None:
-    """The newest result of ``model`` that finished every phase and holds the speed figures."""
+def _complete_run(record: VersionRecord, model: str, kinds: Collection[str]) -> _Run | None:
+    """The newest result of ``model`` of one of ``kinds`` that finished every phase and holds both rates.
+
+    ``kinds`` are the measurements of the version as it is served: a sparkrun comparison's rounds (another
+    sparkrun version) and a calibration's starts are not.
+    """
     for entry in reversed(record.results):
         figures, startup = entry.get("figures"), entry.get("startup_s")
+        rates = _rates(figures) if isinstance(figures, dict) else None
         if (
             entry.get("model") == model
+            and entry.get("kind") in kinds
             and entry.get("complete") is True
-            and isinstance(figures, dict)
-            and _writing(figures) is not None
-            and _reading_seconds(figures) is not None
+            and rates is not None
             and isinstance(startup, int | float)
         ):
-            return _Run(figures, float(startup))
+            return _Run(rates, float(startup))
     return None
 
 
@@ -185,21 +195,30 @@ def _judge(approval: Approval, job: JobShape, available: float | None) -> _Verdi
     record = read_record(engine, tag) if tag else None
     if record is None:
         return _Verdict(approval, ChoiceRule.NO_CURRENT, f"{engine.value} has no `current` version")
-    run = _complete_run(record, model)
+    served = (
+        engine_refresh.ResultKind.BOOTSTRAP,
+        engine_refresh.ResultKind.CANDIDATE,
+        engine_refresh.ResultKind.APPROVED,
+    )
+    run = _complete_run(record, model, served)
     if run is None:
         why = f"{engine.value} {record.tag} has no complete record of {model}"
         return _Verdict(approval, ChoiceRule.NO_COMPLETE_RECORD, why, record=record)
     gguf = Model(approval.gguf_repository, approval.gguf_revision, approval.gguf_file)
     commit = current_commit(llama_home())
     llama = engine_refresh.same_client_record(commit, gguf) if commit else None
-    if llama is None or llama.startup_s is None or _writing(llama.figures) is None:
-        why = f"llama.cpp has no same-client record of {gguf.filename} at its current build ({commit})"
+    llama_rates = _rates(llama.figures) if llama is not None else None
+    if llama is None or llama.startup_s is None or llama_rates is None:
+        why = (
+            f"llama.cpp has no same-client record of {gguf.filename} with writing and prompt-reading "
+            f"figures at its current build ({commit})"
+        )
         return _Verdict(approval, ChoiceRule.NO_SAME_CLIENT, why, record=record)
     if job.concurrency < MIN_CONCURRENCY:
         why = f"{job.concurrency} requests at once is under {MIN_CONCURRENCY}, the lowest measured"
         return _Verdict(approval, ChoiceRule.LOW_CONCURRENCY, why, record=record)
-    t_container = _job_seconds(job, _writing(run.figures) or 0.0, _reading_seconds(run.figures) or 0.0)
-    t_llama = _job_seconds(job, _writing(llama.figures) or 0.0, _reading_seconds(llama.figures) or 0.0)
+    t_container = _job_seconds(job, run.rates)
+    t_llama = _job_seconds(job, llama_rates)
     extra_start = max(0.0, run.startup_s - llama.startup_s)
     saving = t_llama - t_container
     numbers = {
@@ -245,16 +264,19 @@ def choose(
         return EngineChoice(engine=Engine.PYTORCH, rule=ChoiceRule.PYTORCH_KIND)
     if job is None:
         return EngineChoice(engine=Engine.LLAMA_CPP, rule=ChoiceRule.NO_JOB)
-    approvals = approvals_for(job.project, model.key)
+    found = read_approvals()
+    damaged = [f"the approvals store is damaged, so its unreadable entries count as none: {found.problem}"]
+    store = damaged if found.problem else []
+    approvals = [a for a in found.approvals if (a.project, a.model_key) == (job.project, model.key)]
     if not approvals:
         why = f"{job.project} has no approval for this model ({model.key})"
-        return EngineChoice(engine=Engine.LLAMA_CPP, rule=ChoiceRule.NO_APPROVAL, considered=[why])
+        return EngineChoice(engine=Engine.LLAMA_CPP, rule=ChoiceRule.NO_APPROVAL, considered=[why, *store])
     from .container_run import available_gib as hardware_gib  # noqa: PLC0415 - see the module docstring
 
     available = hardware_gib() if available_gib is None else available_gib
     verdicts = [_judge(a, job, available) for a in approvals]
     passing = [v for v in verdicts if v.rule is ChoiceRule.CHOSEN]
-    considered = [v.line for v in verdicts]
+    considered = [*(v.line for v in verdicts), *store]
     if not passing:
         first = verdicts[0]
         return EngineChoice(

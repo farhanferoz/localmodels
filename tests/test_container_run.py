@@ -507,7 +507,12 @@ def test_bulk_server_serves_the_container_and_falls_back_to_llama_cpp_when_it_is
     assert started.stamp["settings"]["engine_choice"]["rule"] == "chosen"
     assert FakeManager.made == []
 
-    for refusal in (ContainerStartError("its image is not on disk"), NotEnoughMemoryError("needs 105 GiB")):
+    refusals = (
+        ContainerStartError("its image is not on disk"),
+        NotEnoughMemoryError("needs 105 GiB"),
+        OSError("No space left on device"),  # preparing the start: still the fallback, not the job's end
+    )
+    for refusal in refusals:
         FakeRun.made, FakeManager.made, FakeRun.fail = [], [], refusal
         served = asyncio.run(serve())
         (manager,) = FakeManager.made
@@ -529,6 +534,9 @@ def test_bulk_server_serves_the_container_and_falls_back_to_llama_cpp_when_it_is
     pytorch_answer, _ = bulk_answer(Engine.PYTORCH, tmp_path)
     with pytest.raises(ValueError, match="not a server"):
         asyncio.run(_serve_answer(pytorch_answer, fallback))
+    named = answer.model_copy(update={"choice": None})  # a container engine named, not chosen: no version
+    with pytest.raises(ValueError, match="named, not chosen"):
+        asyncio.run(_serve_answer(named, fallback))
 
 
 async def _serve_answer(

@@ -728,17 +728,24 @@ async def bulk_server(answer: SettingsAnswer, *, fallback: LlamaFallback) -> Asy
     A container answer starts that engine's chosen version on the approved file (the run is entered on the
     calling thread, so its SIGTERM chain is installed when that is the main thread). When the start is
     refused or fails (``ContainerStartError``, ``NotEnoughMemoryError``) llama.cpp's bulk layout is started
-    instead and the stamp says why. A llama.cpp answer starts llama.cpp. Any other engine is no server:
+    instead and the stamp says why (an ``OSError`` while preparing it too). A llama.cpp answer starts
+    llama.cpp. Any other engine, or a container engine named rather than chosen (no version), is no server:
     ``ValueError``. No project writes its own fallback.
     """
     engine = answer.choice.engine if answer.choice else answer.engine
     reason = None
+    if engine in CONTAINER_ENGINES and answer.choice is None:
+        msg = (
+            f"{engine.value} was named, not chosen, so no version is known: "
+            "`lookup(..., engine=None, job=...)` chooses the version and file bulk_server starts"
+        )
+        raise ValueError(msg)
     if engine in CONTAINER_ENGINES:
         stack = contextlib.ExitStack()
         try:
             run, url = _container_run(answer, fallback)
             stack.enter_context(run)
-        except (ContainerStartError, NotEnoughMemoryError) as exc:
+        except (ServerStartError, OSError) as exc:  # ContainerStartError, NotEnoughMemoryError, or the disk
             reason = f"{engine.value} did not start, llama.cpp serves instead: {exc}"
             log.warning("%s", reason)
         else:

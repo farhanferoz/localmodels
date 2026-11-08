@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from localmodels.atomic import write_text_atomically
 from localmodels.engine_choice import EngineChoice  # noqa: TC001 - a pydantic field type
-from localmodels.engines import CONTAINER_ENGINES, register_pin
+from localmodels.engines import CONTAINER_ENGINES, pins_path, register_pin
 from localmodels.enums import DeviceType, Precision, WorkloadKind
 from localmodels.hardware import inspect_hardware
 from localmodels.pinned import _REVISION_RE, PinnedFile, snapshot_dir
@@ -621,9 +621,8 @@ def lookup(  # noqa: PLR0913 - the call signature of design 3.1
     choice = _choose_engine(model, kind, job, pin) if engine is None else None
     chosen = choice.engine if choice else engine
     assert chosen is not None  # noqa: S101 - engine is None only when a choice was made
-    engine = (
-        Engine.LLAMA_CPP if chosen in CONTAINER_ENGINES else chosen
-    )  # the settings of what runs on a fallback
+    # a chosen container engine gets llama.cpp's settings (what runs on a fallback); a named one is as before
+    engine = Engine.LLAMA_CPP if choice is not None and chosen in CONTAINER_ENGINES else chosen
     if model.unpinned:
         notes.append(f"{name} is identified by its path, size and modification time, not its content.")
     if engine is Engine.LLAMA_CPP and not model.files:
@@ -742,6 +741,8 @@ def _pin(answer: SettingsAnswer, pin: Path, notes: list[str], keep: int) -> None
         return
     answer.pinned = str(pin)
     if entry is None:  # this lookup made the entry
+        version = answer.choice.version if answer.choice else None
+        _keep_engine_pin(answer.engine, version, pin, name, notes)
         return
     now = _store_now(answer, entry)
     answer.pinned_vs_store = now or "the store agrees"
@@ -755,6 +756,18 @@ def _pin(answer: SettingsAnswer, pin: Path, notes: list[str], keep: int) -> None
     answer.record, answer.rule, answer.stale = None, None, []
     answer.tune, answer.tune_plan = TuneState.NOT_NEEDED, None
     answer.pin_entry = entry
+    _keep_engine_pin(entry.engine, entry.engine_version, pin, name, notes)
+
+
+def _keep_engine_pin(
+    engine: Engine | None, version: str | None, pin: Path, name: str, notes: list[str]
+) -> None:
+    """Register a container engine version the pin holds, on every use, so `engines prune` keeps it."""
+    if engine in CONTAINER_ENGINES and version and not register_pin(engine, version, pin):
+        notes.append(
+            f"{name}: {engine.value} {version} could not be registered in {pins_path(engine)}, so "
+            "`engines prune` may remove its image; the start then falls back to llama.cpp, stamped."
+        )
 
 
 def _pin_entry(pin: Path, answer: SettingsAnswer) -> tuple[PinEntry | None, str]:
@@ -776,9 +789,6 @@ def _pin_entry(pin: Path, answer: SettingsAnswer) -> tuple[PinEntry | None, str]
             return entry, "" if entry else found.problem
         text = json.dumps({"schema": SCHEMA_VERSION, "entries": [*found.items, item]}, indent=2)
         write_text_atomically(pin, text + "\n")
-    choice = answer.choice
-    if choice and choice.version and answer.engine in CONTAINER_ENGINES:
-        register_pin(answer.engine, choice.version, pin)  # the pinned version joins the engine's keep list
     return None, ""
 
 

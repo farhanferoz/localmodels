@@ -865,8 +865,9 @@ def stage(
 
     llama.cpp writes 100 tokens/s and reads 1,000 at 16 at once; the container writes ``write_tps`` and
     reads 3,000, so ``BULK_JOB`` takes 6,000 s on llama.cpp and 2,000 s (at 300) on the container, which
-    starts 150 s later. ``flaws`` breaks one piece: no_approval, no_current, incomplete, no_same_client,
-    no_memory (no recorded need).
+    starts 150 s later. A newer sparkrun-comparison round (slower, another sparkrun) must not count.
+    ``flaws`` breaks one piece: no_approval, no_current, incomplete, no_same_client, llama_no_read (no
+    prompt-reading figure on llama.cpp's side), no_memory (no recorded need).
     """
     llama_home = root / "llama"
     commit = "abc1234"
@@ -876,8 +877,9 @@ def stage(
         (llama_home / "builds" / "current").symlink_to(commit)
     gguf = Model(QWEN.repository, QWEN.revision, "q4.gguf")
     if not flaws.get("no_same_client"):
+        figures = {"write_tps_16_at_once": 100.0} if flaws.get("llama_no_read") else LLAMA_FIGURES
         run = EngineRun(
-            engine="llama.cpp", model="m", url="u", started="t", startup_s=50.0, figures=LLAMA_FIGURES
+            engine="llama.cpp", model="m", url="u", started="t", startup_s=50.0, figures=figures
         )  # fmt: skip
         write_model(same_client_path(commit, gguf), run)
     if not flaws.get("no_approval"):
@@ -900,6 +902,8 @@ def stage(
         "model": FILE_REPO, "kind": "approved", "complete": not flaws.get("incomplete"), "figures": figures,
         "startup_s": startup_s, "memory": {} if flaws.get("no_memory") else {"fall_gib": 30.0},
     }  # fmt: skip
+    slow = {"write_tps_16_at_once": 30.0, "read_tps_prefill_8192": 300.0}
+    sparkrun_round = {**result, "kind": "sparkrun", "figures": slow, "startup_s": 900.0}
     write_record(
         VersionRecord(
             engine=engine,
@@ -908,7 +912,7 @@ def stage(
             publisher=Publisher.OFFICIAL,
             gate=GateVerdict.PASSED,
             pulled=True,
-            results=[result],
+            results=[result, sparkrun_round],
         )
     )
     assert switch(engine, "v0.31.0") is None
@@ -942,6 +946,7 @@ def test_a_container_engine_is_chosen_only_when_every_rule_holds(
         "no current": ({"no_current": True}, BULK_JOB, 100.0, ChoiceRule.NO_CURRENT),
         "incomplete record": ({"incomplete": True}, BULK_JOB, 100.0, ChoiceRule.NO_COMPLETE_RECORD),
         "no same-client record": ({"no_same_client": True}, BULK_JOB, 100.0, ChoiceRule.NO_SAME_CLIENT),
+        "llama.cpp read no prompt": ({"llama_no_read": True}, BULK_JOB, 100.0, ChoiceRule.NO_SAME_CLIENT),
         "8 at once": ({}, eight, 100.0, ChoiceRule.LOW_CONCURRENCY),
         "saving too small": ({}, small, 100.0, ChoiceRule.SAVING_TOO_SMALL),
         "need over available": ({}, BULK_JOB, 39.0, ChoiceRule.MEMORY),
@@ -962,6 +967,14 @@ def test_a_container_engine_is_chosen_only_when_every_rule_holds(
         assert answer.version is None
         if rule is not ChoiceRule.NO_APPROVAL:
             assert answer.considered[0].startswith("vllm "), name
+    # a damaged approvals store is named, not taken for "no approval" in silence
+    damaged = tmp_path / "damaged" / "state"
+    monkeypatch.setenv(settings.STATE_DIR_ENV, str(damaged))
+    (damaged / "engines").mkdir(parents=True)
+    (damaged / "engines" / "approvals.json").write_text('{"schema": 1, "approvals": [{}]}', encoding="utf-8")
+    answer = choose(QWEN, WorkloadKind.K2, BULK_JOB, available_gib=100.0)
+    assert answer.rule is ChoiceRule.NO_APPROVAL
+    assert any("approvals store is damaged" in line for line in answer.considered)
     # K1 and K3 are llama.cpp, K4 is PyTorch, K2 without a job is llama.cpp, whatever the approvals say
     monkeypatch.setenv(settings.STATE_DIR_ENV, str(tmp_path / "ok" / "state"))
     monkeypatch.setenv("LOCALMODELS_LLAMA_HOME", str(tmp_path / "ok" / "llama"))
@@ -1034,6 +1047,18 @@ def test_lookup_chooses_the_engine_only_when_asked_and_a_pin_keeps_it(
         "vllm", "v0.31.0", f"{FILE_REPO}@{FILE_REVISION}",
     )  # fmt: skip
     assert [(p.version, p.file) for p in pins_for(Engine.VLLM)] == [("v0.31.0", pin.resolve())]
+    # the pin file out of sight once (an unmounted share): its registration is dropped, and the next
+    # pinned use registers it again
+    away = pin.with_suffix(".away")
+    pin.rename(away)
+    assert pins_for(Engine.VLLM) == []
+    away.rename(pin)
+    lookup(QWEN, WorkloadKind.K2, engine=None, job=BULK_JOB, retune=off, pin=pin)
+    assert [p.version for p in pins_for(Engine.VLLM) or []] == ["v0.31.0"]
+    # a container engine named, not chosen: resolved for itself as before, no llama.cpp settings, no choice
+    named = lookup(QWEN, WorkloadKind.K2, engine=Engine.VLLM, retune=off)
+    assert (named.engine, named.choice) == (Engine.VLLM, None)
+    assert named.settings != llama.settings
 
     # the world changes (the approval goes), and the chooser alone would now say llama.cpp; the pin does not
     (tmp_path / "state" / "engines" / "approvals.json").unlink()

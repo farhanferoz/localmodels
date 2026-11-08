@@ -2216,6 +2216,32 @@ def approved_recipe(approval: engines.Approval) -> dict[str, Any]:
     }
 
 
+def recipe_conflict(approval: engines.Approval) -> str | None:
+    """Why ``approval`` cannot run on its file's recipe; None when it can.
+
+    A recipe is kept per file repository and names one revision, which is what the engine measures and
+    serves, so an approval of another revision is refused rather than measured and stamped on the wrong
+    file. When no recipe file exists yet the refresh's own base recipe for that repository decides.
+    """
+    path = recipe_file(approval.engine, approval.file_repository)
+    try:
+        installed: Any = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        base = BASE_RECIPES[approval.engine]
+        installed = base if base["model"] == approval.file_repository else None
+    except (OSError, ValueError) as exc:
+        return f"the recipe {path} cannot be read: {exc!r}"
+    if installed is None:
+        return None
+    revision = installed.get("model_revision") if isinstance(installed, dict) else None
+    if revision == approval.file_revision:
+        return None
+    return (
+        f"{approval.engine.value} measures and serves {approval.file_repository} at revision {revision} "
+        f"(its recipe {path}, one per repository), not {approval.file_revision}: approve that revision"
+    )
+
+
 def approve_measurement(  # noqa: PLR0911 - one line per way the measurement has to wait
     approval: engines.Approval,
     *,

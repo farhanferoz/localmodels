@@ -346,32 +346,39 @@ def test_switch_names_the_pull_command_when_the_image_is_not_on_disk(
 
 def test_a_registered_pin_keeps_its_version_and_is_dropped_with_its_pin_file(state: Path) -> None:
     study = state / "study" / "pin.json"
+    register = state / "engines" / "vllm" / "pins.json"
     write_text_atomically(study, "{}")
-    for tag in ("v0.31.0", "v0.32.0", "v0.30.0"):
+    for tag in ("v0.31.0", "v0.32.0", "v0.30.0", "v0.29.0"):
         make(Engine.VLLM, tag)
     assert switch(Engine.VLLM, "v0.32.0") is None
     assert register_pin(Engine.VLLM, "v0.30.0", study)
-    assert pins_for(Engine.VLLM) == [Pin("v0.30.0", study)]
+    assert register_pin(Engine.VLLM, "v0.31.0", study)  # one study, two models, two versions: both kept
+    assert register_pin(Engine.VLLM, "v0.31.0", study)  # again: no duplicate
+    assert pins_for(Engine.VLLM) == [Pin("v0.30.0", study), Pin("v0.31.0", study)]
     assert keep_list(Engine.VLLM)["v0.30.0"] == [f"pinned by {study}"]  # no pins passed: the register is read
     removed = prune(Engine.VLLM, dry_run=True).removed
-    assert [item.split()[0] for item in removed] == ["v0.31.0"]  # the pinned v0.30.0 stays on disk
+    assert [item.split()[0] for item in removed] == ["v0.29.0"]  # the pinned v0.30.0 and v0.31.0 stay
     study.unlink()
     assert "v0.30.0" not in keep_list(Engine.VLLM)
-    assert pins_for(Engine.VLLM) == []
-    assert (
-        json.loads((state / "engines" / "vllm" / "pins.json").read_text()) == {}
-    )  # dropped, not only hidden
     assert sorted(item.split()[0] for item in prune(Engine.VLLM, dry_run=True).removed) == [
+        "v0.29.0",
         "v0.30.0",
         "v0.31.0",
     ]
-    (state / "engines" / "vllm" / "pins.json").write_text("{", encoding="utf-8")  # damaged: never overwritten
+    assert str(study) in json.loads(register.read_text())  # a dry run leaves the register as it is
+    assert pins_for(Engine.VLLM) == []
+    assert json.loads(register.read_text()) == {}  # dropped, not only hidden
+    register.write_text("{", encoding="utf-8")  # damaged: never overwritten, and nothing is removed
     assert not register_pin(Engine.VLLM, "v0.30.0", study)
-    assert (state / "engines" / "vllm" / "pins.json").read_text(encoding="utf-8") == "{"
+    assert register.read_text(encoding="utf-8") == "{"
+    report = prune(Engine.VLLM, runner=lambda _c: pytest.fail("prune removed an image"))
+    assert (report.removed, len(report.failed)) == ([], 1)
+    assert "cannot be read, so nothing was removed" in report.failed[0]
 
 
 GGUF_REVISION, FILE_REVISION = "c" * 40, "b" * 40
-FILE_REPO = "nvidia/Qwen3-30B-A3B-NVFP4"
+FILE_REPO = "org/Other-30B-A3B-NVFP4"  # not the refresh's measurement model, whose recipe is pinned
+MEASURED = "nvidia/Qwen3-30B-A3B-NVFP4"  # the refresh's measurement model
 
 
 def hub_cache(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -403,7 +410,9 @@ def test_approve_refuses_what_it_cannot_trust_and_stores_one_approval_per_projec
         (approve_args(gguf, evidence, file=f"{FILE_REPO}@abc"), "40-character"),
         (approve_args(gguf.replace(GGUF_REVISION, "main"), evidence), "40-character"),
         (approve_args(gguf, state / "missing.json"), "does not exist"),
-        (approve_args(gguf.replace("q4.gguf", "q8.gguf"), evidence), ""),  # the Hub cache holds no such file
+        (approve_args(gguf.replace("q4.gguf", "q8.gguf"), evidence), "hf download"),  # not in the Hub cache
+        # the refresh's measurement model at another revision: its recipe serves 2538ded2, not this
+        (approve_args(gguf, evidence, file=f"{MEASURED}@{FILE_REVISION}"), "approve that revision"),
     ]
     for argv, words in refusals:
         assert main(argv) == 1, argv
@@ -473,7 +482,7 @@ def test_an_approval_realizes_its_recipe_for_current_and_submits_the_measure_job
 
     lines = engine_refresh.approve_measurement(approval, sparkrun=lambda _v: sparkrun, docker=lambda _c: ok)
     (argv,) = submitted
-    assert "submitted measure job 4242 (vllm v0.31.0 on nvidia/Qwen3-30B-A3B-NVFP4)" in lines
+    assert f"submitted measure job 4242 (vllm v0.31.0 on {FILE_REPO})" in lines
     flat = " ".join(argv)
     assert "--class restart" in flat
     assert "--gpu" in flat

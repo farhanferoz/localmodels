@@ -458,7 +458,7 @@ def keep_list(engine: Engine, pins: Collection[Pin] | None = None) -> dict[str, 
     version without passing them. A pin keeps its version only while its pin file exists (checked now; a
     dropped pin is logged). ``previous`` is not here: it is kept as its record and digest only.
     """
-    pins = pins_for(engine) if pins is None else pins
+    pins = (pins_for(engine, tidy=False) or []) if pins is None else pins
     folder = versions_dir(engine)
     current, users = link_target(folder), read_users_in(folder)
     pinned: dict[str, list[str]] = {}
@@ -488,11 +488,14 @@ def keep_list(engine: Engine, pins: Collection[Pin] | None = None) -> dict[str, 
 
 
 def pins_path(engine: Engine) -> Path:
-    """``engines/<engine>/pins.json``: ``{"<pin file>": "<version>"}``, one line per registered pin."""
+    """``engines/<engine>/pins.json``: ``{"<pin file>": ["<version>", ...]}``, the versions each file pins.
+
+    A list, since one study's pin file can pin two models to different versions of one engine.
+    """
     return engines_dir() / engine.value / PINS_FILE
 
 
-def _pin_map(path: Path) -> dict[str, str] | None:
+def _pin_map(path: Path) -> dict[str, list[str]] | None:
     """The register as it is: {} when absent; None (logged) when unreadable, so it is never overwritten."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -501,44 +504,65 @@ def _pin_map(path: Path) -> dict[str, str] | None:
     except (OSError, ValueError) as exc:
         log.warning("%s cannot be read, so no pin is registered or kept by it: %r", path, exc)
         return None
-    if not isinstance(raw, dict) or not all(isinstance(v, str) for v in raw.values()):
-        log.warning("%s is not a map of pin file to version, so no pin is registered or kept by it", path)
+    if not isinstance(raw, dict) or not all(
+        isinstance(v, list) and all(isinstance(t, str) for t in v) for v in raw.values()
+    ):
+        log.warning("%s is not a map of pin file to versions, so no pin is registered or kept by it", path)
         return None
     return raw
 
 
+def _write_pins(path: Path, pins: Mapping[str, list[str]]) -> None:
+    write_text_atomically(path, json.dumps(dict(pins), indent=2) + "\n")
+
+
 def register_pin(engine: Engine, version: str, pin_file: Path) -> bool:
-    """Record that ``pin_file`` pins ``version`` of ``engine``; False when the register is unreadable."""
+    """Record that ``pin_file`` pins ``version`` of ``engine``; False (logged) when it could not be recorded.
+
+    Idempotent and cheap when already recorded (read without the lock first), so every pinned lookup calls
+    it: a registration dropped while the pin file was out of sight comes back with the next use.
+    """
     from .settings import _locked  # noqa: PLC0415 - the pin file's own lock, as settings.py takes it
 
     path = pins_path(engine)
-    with _locked(path):
-        pins = _pin_map(path)
-        if pins is None:
-            return False
-        write_text_atomically(path, json.dumps({**pins, str(pin_file): version}, indent=2) + "\n")
+    if version in (_pin_map(path) or {}).get(str(pin_file), []):
+        return True
+    try:
+        with _locked(path):
+            pins = _pin_map(path)
+            if pins is None:
+                return False
+            versions = {*pins.get(str(pin_file), []), version}  # a set: a race cannot write a duplicate
+            _write_pins(path, {**pins, str(pin_file): sorted(versions)})
+    except OSError as exc:
+        log.warning("%s: cannot register the pin of %s %s by %s: %r", path, engine, version, pin_file, exc)
+        return False
     return True
 
 
-def pins_for(engine: Engine) -> list[Pin]:
-    """The registered pins of ``engine`` whose pin file still exists; a pin whose file is gone is dropped."""
+def pins_for(engine: Engine, *, tidy: bool = True) -> list[Pin] | None:
+    """The registered pins of ``engine`` whose pin file still exists; None when the register is unreadable.
+
+    With ``tidy`` a pin whose file is gone is dropped from the register (logged); without it (a dry run)
+    it is only left out of the answer.
+    """
     from .settings import _locked  # noqa: PLC0415 - as above
 
     path = pins_path(engine)
-    if not _pin_map(path):
-        return []
-    with _locked(path):
-        pins = _pin_map(path)
-        if pins is None:
-            return []
-        gone = [file for file in pins if not Path(file).exists()]
-        for file in gone:
-            log.info("%s: pin file %s is gone, so its pin of %s is dropped", engine, file, pins[file])
-        if gone:
-            kept = {file: version for file, version in pins.items() if file not in gone}
-            write_text_atomically(path, json.dumps(kept, indent=2) + "\n")
-            pins = kept
-    return [Pin(version, Path(file)) for file, version in pins.items()]
+    pins = _pin_map(path)
+    if pins is None:
+        return None
+    gone = [file for file in pins if not Path(file).exists()]
+    if gone and tidy:
+        with _locked(path):
+            pins = _pin_map(path)
+            if pins is None:
+                return None
+            gone = [file for file in pins if not Path(file).exists()]
+            for file in gone:
+                log.info("%s: pin file %s is gone, so its pins of %s are dropped", engine, file, pins[file])
+            _write_pins(path, {file: versions for file, versions in pins.items() if file not in gone})
+    return [Pin(v, Path(file)) for file, versions in pins.items() if file not in gone for v in versions]
 
 
 # --- approvals: a project accepts an engine running a file for a model (design 6) ----------------
@@ -630,11 +654,6 @@ def read_approvals(path: Path | None = None) -> ApprovalFile:
     return ApprovalFile(found, items, f"{path}: {'; '.join(problems)}" if problems else "")
 
 
-def approvals_for(project: str, model_key: str) -> list[Approval]:
-    """The approvals of ``project`` for the llama.cpp model ``model_key``: one per container engine."""
-    return [a for a in read_approvals().approvals if (a.project, a.model_key) == (project, model_key)]
-
-
 def register_approval(approval: Approval) -> str | None:
     """Store ``approval``, replacing the one for the same project, model and engine; None, or why not."""
     from .settings import _locked  # noqa: PLC0415 - the pin file's own lock, as settings.py takes it
@@ -687,7 +706,13 @@ def make_approval(project: str, gguf: str, engine: str, file: str, evidence: str
             gguf_match["repository"], gguf_match["revision"], [gguf_match["file"]]
         )
     except ValueError as exc:
-        raise ApprovalError(str(exc)) from exc
+        msg = (
+            f"the Hub cache does not hold {gguf} (its blob names the model's key): download it first "
+            f"(`hf download {gguf_match['repository']} {gguf_match['file']} --revision "
+            f"{gguf_match['revision']}`, into the shared cache), then approve; the check said: "
+            f"{str(exc).splitlines()[0]}"
+        )
+        raise ApprovalError(msg) from exc
     return Approval(
         project=project,
         model_key=identity.key,
@@ -757,6 +782,11 @@ def prune(
     ``previous`` loses its image too (its record and digest stay). No record is deleted: the records say which
     tags were tried. ``docker rmi`` goes through ``runner``.
     """
+    if pins is None:
+        pins = pins_for(engine, tidy=not dry_run)
+        if pins is None:  # which versions studies pin is unknown: removing any image could break one
+            why = f"{pins_path(engine)} cannot be read, so nothing was removed: repair it (it names pins)"
+            return PruneReport(removed=[], kept={}, failed=[why])
     kept = keep_list(engine, pins)
     report = PruneReport(removed=[], kept=kept, failed=[])
     kept_images = {r.image for r in records(engine) if r.tag in kept and r.image}
@@ -877,8 +907,12 @@ def cmd_approve(args: argparse.Namespace) -> int:
     except ApprovalError as exc:
         sys.stderr.write(f"not approving: {exc}\n")
         return EXIT_ERROR
-    from .engine_refresh import approve_measurement  # noqa: PLC0415 - loaded only when used
+    from .engine_refresh import approve_measurement, recipe_conflict  # noqa: PLC0415 - loaded only when used
 
+    conflict = recipe_conflict(approval)
+    if conflict:
+        sys.stderr.write(f"not approving: {conflict}\n")
+        return EXIT_ERROR
     if not args.dry_run:
         problem = register_approval(approval)
         if problem:
