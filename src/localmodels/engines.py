@@ -31,11 +31,12 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, NamedTuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationError, field_validator
 
-from .atomic import read_model, write_model
+from .atomic import read_model, write_model, write_text_atomically
 from .llama_builds import (
     CURRENT,
     EXIT_ERROR,
@@ -55,7 +56,6 @@ if TYPE_CHECKING:
     import argparse
     import email.message
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-    from pathlib import Path
     from typing import IO
 
 log = logging.getLogger(__name__)
@@ -78,6 +78,13 @@ DOCKER_TIMEOUT_SECONDS: Final = 600.0
 RUNNER_NOT_FOUND: Final = 127
 RUNNER_CANNOT_RUN: Final = 126  # found, but not executable (the shell's code)
 RUNNER_TIMEOUT: Final = 124
+
+APPROVALS_FILE: Final = "approvals.json"
+PINS_FILE: Final = "pins.json"
+STORE_SCHEMA: Final = 1
+_REVISION: Final = re.compile(r"[0-9a-f]{40}")
+_GGUF_SPEC: Final = re.compile(r"(?P<repository>[^@:\s]+)@(?P<revision>[^@:\s]+):(?P<file>[^:\s]+)")
+_FILE_SPEC: Final = re.compile(r"(?P<repository>[^@:\s]+)@(?P<revision>[^@:\s]+)")
 
 _IMAGE: Final = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 #: A tag is a folder name: no separator, no leading dot.
@@ -104,6 +111,7 @@ class GateVerdict(StrEnum):
 
 
 CONTAINER_ENGINES: Final = (Engine.VLLM, Engine.SGLANG, Engine.TRTLLM)
+CONTAINER_NAMES: Final = ", ".join(e.value for e in CONTAINER_ENGINES)
 
 
 class VersionRecord(BaseModel):
@@ -443,13 +451,14 @@ class Pin(NamedTuple):
     file: Path
 
 
-def keep_list(engine: Engine, pins: Collection[Pin] = ()) -> dict[str, list[str]]:
+def keep_list(engine: Engine, pins: Collection[Pin] | None = None) -> dict[str, list[str]]:
     """The tags whose image stays on disk, each with why: ``current``, a pin or a ``users.toml`` name.
 
-    A pin keeps its version only while its pin file exists (checked now; a dropped pin is logged).
-    ``previous``
-    is not here: it is kept as its record and digest only.
+    ``pins`` None reads the pins registered for the engine (``pins_for``), so every caller keeps a pinned
+    version without passing them. A pin keeps its version only while its pin file exists (checked now; a
+    dropped pin is logged). ``previous`` is not here: it is kept as its record and digest only.
     """
+    pins = pins_for(engine) if pins is None else pins
     folder = versions_dir(engine)
     current, users = link_target(folder), read_users_in(folder)
     pinned: dict[str, list[str]] = {}
@@ -473,6 +482,225 @@ def keep_list(engine: Engine, pins: Collection[Pin] = ()) -> dict[str, list[str]
         if why:
             kept[version.name] = why
     return kept
+
+
+# --- pins: the versions studies hold (design 6) -----------------------------------------------------
+
+
+def pins_path(engine: Engine) -> Path:
+    """``engines/<engine>/pins.json``: ``{"<pin file>": "<version>"}``, one line per registered pin."""
+    return engines_dir() / engine.value / PINS_FILE
+
+
+def _pin_map(path: Path) -> dict[str, str] | None:
+    """The register as it is: {} when absent; None (logged) when unreadable, so it is never overwritten."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("%s cannot be read, so no pin is registered or kept by it: %r", path, exc)
+        return None
+    if not isinstance(raw, dict) or not all(isinstance(v, str) for v in raw.values()):
+        log.warning("%s is not a map of pin file to version, so no pin is registered or kept by it", path)
+        return None
+    return raw
+
+
+def register_pin(engine: Engine, version: str, pin_file: Path) -> bool:
+    """Record that ``pin_file`` pins ``version`` of ``engine``; False when the register is unreadable."""
+    from .settings import _locked  # noqa: PLC0415 - the pin file's own lock, as settings.py takes it
+
+    path = pins_path(engine)
+    with _locked(path):
+        pins = _pin_map(path)
+        if pins is None:
+            return False
+        write_text_atomically(path, json.dumps({**pins, str(pin_file): version}, indent=2) + "\n")
+    return True
+
+
+def pins_for(engine: Engine) -> list[Pin]:
+    """The registered pins of ``engine`` whose pin file still exists; a pin whose file is gone is dropped."""
+    from .settings import _locked  # noqa: PLC0415 - as above
+
+    path = pins_path(engine)
+    if not _pin_map(path):
+        return []
+    with _locked(path):
+        pins = _pin_map(path)
+        if pins is None:
+            return []
+        gone = [file for file in pins if not Path(file).exists()]
+        for file in gone:
+            log.info("%s: pin file %s is gone, so its pin of %s is dropped", engine, file, pins[file])
+        if gone:
+            kept = {file: version for file, version in pins.items() if file not in gone}
+            write_text_atomically(path, json.dumps(kept, indent=2) + "\n")
+            pins = kept
+    return [Pin(version, Path(file)) for file, version in pins.items()]
+
+
+# --- approvals: a project accepts an engine running a file for a model (design 6) ----------------
+
+
+class Approval(BaseModel):
+    """A project's acceptance of one container engine serving one file in place of one llama.cpp model.
+
+    ``model_key`` is the llama.cpp ``ModelIdentity.key`` of the GGUF (``gguf_*``); ``file_*`` is the
+    container engine's file. ``evidence`` is the project's quality check, kept by path and SHA-256.
+    """
+
+    project: str
+    model_key: str
+    gguf_repository: str
+    gguf_revision: str
+    gguf_file: str
+    engine: Engine
+    file_repository: str
+    file_revision: str
+    evidence: str
+    evidence_sha256: str
+    approved_at: str
+
+    @field_validator("gguf_revision", "file_revision")
+    @classmethod
+    def _commit(cls, revision: str) -> str:
+        if not _REVISION.fullmatch(revision):
+            msg = f"a revision is a 40-character commit sha, not {revision!r}"
+            raise ValueError(msg)
+        return revision
+
+    @field_validator("engine")
+    @classmethod
+    def _container(cls, engine: Engine) -> Engine:
+        if engine not in CONTAINER_ENGINES:
+            msg = f"{engine.value} is not a container engine ({CONTAINER_NAMES})"
+            raise ValueError(msg)
+        return engine
+
+    @field_validator("evidence")
+    @classmethod
+    def _absolute(cls, evidence: str) -> str:
+        if not Path(evidence).is_absolute():
+            msg = f"the evidence path must be absolute: {evidence!r}"
+            raise ValueError(msg)
+        return evidence
+
+    @property
+    def file_pin(self) -> str:
+        """The container file as ``repository@revision``."""
+        return f"{self.file_repository}@{self.file_revision}"
+
+
+class ApprovalFile(NamedTuple):
+    """The store's valid approvals, its items as they stand, and what is wrong with it ("" if nothing)."""
+
+    approvals: list[Approval]
+    items: list[Any]
+    problem: str
+
+
+def approvals_path() -> Path:
+    """``engines/approvals.json``: ``{"schema": 1, "approvals": [...]}``."""
+    return engines_dir() / APPROVALS_FILE
+
+
+def read_approvals(path: Path | None = None) -> ApprovalFile:
+    """Read the store; never raises. A bad file or item is reported in ``problem`` and never replaced."""
+    path = path or approvals_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        schema, items = payload["schema"], payload["approvals"]
+        if not isinstance(schema, int) or not isinstance(items, list):
+            msg = "schema is not a number or approvals is not a list"
+            raise TypeError(msg)  # noqa: TRY301 - one exit for every damaged shape
+        if schema > STORE_SCHEMA:
+            return ApprovalFile([], [], f"{path}: schema {schema}, written by a newer localmodels")
+    except FileNotFoundError:
+        return ApprovalFile([], [], "")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return ApprovalFile([], [], f"{path}: {exc!r}")
+    found, problems = [], []
+    for index, item in enumerate(items):
+        try:
+            found.append(Approval.model_validate(item))
+        except ValidationError as exc:
+            problems.append(f"approval {index}: {exc.errors()[0]['msg']}")
+    return ApprovalFile(found, items, f"{path}: {'; '.join(problems)}" if problems else "")
+
+
+def approvals_for(project: str, model_key: str) -> list[Approval]:
+    """The approvals of ``project`` for the llama.cpp model ``model_key``: one per container engine."""
+    return [a for a in read_approvals().approvals if (a.project, a.model_key) == (project, model_key)]
+
+
+def register_approval(approval: Approval) -> str | None:
+    """Store ``approval``, replacing the one for the same project, model and engine; None, or why not."""
+    from .settings import _locked  # noqa: PLC0415 - the pin file's own lock, as settings.py takes it
+
+    path = approvals_path()
+    with _locked(path):
+        found = read_approvals(path)
+        if found.problem:
+            return found.problem  # reported, never overwritten
+        same = (approval.project, approval.model_key, approval.engine)
+        kept = [a for a in found.approvals if (a.project, a.model_key, a.engine) != same]
+        items = [a.model_dump(mode="json") for a in (*kept, approval)]
+        write_text_atomically(path, json.dumps({"schema": STORE_SCHEMA, "approvals": items}, indent=2) + "\n")
+    return None
+
+
+class ApprovalError(ValueError):
+    """Why an approval was refused; the message is the refusal text."""
+
+
+def make_approval(project: str, gguf: str, engine: str, file: str, evidence: str) -> Approval:
+    """Check the command's inputs and build the approval; ``ApprovalError`` says what is wrong.
+
+    ``gguf`` is ``<repo>@<revision>:<file>`` (the Hub cache must hold it: its blob hashes make the model's
+    key), ``file`` is ``<repo>@<revision>``.
+    """
+    from .pinned import sha256_file  # noqa: PLC0415 - settings and pinned are loaded only when used
+    from .settings import ModelIdentity  # noqa: PLC0415
+
+    if engine not in {e.value for e in CONTAINER_ENGINES}:
+        msg = f"{engine!r} is not a container engine ({CONTAINER_NAMES})"
+        raise ApprovalError(msg)
+    gguf_match, file_match = _GGUF_SPEC.fullmatch(gguf), _FILE_SPEC.fullmatch(file)
+    if gguf_match is None:
+        msg = f"--gguf must be <repo>@<revision>:<file>, not {gguf!r}"
+        raise ApprovalError(msg)
+    if file_match is None:
+        msg = f"--file must be <repo>@<revision>, not {file!r}"
+        raise ApprovalError(msg)
+    for what, revision in (("--gguf", gguf_match["revision"]), ("--file", file_match["revision"])):
+        if not _REVISION.fullmatch(revision):
+            msg = f"{what}: the revision must be a 40-character commit sha, not {revision!r}"
+            raise ApprovalError(msg)
+    evidence_path = Path(evidence).expanduser().resolve()
+    if not evidence_path.is_file():
+        msg = f"the evidence file {evidence_path} does not exist"
+        raise ApprovalError(msg)
+    try:
+        identity = ModelIdentity.from_hub_files(
+            gguf_match["repository"], gguf_match["revision"], [gguf_match["file"]]
+        )
+    except ValueError as exc:
+        raise ApprovalError(str(exc)) from exc
+    return Approval(
+        project=project,
+        model_key=identity.key,
+        gguf_repository=gguf_match["repository"],
+        gguf_revision=gguf_match["revision"],
+        gguf_file=gguf_match["file"],
+        engine=Engine(engine),
+        file_repository=file_match["repository"],
+        file_revision=file_match["revision"],
+        evidence=str(evidence_path),
+        evidence_sha256=sha256_file(evidence_path),
+        approved_at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
 
 
 # --- prune ----------------------------------------------------------------------------------------
@@ -516,9 +744,15 @@ class PruneReport:
 
 
 def prune(
-    engine: Engine, *, pins: Collection[Pin] = (), dry_run: bool = False, runner: Runner = docker_runner
+    engine: Engine,
+    *,
+    pins: Collection[Pin] | None = None,
+    dry_run: bool = False,
+    runner: Runner = docker_runner,
 ) -> PruneReport:
     """Remove the images of every version that is not ``current``, pinned or named in ``users.toml``.
+
+    ``pins`` None reads the registered pins (``keep_list``).
 
     ``previous`` loses its image too (its record and digest stay). No record is deleted: the records say which
     tags were tried. ``docker rmi`` goes through ``runner``.
@@ -636,8 +870,44 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_approve(args: argparse.Namespace) -> int:
+    """`engines approve`: store a project's approval, install its recipe and measure the file on `current`."""
+    try:
+        approval = make_approval(args.project, args.gguf, args.engine, args.file, args.evidence)
+    except ApprovalError as exc:
+        sys.stderr.write(f"not approving: {exc}\n")
+        return EXIT_ERROR
+    from .engine_refresh import approve_measurement  # noqa: PLC0415 - loaded only when used
+
+    if not args.dry_run:
+        problem = register_approval(approval)
+        if problem:
+            sys.stderr.write(f"not approving: the approvals store cannot be written: {problem}\n")
+            return EXIT_ERROR
+    sys.stdout.write(
+        f"{'would approve' if args.dry_run else 'approved'} {approval.engine.value} on {approval.file_pin} "
+        f"for {approval.project} in place of {approval.gguf_repository}@{approval.gguf_revision}:"
+        f"{approval.gguf_file} (model {approval.model_key})\n"
+    )
+    sys.stdout.writelines(f"{line}\n" for line in approve_measurement(approval, dry_run=args.dry_run))
+    return EXIT_OK
+
+
+def cmd_approvals(_args: argparse.Namespace) -> int:
+    """`engines approvals`: every approval, one line each."""
+    found = read_approvals()
+    if found.problem:
+        sys.stderr.write(f"approvals store: {found.problem}\n")
+    sys.stdout.writelines(
+        f"{a.project}  {a.engine.value}  {a.file_pin}  for {a.gguf_repository}@{a.gguf_revision}:"
+        f"{a.gguf_file} ({a.model_key})  evidence {a.evidence}  approved {a.approved_at}\n"
+        for a in found.approvals
+    )
+    return EXIT_ERROR if found.problem else EXIT_OK
+
+
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Add ``engines list|switch|pull|calibrate|prune|measure|prompts install|reap`` to ``localmodels``."""
+    """Add the ``engines`` commands (list, switch, pull, calibrate, approve, approvals, prune, ...)."""
     engines = subparsers.add_parser(
         "engines", help="serving engines: container engine versions and the measuring harness"
     )
@@ -668,6 +938,20 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     calibrate_p.add_argument("engine", choices=[e.value for e in CONTAINER_ENGINES])
     calibrate_p.set_defaults(fn=cmd_calibrate)
+
+    approve_p = commands.add_parser(
+        "approve", help="accept a container engine serving a file in place of a llama.cpp model"
+    )
+    approve_p.add_argument("project", help="the project that accepts it")
+    approve_p.add_argument("--gguf", required=True, metavar="REPO@REVISION:FILE", help="the llama.cpp model")
+    approve_p.add_argument("--engine", required=True, help=CONTAINER_NAMES)
+    approve_p.add_argument("--file", required=True, metavar="REPO@REVISION", help="the container's file")
+    approve_p.add_argument("--evidence", required=True, help="the project's quality check (a file)")
+    approve_p.add_argument("--dry-run", action="store_true", help="check and print; store and submit nothing")
+    approve_p.set_defaults(fn=cmd_approve)
+    commands.add_parser("approvals", help="the approvals, one per project, model and engine").set_defaults(
+        fn=cmd_approvals
+    )
 
     prune_p = commands.add_parser(
         "prune", help="remove the images that are not current, pinned or named in users.toml"

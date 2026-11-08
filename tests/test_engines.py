@@ -6,14 +6,17 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from localmodels import engine_refresh, retune
 from localmodels.atomic import write_text_atomically
 from localmodels.cli import main
 from localmodels.engines import (
     SOURCES,
+    Approval,
     GateVerdict,
     NoRedirect,
     Pin,
@@ -25,9 +28,13 @@ from localmodels.engines import (
     list_tags,
     matching_tags,
     newest_untried,
+    pins_for,
     prune,
+    read_approvals,
     read_record,
     record_path,
+    register_approval,
+    register_pin,
     sources_for,
     switch,
     tried_tags,
@@ -38,7 +45,6 @@ from localmodels.stack import Engine
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
 DIGEST = "sha256:" + "ab" * 32
 CHALLENGE = 'Bearer realm="https://auth.example/token",service="registry.example",scope="repository:a/b:pull"'
@@ -336,3 +342,151 @@ def test_switch_names_the_pull_command_when_the_image_is_not_on_disk(
     make(Engine.VLLM, "v0.34.0")
     assert main(["engines", "switch", "vllm", "v0.34.0"]) == 0
     assert "pull it with" not in capsys.readouterr().out
+
+
+def test_a_registered_pin_keeps_its_version_and_is_dropped_with_its_pin_file(state: Path) -> None:
+    study = state / "study" / "pin.json"
+    write_text_atomically(study, "{}")
+    for tag in ("v0.31.0", "v0.32.0", "v0.30.0"):
+        make(Engine.VLLM, tag)
+    assert switch(Engine.VLLM, "v0.32.0") is None
+    assert register_pin(Engine.VLLM, "v0.30.0", study)
+    assert pins_for(Engine.VLLM) == [Pin("v0.30.0", study)]
+    assert keep_list(Engine.VLLM)["v0.30.0"] == [f"pinned by {study}"]  # no pins passed: the register is read
+    removed = prune(Engine.VLLM, dry_run=True).removed
+    assert [item.split()[0] for item in removed] == ["v0.31.0"]  # the pinned v0.30.0 stays on disk
+    study.unlink()
+    assert "v0.30.0" not in keep_list(Engine.VLLM)
+    assert pins_for(Engine.VLLM) == []
+    assert (
+        json.loads((state / "engines" / "vllm" / "pins.json").read_text()) == {}
+    )  # dropped, not only hidden
+    assert sorted(item.split()[0] for item in prune(Engine.VLLM, dry_run=True).removed) == [
+        "v0.30.0",
+        "v0.31.0",
+    ]
+    (state / "engines" / "vllm" / "pins.json").write_text("{", encoding="utf-8")  # damaged: never overwritten
+    assert not register_pin(Engine.VLLM, "v0.30.0", study)
+    assert (state / "engines" / "vllm" / "pins.json").read_text(encoding="utf-8") == "{"
+
+
+GGUF_REVISION, FILE_REVISION = "c" * 40, "b" * 40
+FILE_REPO = "nvidia/Qwen3-30B-A3B-NVFP4"
+
+
+def hub_cache(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A Hub cache holding one GGUF (a snapshot link to a blob named by its SHA-256); returns its spec."""
+    monkeypatch.setenv("HF_HUB_CACHE", str(root))
+    repo = root / "models--Qwen--Qwen3-30B-A3B-GGUF"
+    (repo / "blobs").mkdir(parents=True)
+    (repo / "snapshots" / GGUF_REVISION).mkdir(parents=True)
+    (repo / "blobs" / ("1d" * 32)).write_text("weights", encoding="utf-8")
+    (repo / "snapshots" / GGUF_REVISION / "q4.gguf").symlink_to(Path("../../blobs") / ("1d" * 32))
+    return f"Qwen/Qwen3-30B-A3B-GGUF@{GGUF_REVISION}:q4.gguf"
+
+
+def approve_args(gguf: str, evidence: Path, *, engine: str = "vllm", file: str | None = None) -> list[str]:
+    return [
+        "engines", "approve", "proj", "--gguf", gguf, "--engine", engine,
+        "--file", file or f"{FILE_REPO}@{FILE_REVISION}", "--evidence", str(evidence),
+    ]  # fmt: skip
+
+
+def test_approve_refuses_what_it_cannot_trust_and_stores_one_approval_per_project_model_and_engine(
+    state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gguf = hub_cache(state / "hub", monkeypatch)
+    evidence = state / "check.json"
+    evidence.write_text("{}", encoding="utf-8")
+    refusals = [
+        (approve_args(gguf, evidence, engine="pytorch"), "not a container engine"),
+        (approve_args(gguf, evidence, file=f"{FILE_REPO}@abc"), "40-character"),
+        (approve_args(gguf.replace(GGUF_REVISION, "main"), evidence), "40-character"),
+        (approve_args(gguf, state / "missing.json"), "does not exist"),
+        (approve_args(gguf.replace("q4.gguf", "q8.gguf"), evidence), ""),  # the Hub cache holds no such file
+    ]
+    for argv, words in refusals:
+        assert main(argv) == 1, argv
+        err = capsys.readouterr().err
+        assert err.startswith("not approving:")
+        assert words in err
+    assert read_approvals().approvals == []  # nothing was stored by a refusal
+
+    assert main([*approve_args(gguf, evidence), "--dry-run"]) == 0  # checks and prints; stores nothing
+    assert read_approvals().approvals == []
+    assert main(approve_args(gguf, evidence)) == 0
+    out = capsys.readouterr().out
+    assert f"installed the recipe {engine_refresh.recipe_file(Engine.VLLM, FILE_REPO)}" in out
+    assert "vllm has no `current` with its image on disk; the measurement waits" in out
+    recipe = json.loads(engine_refresh.recipe_file(Engine.VLLM, FILE_REPO).read_text(encoding="utf-8"))
+    assert (recipe["model"], recipe["model_revision"]) == (FILE_REPO, FILE_REVISION)
+    (first,) = read_approvals().approvals
+    assert first.evidence == str(evidence)
+    assert len(first.evidence_sha256) == 64
+
+    other = Approval.model_validate({**first.model_dump(), "engine": "sglang"})
+    assert register_approval(other) is None
+    assert register_approval(first.model_copy(update={"file_revision": "a" * 40})) is None  # replaces
+    assert sorted((a.engine.value, a.file_revision[0]) for a in read_approvals().approvals) == [
+        ("sglang", "b"),
+        ("vllm", "a"),
+    ]
+    assert main(["engines", "approvals"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    # a second GGUF paired with the same container file is measured on the client too, apart from the first
+    paired = first.model_copy(update={"gguf_file": "q5.gguf", "model_key": "k" * 16})
+    assert register_approval(paired) is None
+    labels = engine_refresh.same_client_targets()
+    assert len(labels) == 3  # the fixed pair, q4 and q5
+    assert {g.filename for g in labels.values()} >= {"q4.gguf", "q5.gguf"}
+    approvals_path = state / "engines" / "approvals.json"
+    approvals_path.write_text('{"schema": 1, "approvals": [{}]}', encoding="utf-8")
+    assert register_approval(first) is not None  # a damaged store is reported and never replaced
+    assert approvals_path.read_text(encoding="utf-8") == '{"schema": 1, "approvals": [{}]}'
+
+
+def test_an_approval_realizes_its_recipe_for_current_and_submits_the_measure_job(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make(Engine.VLLM, "v0.31.0")
+    assert switch(Engine.VLLM, "v0.31.0") is None
+    evidence = state / "check.json"
+    evidence.write_text("{}", encoding="utf-8")
+    approval = Approval(
+        project="proj", model_key="k" * 16, gguf_repository="Qwen/Qwen3-30B-A3B-GGUF",
+        gguf_revision=GGUF_REVISION, gguf_file="q4.gguf", engine=Engine.VLLM, file_repository=FILE_REPO,
+        file_revision=FILE_REVISION, evidence=str(evidence), evidence_sha256="0" * 64, approved_at="now",
+    )  # fmt: skip
+    sparkrun = state / "sparkrun"
+    sparkrun.write_text("#!/bin/sh\necho '{\"realized\": true}'\n", encoding="utf-8")
+    sparkrun.chmod(0o755)
+    submitted: list[list[str]] = []
+    monkeypatch.setattr(retune, "_run_submit", lambda argv: (submitted.append(argv), ("4242", ""))[1])
+    ok = subprocess.CompletedProcess([], 0, "", "")
+
+    dry = engine_refresh.approve_measurement(
+        approval, dry_run=True, sparkrun=lambda _v: sparkrun, docker=lambda _c: ok
+    )
+    assert submitted == []
+    assert any(line.startswith("would realize the recipe for v0.31.0, then submit: ") for line in dry)
+    assert not engine_refresh.recipe_file(Engine.VLLM, FILE_REPO).exists()  # a dry run writes nothing
+
+    lines = engine_refresh.approve_measurement(approval, sparkrun=lambda _v: sparkrun, docker=lambda _c: ok)
+    (argv,) = submitted
+    assert "submitted measure job 4242 (vllm v0.31.0 on nvidia/Qwen3-30B-A3B-NVFP4)" in lines
+    flat = " ".join(argv)
+    assert "--class restart" in flat
+    assert "--gpu" in flat
+    assert "engine-measure --run" in flat
+    assert "--engine vllm --tag v0.31.0 --mode approved" in flat
+    assert f"--model {FILE_REPO}" in flat
+    stored = read_record(Engine.VLLM, "v0.31.0")
+    assert stored is not None
+    assert json.loads(stored.recipes[FILE_REPO]) == {"realized": True}  # a measure job finds its recipe
+
+    gone = subprocess.CompletedProcess([], 1, "", "No such image")
+    waiting = engine_refresh.approve_measurement(
+        approval, sparkrun=lambda _v: sparkrun, docker=lambda _c: gone
+    )
+    assert len(submitted) == 1  # an image removed from disk submits nothing
+    assert "its image is not on disk; the measurement waits" in waiting[-1]

@@ -83,7 +83,7 @@ from .stack import Engine
 
 if TYPE_CHECKING:
     import argparse
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from .engine_bench import EngineRun, TeacherForced
@@ -1245,6 +1245,21 @@ def same_client_record(commit: str, gguf: refresh.Model) -> EngineRun | None:
     return read_model(same_client_path(commit, gguf), engine_bench.EngineRun)
 
 
+def same_client_targets() -> dict[str, refresh.Model]:
+    """The llama.cpp files measured on the container engines' client, by label.
+
+    ``SAME_CLIENT_FILES`` (labelled by their container model) and each approval's GGUF: a chooser rule needs
+    llama.cpp's figures for every file an approval pairs with a container file. Records are keyed by the
+    llama.cpp file, so two approvals pairing one container file with different GGUFs never collide.
+    """
+    targets = dict(SAME_CLIENT_FILES)
+    for approval in engines.read_approvals().approvals:
+        gguf = refresh.Model(approval.gguf_repository, approval.gguf_revision, approval.gguf_file)
+        if gguf not in targets.values():
+            targets[f"{gguf.repository}@{gguf.revision}--{gguf.filename}"] = gguf
+    return targets
+
+
 def _free_port() -> int:
     import socket  # noqa: PLC0415 - only this one place binds a port
 
@@ -1311,30 +1326,30 @@ class SameClientJob(JobRunner):
         super().__init__(run, run / "engines" / "same-client", JobResult(), harness=harness, guards=guards)
 
     def work(self) -> None:
-        """Measure each model of ``SAME_CLIENT_FILES`` that has no record for the current build."""
+        """Measure each file of ``same_client_targets`` that has no record for the current build."""
         base = llama_home(self.home)
         commit = current_commit(base)
         if commit is None:
             self.result.not_measured = "llama.cpp has no current build"
             return
-        for container_model, pin in SAME_CLIENT_FILES.items():
+        for label, pin in same_client_targets().items():
             if same_client_record(commit, pin) is not None:
-                self.result.steps[container_model] = STEP_OK
+                self.result.steps[label] = STEP_OK
                 continue
             file = refresh.model_file(pin)
             if file is None:
-                self.result.steps[container_model] = f"{NOT_MEASURED}{pin.filename} absent"
+                self.result.steps[label] = f"{NOT_MEASURED}{pin.filename} absent"
                 continue
             try:
                 measured = (self.harness.llama or measure_llama)(
                     current_server(base), file, self.folder / "lease"
                 )
             except (ServerStartError, httpx.HTTPError, OSError) as exc:
-                self.result.steps[container_model] = f"{NOT_MEASURED}{type(exc).__name__}: {exc}"
+                self.result.steps[label] = f"{NOT_MEASURED}{type(exc).__name__}: {exc}"
                 continue
             write_model(same_client_path(commit, pin), measured)
-            write_model(self.folder / f"{_slug(container_model)}.json", measured)
-            self.result.steps[container_model] = STEP_OK
+            write_model(self.folder / f"{_slug(label)}.json", measured)
+            self.result.steps[label] = STEP_OK
 
 
 # --- the sparkrun comparison job (design 2) --------------------------------------------------------
@@ -1451,6 +1466,57 @@ class SparkrunCompareJob(JobRunner):
 # --- the pull job (design 4.2) ----------------------------------------------------------------------
 
 
+def realize_recipes(
+    engine: Engine,
+    image: str,
+    models: Collection[str] | None,
+    folder: Path,
+    *,
+    sparkrun: Callable[[str], Path] = ensure_sparkrun,
+) -> tuple[dict[str, str], list[str]]:
+    """Realize ``engine``'s recipes for ``image``: (model -> recipe text, one failure per model).
+
+    ``models`` None realizes every recipe of the engine, else only those named. ``folder`` holds the
+    recipe sources sparkrun reads. A pull realizes all of them; an approval realizes its own file for
+    `current` at once (CPU, seconds), since a measure job finds no recipe otherwise.
+    """
+    wanted = {m: r for m, r in recipes_for(engine).items() if models is None or m in models}
+    texts: dict[str, str] = {}
+    failures: list[str] = []
+    try:
+        binary = sparkrun(in_use_version())
+    except ServerStartError as exc:
+        return texts, [f"{model}: realize failed: {exc}" for model in wanted]
+    for model, recipe in wanted.items():
+        source = folder / f"realize-{_slug(model)}.json"
+        write_text_atomically(source, json.dumps({**recipe, "container": image}, indent=2))
+        done = run_sparkrun(
+            binary,
+            [
+                "export",
+                "recipe",
+                str(source),
+                "--realize",
+                "--offline",
+                "--hosts",
+                "localhost",
+                "--tp",
+                "1",
+                "--json",
+            ],
+            timeout=engines.DOCKER_TIMEOUT_SECONDS,
+        )
+        try:
+            json.loads(done.stdout)
+        except ValueError:
+            failures.append(
+                f"{model}: realize failed: {done.stderr.strip()[-200:] or f'exit {done.returncode}'}"
+            )
+            continue
+        texts[model] = done.stdout.strip()
+    return texts, failures
+
+
 class PullJob:
     """`refresh engine-pull`: pull one image on the CPU, realize the recipes, write the version record.
 
@@ -1515,43 +1581,6 @@ class PullJob:
             )
         return digest, None
 
-    def realize(self, image: str) -> tuple[dict[str, str], list[str]]:
-        """Realize each recipe of the engine for ``image``: (model -> recipe text, one failure per model)."""
-        texts: dict[str, str] = {}
-        failures: list[str] = []
-        try:
-            binary = self.sparkrun(in_use_version())
-        except ServerStartError as exc:
-            return texts, [f"{model}: realize failed: {exc}" for model in recipes_for(self.engine)]
-        for model, recipe in recipes_for(self.engine).items():
-            source = self.folder / f"realize-{_slug(model)}.json"
-            write_text_atomically(source, json.dumps({**recipe, "container": image}, indent=2))
-            done = run_sparkrun(
-                binary,
-                [
-                    "export",
-                    "recipe",
-                    str(source),
-                    "--realize",
-                    "--offline",
-                    "--hosts",
-                    "localhost",
-                    "--tp",
-                    "1",
-                    "--json",
-                ],
-                timeout=engines.DOCKER_TIMEOUT_SECONDS,
-            )
-            try:
-                json.loads(done.stdout)
-            except ValueError:
-                failures.append(
-                    f"{model}: realize failed: {done.stderr.strip()[-200:] or f'exit {done.returncode}'}"
-                )
-                continue
-            texts[model] = done.stdout.strip()
-        return texts, failures
-
     def execute(self) -> int:
         """Pull, realize and record; see the class."""
         record = read_record(self.engine, self.tag) or VersionRecord(
@@ -1569,7 +1598,7 @@ class PullJob:
         if problem is not None:  # ``pulled`` stays as it was: a failed pull removes nothing from disk
             updated = record.model_copy(update={"reason": problem})
         else:
-            texts, failures = self.realize(image)
+            texts, failures = realize_recipes(self.engine, image, None, self.folder, sparkrun=self.sparkrun)
             verdict_kept = record.gate is not GateVerdict.NOT_RUN
             updated = record.model_copy(
                 update={
@@ -1860,7 +1889,7 @@ class EngineWalk:
                 self._plan(engine, source)
         commit = current_commit(llama_home(self.home))
         self.same_client = commit is not None and any(
-            same_client_record(commit, gguf) is None for gguf in SAME_CLIENT_FILES.values()
+            same_client_record(commit, gguf) is None for gguf in same_client_targets().values()
         )
 
     @staticmethod
@@ -2153,7 +2182,8 @@ def _submitter() -> refresh.JobSubmitter:
     )
 
 
-def _owner_folder(engine: Engine, kind: str) -> Path:
+def owner_folder(engine: Engine, kind: str) -> Path:
+    """A new run folder for a job the owner submits by hand (`engines pull|calibrate|approve`)."""
     folder = engines_dir() / engine.value / kind / datetime.now(UTC).strftime(refresh.RUN_ID_FORMAT)
     folder.mkdir(parents=True, exist_ok=True)  # the jobs' --workdir and --log: there before they queue
     return folder
@@ -2170,11 +2200,67 @@ def cmd_engines_pull(args: argparse.Namespace) -> int:
     if script is None:
         sys.stderr.write(f"no submit script (${retune.SUBMIT_ENV} is empty)\n")
         return EXIT_ERROR
-    folder = _owner_folder(engine, "pulls")
+    folder = owner_folder(engine, "pulls")
     job = _submitter().submit(
         job_name(EngineJob.PULL, engine), pull_argv(script, folder, engine, tag, source.publisher, None)
     )
     return EXIT_OK if job else EXIT_ERROR
+
+
+def approved_recipe(approval: engines.Approval) -> dict[str, Any]:
+    """The recipe an approval installs for its container file: the engine's base recipe on that file."""
+    return {
+        **BASE_RECIPES[approval.engine],
+        "model": approval.file_repository,
+        "model_revision": approval.file_revision,
+    }
+
+
+def approve_measurement(  # noqa: PLR0911 - one line per way the measurement has to wait
+    approval: engines.Approval,
+    *,
+    dry_run: bool = False,
+    sparkrun: Callable[[str], Path] = ensure_sparkrun,
+    docker: engines.Runner = docker_runner,
+) -> list[str]:
+    """What `engines approve` does after the approval is stored: the recipe, its realization, the job.
+
+    Installs a recipe for the approved file when absent; when the engine has a `current` whose image is on
+    disk, realizes it for that image now (CPU, seconds) and submits an APPROVED measure job of `current`;
+    otherwise says the measurement waits for the next refresh. Returns the lines to print; a dry run
+    writes and submits nothing and prints the job's command.
+    """
+    engine, model = approval.engine, approval.file_repository
+    path = recipe_file(engine, model)
+    lines = []
+    if not path.exists():
+        if not dry_run:
+            write_text_atomically(path, json.dumps(approved_recipe(approval), indent=2) + "\n")
+        lines.append(f"{'would install' if dry_run else 'installed'} the recipe {path}")
+    waits = "the measurement waits: the next refresh realizes every recipe and measures it"
+    tag = link_target(versions_dir(engine))
+    record = read_record(engine, tag) if tag else None
+    if record is None or not record.pulled or not record.image:
+        return [*lines, f"{engine.value} has no `current` with its image on disk; {waits}"]
+    if docker(["docker", "image", "inspect", record.image]).returncode != 0:
+        return [*lines, f"{engine.value} {record.tag}: its image is not on disk; {waits}"]
+    script = retune._script()  # noqa: SLF001
+    if script is None:
+        return [*lines, f"no submit script (${retune.SUBMIT_ENV} is empty); {waits}"]
+    folder = engines_dir() / engine.value / "approvals" if dry_run else owner_folder(engine, "approvals")
+    argv = measure_job_argv(script, folder, engine, record.tag, MeasureMode.APPROVED, model=model)
+    if dry_run:
+        return [*lines, f"would realize the recipe for {record.tag}, then submit: {' '.join(argv)}"]
+    texts, failures = realize_recipes(engine, record.image, [model], folder, sparkrun=sparkrun)
+    if failures or model not in texts:
+        return [*lines, *(failures or [f"{model}: no recipe to realize"]), waits]
+    latest = read_record(engine, record.tag) or record
+    write_record(latest.model_copy(update={"recipes": {**latest.recipes, **texts}}))
+    lines.append(f"realized the recipe for {record.tag}")
+    job, failure = retune._run_submit(argv)  # noqa: SLF001
+    if failure:
+        return [*lines, f"measure job not submitted: {failure}", waits]
+    return [*lines, f"submitted measure job {job} ({engine.value} {record.tag} on {model})"]
 
 
 def cmd_engines_calibrate(args: argparse.Namespace) -> int:
@@ -2206,7 +2292,7 @@ def cmd_engines_calibrate(args: argparse.Namespace) -> int:
     if pending:
         pull = submitter.submit(
             job_name(EngineJob.PULL, engine),
-            pull_argv(script, _owner_folder(engine, "pulls"), engine, adjacent, source.publisher, None),
+            pull_argv(script, owner_folder(engine, "pulls"), engine, adjacent, source.publisher, None),
         )
         if pull is None:
             return EXIT_ERROR
@@ -2214,7 +2300,7 @@ def cmd_engines_calibrate(args: argparse.Namespace) -> int:
         job_name(EngineJob.CALIBRATE, engine),
         calibrate_argv(
             script,
-            _owner_folder(engine, "calibrations"),
+            owner_folder(engine, "calibrations"),
             engine,
             tag,
             adjacent,
