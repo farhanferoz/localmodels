@@ -127,6 +127,11 @@ async def test_the_projection_counts_the_memory_the_server_draws_from(
         with pytest.raises(ServerStartError, match=rf"needs {counted + 12}\.0 GiB"):
             await manager.start()
         assert calls[0][3:5] == ["-ngl", "0" if cpu else "99"]
+        # a GPU server whose projection has no GPU line was projected for another device: refused
+        _fit_params(Path(manager.binary), "Host 10000 200 40")
+        if not shares and not cpu:
+            with pytest.raises(ServerStartError, match=r"projected test\.gguf for no GPU"):
+                await manager.start()
 
 
 async def test_a_peak_its_tune_measured_at_the_same_layout_raises_the_need(tmp_path: Path) -> None:

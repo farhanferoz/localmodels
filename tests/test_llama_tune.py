@@ -202,7 +202,7 @@ class FakeTune(LlamaTune):
     def _free_gib(self) -> float | None:
         return 100.0
 
-    async def _serve(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+    async def _measure_server(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
         name = llama_tune.arm_name(settings)
         self.calls.append(name)
         fields = dict(self.script[name])
@@ -759,10 +759,10 @@ async def test_the_command_holds_the_card_writes_the_record_and_adopts_only_what
 
 async def test_a_cancelled_tune_keeps_what_it_measured_and_deletes_its_base_file(tmp_path: Path) -> None:
     class Cancelled(FakeTune):
-        async def _serve(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+        async def _measure_server(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
             if llama_tune.arm_name(settings) == "ub2048":
                 raise asyncio.CancelledError  # SIGTERM arrives while the -ub arm is loading
-            return await super()._serve(settings, files, checked=checked)
+            return await super()._measure_server(settings, files, checked=checked)
 
     tune = Cancelled(make_spec(tmp_path), arm_script())
     with pytest.raises(asyncio.CancelledError):
@@ -788,9 +788,12 @@ async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> N
     assert record.candidate == "reference"
 
     class Killed(FakeTune):
-        async def _serve(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
-            arm = await super()._serve(settings, files, checked=checked)
-            if self.calls.count("reference") == 2:  # what the real _serve records when the guard killed it
+        killed_on = ("reference", 2)  # the arm whose run its guard kills, and which run of it
+
+        async def _measure_server(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+            arm = await super()._measure_server(settings, files, checked=checked)
+            name, run = self.killed_on
+            if self.calls[-1] == name and self.calls.count(name) == run:  # as the real one records a kill
                 self.guard_kill = arm.error = "available memory fell to 9.5 GiB, below the 10 GiB kill floor"
             return arm
 
@@ -799,6 +802,24 @@ async def test_a_model_shown_not_to_fit_is_not_loaded_again(tmp_path: Path) -> N
         await killed.tune()
     assert (killed.calls, killed.tools) == (["reference", "reference"], [])
     assert json.loads((tmp_path / "run" / "record.json").read_text())["partial"] is True
+
+    # a kill in the restart of the leading speculative arm, where the choosing restarts the next one
+    two = (SpecCandidate(SpecType.NGRAM_MOD), *MTP_ONLY)
+    script = {**arm_script(), "ngram-mod": {**arm_script()["draft-mtp"], "request_s": 6.0}}
+    killed = Killed(make_spec(tmp_path, speculation=two, prompt_tokens=300), script)
+    killed.killed_on = ("draft-mtp", 2)
+    with pytest.raises(LlamaTuneError, match="loads nothing more"):
+        await killed.tune()
+    assert killed.calls == ["reference", "reference", "draft-mtp", "ngram-mod", "draft-mtp"]
+
+    # a llama-bench that failed is not run again by the next -ub step
+    class BenchFails(FakeTune):
+        async def _run_bench(self) -> None:
+            self.tools.append("llama-bench")  # and no rows, as when it raised BenchError
+
+    failed = BenchFails(make_spec(tmp_path), arm_script())
+    await failed.tune()
+    assert failed.tools.count("llama-bench") == 1
 
 
 async def test_the_reference_is_timed_twice_whenever_a_candidate_is_planned(tmp_path: Path) -> None:

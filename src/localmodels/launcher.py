@@ -515,10 +515,16 @@ class LocalServerManager:
         host = rows.pop(_FIT_HOST_ROW)
         if shares:  # the GPU's memory is the host's RAM
             mib = host + sum(rows.values())
-        elif self.params.n_gpu_layers != 0:
-            mib = sum(rows.values())
-        else:
+        elif self.params.n_gpu_layers == 0:
             mib = host
+        elif rows:
+            mib = sum(rows.values())
+        else:  # a GPU server with no GPU line: llama-fit-params saw no GPU; its figure is not this server's
+            msg = (
+                f"llama-fit-params projected {model_path.name} for no GPU, but the server loads it on one; "
+                "not loading a model it has not projected"
+            )
+            raise ServerStartError(msg)
         return mib / _MIB_PER_GIB
 
     def _measured_peak_gib(self) -> float | None:

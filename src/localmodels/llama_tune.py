@@ -540,8 +540,8 @@ def _free_port() -> int:
 class LlamaTune:
     """One llama.cpp tune. ``tune()`` measures and returns the record; ``adopt`` is the caller's step.
 
-    The methods that run a program (``_bench``, ``_perplexity``, ``_screen``, ``_serve``) and read the clock
-    and memory are the ones a test replaces.
+    The methods that run a program (``_bench``, ``_perplexity``, ``_screen``, ``_measure_server``) and read
+    the clock and memory are the ones a test replaces.
     """
 
     def __init__(
@@ -557,7 +557,7 @@ class LlamaTune:
         self.measurements: list[BaseModel] = []
         self.arms: list[ArmResult] = []  # the first run of each arm; a restart is only kept in the record
         self.bench: dict[int, BenchRow] = {}
-        self.bench_refused = False  # llama-bench's memory screen refused it: the -ub steps measure nothing
+        self.bench_tried = False  # llama-bench is screened and run once; refused or failed, never again
         self.guard_kill: str | None = None  # why a server's memory guard killed it; the tune then stops
         self.kl: dict[int, KlResult] = {}
         self.ub_star: int | None = None  # the larger -ub that passed, once one has
@@ -910,19 +910,16 @@ class LlamaTune:
             self.ub_star = ubatch
 
     async def _bench_once(self) -> bool:
-        """Run llama-bench the first time a -ub step needs it; False when its memory screen refused it.
+        """Run llama-bench the first time a -ub step needs it; False when it has no rows (refused or failed).
 
         llama-bench loads the model at every -ub it times, the largest last, and has no memory guard: on
         2026-11-07 (slurm 2187) it loaded a model that did not fit and could not be killed (D22).
         """
-        if self.bench_refused:
-            return False
-        if not self.bench:
-            if not await self._fits_screen(max(UB_CANDIDATES), name="llama-bench"):
-                self.bench_refused = True
-                return False
-            await self._run_bench()
-        return True
+        if not self.bench_tried:
+            self.bench_tried = True
+            if await self._fits_screen(max(UB_CANDIDATES), name="llama-bench"):
+                await self._run_bench()
+        return bool(self.bench)
 
     async def _run_bench(self) -> None:
         """One ``llama-bench`` run for every -ub (it reloads the model only when its parameters change)."""
@@ -1097,6 +1094,11 @@ class LlamaTune:
         )
 
     async def _serve(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
+        """Measure one server; never after a memory guard killed one (every server start comes here)."""
+        self._stop_after_a_guard_kill()
+        return await self._measure_server(settings, files, checked=checked)
+
+    async def _measure_server(self, settings: Settings, files: FileSet, *, checked: bool) -> ArmResult:
         """Start a server with ``settings``, send the prompts at the role's concurrency, and measure."""
         arm = ArmResult(name=arm_name(settings), settings=settings, free_gib=self._free_gib())
         peaks: list[int] = []
