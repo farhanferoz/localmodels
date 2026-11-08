@@ -136,7 +136,10 @@ def test_teacher_forced_scores_the_stub_on_both_shapes(
         assert sent[0]["prompt_logprobs"] == 1
 
 
-def test_parsers_read_the_documented_shapes_and_refuse_others() -> None:
+def test_parsers_read_the_documented_shapes_and_refuse_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine_bench, "_score_chunk", lambda *_: engine_bench.ChunkScores([-900.0], [1]))
+    far_off = engine_bench.phase_teacher_forced(None, TINY, "w0 w1", "vllm")  # type: ignore[arg-type]
+    assert far_off.perplexity == math.inf  # recorded, not an OverflowError
     vllm = {
         "choices": [
             {
@@ -216,6 +219,11 @@ def test_a_server_that_cannot_answer_skips_the_slow_phases(prompts: tuple[Path, 
         "http://127.0.0.1:9", "vllm", sizes=TINY, phases=[Phase.WARM, Phase.DECODE]
     )
     assert {o.status for o in unreachable.phases.values()} == {PhaseStatus.NOT_MEASURED}
+    no_warm = engine_bench.measure("http://127.0.0.1:9", "vllm", sizes=TINY, phases=[Phase.DECODE])
+    assert "model list could not be read" in no_warm.phases[Phase.DECODE].reason
+    with StubEngine(fail_paths=("/v1/models",)) as no_list:  # a server that answers, its model list unread
+        answers = _measure(no_list, prompts, "vllm", phases=[Phase.WARM, Phase.DECODE])
+    assert {o.status for o in answers.phases.values()} == {PhaseStatus.MEASURED}
 
 
 def test_a_changed_prompt_file_is_refused_by_its_hash(
@@ -244,12 +252,13 @@ def test_a_changed_prompt_file_is_refused_by_its_hash(
 
 
 def test_benchy_command_is_pinned_and_its_json_read(tmp_path: Path) -> None:
-    cmd = engine_bench.benchy_command("http://h:1", "m", tmp_path / "r.json")
+    cmd = engine_bench.benchy_command("http://h:1/", "m", tmp_path / "r.json")
     assert cmd[:2] == ["uvx", "llama-benchy==0.4.0"]
     flags = {cmd[i]: cmd[i + 1] for i in range(2, len(cmd), 2)}
     assert flags == {
-        "--base-url": "http://h:1",
+        "--base-url": "http://h:1/v1",  # llama-benchy appends /models and /chat/completions itself
         "--model": "m",
+        "--served-model-name": "m",
         "--pp": "2048",
         "--tg": "32",
         "--runs": "3",
@@ -265,6 +274,13 @@ def test_benchy_command_is_pinned_and_its_json_read(tmp_path: Path) -> None:
     with pytest.raises(PhaseError, match="exited 2: no such host"):
         engine_bench.phase_benchy("http://h:1", "m", failing)
     assert seen[0][1] == "llama-benchy==0.4.0"
+
+    def gpt2_counted(c: list[str]) -> subprocess.CompletedProcess[str]:
+        _fake_benchy(c)
+        return subprocess.CompletedProcess(c, 0, "Falling back to 'gpt2' tokenizer as approximation.\n", "")
+
+    with pytest.raises(PhaseError, match="--tokenizer"):  # a run counted in another model's tokens
+        engine_bench.phase_benchy("http://h:1", "local-alias", gpt2_counted)
     with pytest.raises(PhaseError, match="not in the expected shape"):
         engine_bench.parse_benchy({"benchmarks": [{"concurrency": 4}]})
 
@@ -309,3 +325,10 @@ def test_command_line_measures_and_installs(
         True,
     )
     assert "teacher_forced: measured" in capsys.readouterr().out
+    base = ["engines", "measure", "--url", stub.url, "--engine", "vllm", "--out", str(out)]
+    for bad, says in (
+        (["--phases", "warm,decode,nope"], "unknown nope"),
+        (["--extra-json", "{bad"], "not JSON"),
+    ):
+        with pytest.raises(SystemExit, match=says):  # a message, not a traceback
+            cli.main(base + bad)

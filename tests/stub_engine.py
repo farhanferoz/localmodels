@@ -84,7 +84,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
-        if self.path == "/v1/models":
+        if self.path in self.server.fail_paths:
+            self.send_error(404)
+        elif self.path == "/v1/models":
             self.send_json({"data": [{"id": MODEL}]})
         else:
             self.send_error(404)

@@ -74,6 +74,8 @@ BENCHY_PACKAGE: Final = "llama-benchy==0.4.0"
 BENCHY_PROMPT_TOKENS: Final = 2048
 BENCHY_WRITE_TOKENS: Final = 32
 BENCHY_RUNS: Final = 3
+# what llama-benchy 0.4.0 prints (corpus.py) when it cannot load the named tokenizer and counts with gpt2's
+BENCHY_GPT2_FALLBACK: Final = "Falling back to 'gpt2' tokenizer"
 TF_TOP_K: Final = 1  # top tokens asked for per position
 VARIANT_STRIDE: Final = 7919  # a prime, so successive variants start far apart in the text
 
@@ -639,9 +641,8 @@ def parse_vllm_prompt_logprobs(response: dict[str, Any]) -> ChunkScores:
         for entry in entries[1:]:  # entry 0 is null: nothing precedes the first token
             by_rank = sorted(entry.items(), key=lambda kv: kv[1]["rank"])
             scores.top_tokens.append(int(by_rank[0][0]))
-            scores.logprobs.append(
-                float(by_rank[-1][1]["logprob"])
-            )  # the prompt's own token has the highest rank
+            # the prompt's own token has the highest rank: true only while TF_TOP_K is 1 (top + own)
+            scores.logprobs.append(float(by_rank[-1][1]["logprob"]))
     except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
         raise ScoringError(f"vLLM prompt_logprobs response not in the documented shape: {exc!r}") from exc
     if not scores.logprobs:
@@ -716,12 +717,16 @@ def phase_teacher_forced(target: Target, sizes: Sizes, text: str, engine: str) -
     scored = [_score_chunk(target, path, prompt) for prompt in chunk_prompts(text, sizes)]
     logprobs = [lp for chunk in scored for lp in chunk.logprobs]
     mean = statistics.fmean(logprobs)
+    try:
+        perplexity = math.exp(-mean)
+    except OverflowError:  # a mean below about -709: past any gate, recorded rather than raised
+        perplexity = math.inf
     return TeacherForced(
         path=path,
         chunks=len(scored),
         positions=len(logprobs),
         mean_logprob=mean,
-        perplexity=math.exp(-mean),
+        perplexity=perplexity,
         top_tokens=[chunk.top_tokens for chunk in scored],
     )
 
@@ -730,12 +735,17 @@ def phase_teacher_forced(target: Target, sizes: Sizes, text: str, engine: str) -
 
 
 def benchy_command(url: str, model: str, result_file: Path, *, tokenizer: str | None = None) -> list[str]:
-    """``uvx llama-benchy==0.4.0`` against ``url``: prompt 2,048, writing 32 tokens, JSON saved to a file."""
+    """``uvx llama-benchy==0.4.0`` against ``url``: prompt 2,048, writing 32 tokens, JSON saved to a file.
+
+    llama-benchy appends ``/models`` and ``/chat/completions`` to its base URL itself, so it gets ``url/v1``;
+    ``--model`` also names its tokenizer, so the served id travels as ``--served-model-name``.
+    """
     cmd = [
         "uvx",
         BENCHY_PACKAGE,
-        *("--base-url", url),
+        *("--base-url", f"{url.rstrip('/')}/v1"),
         *("--model", model),
+        *("--served-model-name", model),
         *("--pp", str(BENCHY_PROMPT_TOKENS)),
         *("--tg", str(BENCHY_WRITE_TOKENS)),
         *("--runs", str(BENCHY_RUNS)),
@@ -792,6 +802,12 @@ def phase_benchy(
         if done.returncode != 0:
             tail = (done.stderr or done.stdout or "").strip().splitlines()[-3:]
             raise PhaseError(f"llama-benchy exited {done.returncode}: {' | '.join(tail)}")
+        if BENCHY_GPT2_FALLBACK in (done.stdout or ""):
+            raise PhaseError(
+                f"llama-benchy could not load the tokenizer {tokenizer or model!r} and counted tokens "
+                "with gpt2's, so its prompt is not 2,048 of the model's tokens; "
+                "pass the model's Hub name as --tokenizer"
+            )
         try:
             data = json.loads(result_file.read_text())
         except (OSError, ValueError) as exc:
@@ -859,7 +875,8 @@ class _Run:
     runner: Callable[[list[str]], subprocess.CompletedProcess[str]]
     tokenizer: str | None
     record: EngineRun
-    warm_failed: str | None = field(default=None)
+    #: why the server cannot answer (model list unread, or the warm-up failed); a measured warm-up clears it
+    blocked: str | None = field(default=None)
 
     def pinned(self) -> Prompts:
         if self.prompts is None:
@@ -898,9 +915,9 @@ class _Run:
 
 
 def _measure_phase(run: _Run, phase: Phase) -> None:
-    if run.warm_failed and phase is not Phase.WARM:
+    if run.blocked and phase is not Phase.WARM:
         run.record.phases[phase] = PhaseOutcome(
-            status=PhaseStatus.NOT_MEASURED, reason=f"skipped: the warm-up request failed ({run.warm_failed})"
+            status=PhaseStatus.NOT_MEASURED, reason=f"skipped: {run.blocked}"
         )
         return
     t0 = time.perf_counter()
@@ -913,8 +930,10 @@ def _measure_phase(run: _Run, phase: Phase) -> None:
             status=PhaseStatus.NOT_MEASURED, reason=reason, seconds=time.perf_counter() - t0
         )
         if phase is Phase.WARM:
-            run.warm_failed = reason
+            run.blocked = f"the warm-up request failed ({reason})"
         return
+    if phase is Phase.WARM:
+        run.blocked = None  # the server answered, whatever its model list said
     run.store(phase, data)
     run.record.phases[phase] = PhaseOutcome(status=PhaseStatus.MEASURED, seconds=time.perf_counter() - t0)
     log.info("phase %s done in %.1fs", phase.value, time.perf_counter() - t0)
@@ -971,7 +990,7 @@ def measure(  # noqa: PLR0913 - one entry point; every argument is a distinct in
             record,
         )
         if unreachable:
-            run.warm_failed = f"the server's model list could not be read ({unreachable})"
+            run.blocked = f"the server's model list could not be read ({unreachable})"
         for phase in phases:
             _measure_phase(run, phase)
     record.figures = figures(record.details)
@@ -990,15 +1009,28 @@ def _parse_stamp(items: Sequence[str]) -> dict[str, str]:
 
 def cmd_measure(args: argparse.Namespace) -> int:
     """``localmodels engines measure``: run the phases against a running server and write the record."""
-    phases = [Phase(p) for p in args.phases.split(",")] if args.phases else list(Phase)
+    names = [p.strip() for p in args.phases.split(",")] if args.phases else [p.value for p in Phase]
+    unknown = [n for n in names if n not in {p.value for p in Phase}]
+    if unknown:
+        raise SystemExit(
+            f"--phases: unknown {', '.join(unknown)}; choose from {','.join(p.value for p in Phase)}"
+        )
+    try:
+        extra = json.loads(args.extra_json) if args.extra_json else None
+    except ValueError as exc:
+        raise SystemExit(f"--extra-json is not JSON: {exc}") from None
+    try:
+        httpx.URL(args.url)
+    except httpx.InvalidURL as exc:
+        raise SystemExit(f"--url: {exc}") from None
     record = measure(
         args.url,
         args.engine,
         model=args.model,
-        extra=json.loads(args.extra_json) if args.extra_json else None,
+        extra=extra,
         stamp=_parse_stamp(args.stamp),
         startup_s=args.startup_s,
-        phases=phases,
+        phases=[Phase(n) for n in names],
         sizes=TINY if args.tiny else FULL,
         tokenizer=args.tokenizer,
     )
