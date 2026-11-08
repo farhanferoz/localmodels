@@ -86,8 +86,19 @@ def fake_sparkrun(tmp_path: Path, docker: FakeDocker, run_id: str, *, fail: bool
 
 
 def hub(tmp_path: Path) -> Path:
+    """A Hub root whose model links, as on this machine, into a blob store shared by several models."""
     root = tmp_path / "hf"
-    (root / "hub" / "models--nvidia--Qwen3-30B-A3B-NVFP4" / "snapshots").mkdir(parents=True, exist_ok=True)
+    model = root / "hub" / "models--nvidia--Qwen3-30B-A3B-NVFP4"
+    shared = root / "hub" / "blobs" / "1d" / "1d20"
+    for folder in (model / "snapshots" / "rev", model / "blobs", shared.parent):
+        folder.mkdir(parents=True, exist_ok=True)
+    shared.write_text("weights", encoding="utf-8")
+    for link, target in (
+        (model / "blobs" / "00fe", "../../blobs/1d/1d20"),
+        (model / "snapshots" / "rev" / "w", "../../blobs/00fe"),
+    ):
+        if not link.is_symlink():
+            link.symlink_to(target)
     return root
 
 
@@ -162,7 +173,11 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
         real = tmp_path / "hf" / "hub" / "models--nvidia--Qwen3-30B-A3B-NVFP4"
         assert body["container"] == IMAGE
         assert body["model"] == MODEL
-        assert f"{real}:{real}:ro" in body["executor_config"]["volumes"]
+        shared = tmp_path / "hf" / "hub" / "blobs" / "1d" / "1d20"
+        assert body["executor_config"]["volumes"] == [
+            f"{real}:{real}:ro",
+            f"{shared}:{shared}:ro",
+        ]  # links resolve
         assert set(body["executor_config"]["labels"]) == {
             "lifecycle=ephemeral",
             "slurm-job=4242",

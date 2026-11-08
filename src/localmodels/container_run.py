@@ -255,10 +255,26 @@ class ContainerRun:
         self._run_root = root
         return real
 
+    @staticmethod
+    def model_mounts(real_model_dir: Path) -> list[Path]:
+        """The model folder and every file its links reach outside it, each to be mounted read-only.
+
+        A folder's blobs may themselves link into a store shared by several models (on this machine,
+        ``hub/blobs/<2 hex>/<sha256>``); the folder alone leaves those links dangling in the container.
+        """
+        inside = real_model_dir.resolve()
+        outside = {
+            link.resolve()
+            for link in real_model_dir.rglob("*")
+            if link.is_symlink() and not link.resolve().is_relative_to(inside)
+        }
+        return [real_model_dir, *sorted(t for t in outside if t.is_file())]
+
     def _write_recipe(self, real_model_dir: Path) -> Path:
-        """The recipe sparkrun runs: ours, the read-only model mount and the run's labels (JSON is YAML)."""
+        """The recipe sparkrun runs: ours, the read-only model mounts and the run's labels (JSON is YAML)."""
         executor = dict(self.recipe.get("executor_config") or {})
-        executor["volumes"] = [*executor.get("volumes", []), f"{real_model_dir}:{real_model_dir}:ro"]
+        mounts = [f"{m}:{m}:ro" for m in self.model_mounts(real_model_dir)]
+        executor["volumes"] = [*executor.get("volumes", []), *mounts]
         job = os.environ.get("SLURM_JOB_ID", "none")
         executor["labels"] = [LIFECYCLE_LABEL, f"{JOB_LABEL}={job}", f"{RUN_LABEL}={self.run_id}"]
         body = {
@@ -303,6 +319,8 @@ class ContainerRun:
             self.sparkrun, self._run_args(recipe, need), timeout=START_TIMEOUT_S, hub_root=self._run_root
         )
         if done.returncode != 0 or self._killed:
+            if done.returncode != 0:  # the cause is often well above the last lines: keep it all in the log
+                log.error("sparkrun run exited %d:\n%s\n%s", done.returncode, done.stdout, done.stderr)
             why = self._killed or f"sparkrun run exited {done.returncode}: {done.stderr.strip()[-500:]}"
             raise ContainerStartError(why)
         free = self._sample_free()  # the reading after the load counts toward the fall
