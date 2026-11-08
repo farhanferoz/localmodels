@@ -393,3 +393,9 @@ def test_record_result_adds_the_runs_memory_and_what_it_measured(tmp_path: Path)
         "run0001",
     )
     assert MemoryNeed.recorded(container_run.read_record(Engine.SGLANG, rec.tag), MODEL) == 30.0  # type: ignore[arg-type]
+    run._free_before, run._lowest_free = 90.0, 80.0  # a guard-killed run measured only part of its need
+    container_run.record_result(rec, MODEL, run, extra={"kind": "candidate", "complete": False})
+    assert MemoryNeed.recorded(container_run.read_record(Engine.SGLANG, rec.tag), MODEL) == 30.0  # type: ignore[arg-type]
+    run._gpu_peak = 40.0  # larger, but incomplete: still not the need
+    container_run.record_result(rec, MODEL, run, extra={"kind": "candidate", "complete": False})
+    assert MemoryNeed.recorded(container_run.read_record(Engine.SGLANG, rec.tag), MODEL) == 30.0  # type: ignore[arg-type]

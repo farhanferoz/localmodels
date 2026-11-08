@@ -35,6 +35,7 @@ from localmodels.engines import (
     versions_dir,
     write_record,
 )
+from localmodels.launcher import NotEnoughMemoryError
 from localmodels.llama_tune import KlStats
 from localmodels.stack import Engine
 
@@ -207,7 +208,7 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due( 
         "--name refresh-same-client" in same_client
     )  # llama.cpp's current may change: measured on the client
     assert "--class restart --gpu --mem 52G --after 102" in same_client
-    assert "timeout --kill-after=30 600" in same_client
+    assert "timeout --kill-after=180 600" in same_client
     record = refresh.RunRecord.model_validate_json((run_dir / refresh.RUN_FILE).read_text())
     assert [job.job for job in record.jobs] == ["101", "102", "103"]
     assert record.candidate_commit == CANDIDATE_SHA
@@ -580,6 +581,8 @@ def test_container_gate_fails_each_limit_once_and_records_only_without_limits() 
     assert "not comparable" in apart.quality_failures[0]
     with pytest.raises(engine_refresh.NotComparableError):
         engine_refresh.compare_scores(tf(positions=10), tf(positions=11))
+    with pytest.raises(engine_refresh.NotComparableError):  # a NaN would pass both limits silently
+        engine_refresh.compare_scores(tf(), tf(ppl=float("nan")))
     compared = engine_refresh.compare_scores(tf(), tf(ppl=2.2, diff=10))
     assert (compared.ppl_ratio, compared.same_top, compared.positions) == (
         pytest.approx(1.1),
@@ -691,12 +694,29 @@ class Served:
         return MemoryNeed(fall_gib=30.0, gpu_peak_gib=20.0, host_peak_gib=1.0)
 
 
+class Refused:
+    """A start the memory check refused before ``sparkrun run`` was called."""
+
+    launched = False
+
+    def __init__(self, number: int) -> None:
+        self.number = number
+
+    def __enter__(self) -> Self:
+        msg = f"start {self.number}: not enough memory available"
+        raise NotEnoughMemoryError(msg)
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
 class Fleet:
     """Fake container starts and measurements: every start is logged, each can be scripted by its number."""
 
     def __init__(self) -> None:
         self.starts: list[tuple[str, str, dict[str, Any]]] = []
         self.fail_on: set[int] = set()
+        self.refuse_on: set[int] = set()  # refused before sparkrun ran (memory short at the start)
         self.by_start: dict[int, dict[str, Any]] = {}  # start number -> erun() keywords
         self.by_tag: dict[str, dict[str, Any]] = {}
         self.removed: list[str] = []
@@ -716,7 +736,7 @@ class Fleet:
         if number in self.fail_on:
             msg = f"start {number} failed"
             raise ContainerStartError(msg)
-        return Served(self, record.tag)
+        return Refused(number) if number in self.refuse_on else Served(self, record.tag)
 
     def measure(self, url, engine, *, stamp, startup_s, phases):
         self.number += 1
@@ -742,10 +762,7 @@ def measure_job(
 ) -> engine_refresh.EngineMeasureResult:
     job = engine_refresh.MeasureJob(world.run_dir, engine, tag, mode, harness=fleet.harness(), **kw)
     assert job.execute() == 0
-    done = read_model(
-        engine_refresh.engine_folder(world.run_dir, engine, tag) / "measure.json",
-        engine_refresh.EngineMeasureResult,
-    )
+    done = read_model(job.folder / "measure.json", engine_refresh.EngineMeasureResult)
     assert done is not None
     return done
 
@@ -812,9 +829,42 @@ def test_nothing_starts_after_a_failed_start_and_a_candidate_needs_a_current_on_
     assert done.steps["r2-current"].startswith("not measured: not started after")
     assert read_record(Engine.SGLANG, "v0.5.23-cu130").gate is GateVerdict.FAILED  # type: ignore[union-attr]
 
-    put(Engine.TRTLLM, "1.3.0rc13")  # no current at all
+    for refusal in ({"fail_on": {2}}, {"refuse_on": {3}}):  # current's start failed; the candidate's refused
+        fleet.starts.clear()
+        fleet.fail_on, fleet.refuse_on = refusal.get("fail_on", set()), refusal.get("refuse_on", set())
+        put(Engine.SGLANG, "v0.5.24-cu130")
+        unjudged = measure_job(
+            world, fleet, Engine.SGLANG, "v0.5.24-cu130", engine_refresh.MeasureMode.CANDIDATE
+        )
+        assert unjudged.verdict.gate is GateVerdict.NOT_RUN  # type: ignore[union-attr]
+        assert read_record(Engine.SGLANG, "v0.5.24-cu130").gate is GateVerdict.NOT_RUN  # type: ignore[union-attr]
+        assert "v0.5.24-cu130" not in engine_refresh.judged_tags(Engine.SGLANG)  # offered again next run
+    fleet.fail_on, fleet.refuse_on = set(), set()
+
+    def broken(*_args: object) -> None:
+        msg = "a bug"
+        raise RuntimeError(msg)
+
+    put(Engine.SGLANG, "v0.5.24-cu130")  # the last job's prune took its image
+    job = engine_refresh.MeasureJob(
+        world.run_dir,
+        Engine.SGLANG,
+        "v0.5.24-cu130",
+        engine_refresh.MeasureMode.CANDIDATE,
+        harness=fleet.harness(),
+    )
+    job._candidate = broken  # type: ignore[method-assign]
+    assert job.execute() == 0  # recorded, and the rest of the chain still runs
+    assert (
+        "RuntimeError: a bug"
+        in read_model(job.folder / "measure.json", engine_refresh.EngineMeasureResult).error
+    )  # type: ignore[union-attr]
+
+    put(Engine.TRTLLM, "1.3.0rc12", current=True, pulled=False)  # a current whose image is gone
+    put(Engine.TRTLLM, "1.3.0rc13")
     refused = measure_job(world, fleet, Engine.TRTLLM, "1.3.0rc13", engine_refresh.MeasureMode.CANDIDATE)
     assert "no `current` with its image on disk" in refused.not_measured
+    assert read_record(Engine.TRTLLM, "1.3.0rc13").gate is GateVerdict.NOT_RUN  # type: ignore[union-attr]
 
 
 def test_a_bootstrap_makes_the_first_current_only_when_official_and_every_phase_measured(
@@ -835,15 +885,27 @@ def test_a_bootstrap_makes_the_first_current_only_when_official_and_every_phase_
     assert link_target(versions_dir(Engine.TRTLLM)) is None
 
     put(Engine.VLLM, "v0.33.0-gb10.0", publisher=Publisher.COMMUNITY)
-    alone = measure_job(world, fleet, Engine.VLLM, "v0.33.0-gb10.0", bootstrap)
+    alone = measure_job(world, fleet, Engine.VLLM, "v0.33.0-gb10.0", engine_refresh.MeasureMode.CANDIDATE)
+    assert alone.mode is bootstrap  # planned as a candidate; no `current` when it ran: measured alone
     assert (alone.verdict.gate, alone.switched) == (GateVerdict.PASSED, False)  # type: ignore[union-attr]
     assert link_target(versions_dir(Engine.VLLM)) is None  # measured and recorded; never made current
+
+    fleet.starts.clear()
+    put(Engine.SGLANG, "v0.5.24-cu130", publisher=Publisher.OFFICIAL)
+    behind = measure_job(world, fleet, Engine.SGLANG, "v0.5.24-cu130", bootstrap)
+    assert behind.mode is engine_refresh.MeasureMode.CANDIDATE  # a `current` appeared earlier in the chain
+    assert len(fleet.starts) == 6  # compared with it: never a second bootstrap over it
 
 
 def test_an_approved_file_is_measured_on_current_alone_without_a_gate(world: World, fleet: Fleet) -> None:
     put(Engine.VLLM, "v0.33.0", gate=GateVerdict.PASSED, current=True)
     done = measure_job(world, fleet, Engine.VLLM, "v0.33.0", engine_refresh.MeasureMode.APPROVED, model=MODEL)
     assert done.verdict is None
+    folder = engine_refresh.engine_folder(world.run_dir, Engine.VLLM, "v0.33.0")
+    assert not (
+        folder / "measure.json"
+    ).exists()  # its own folder: a candidate's verdict is never overwritten
+    assert (folder / "approved" / "nvidia--Qwen3-30B-A3B-NVFP4" / "measure.json").exists()
     assert [r["kind"] for r in read_record(Engine.VLLM, "v0.33.0").results] == ["warm", "approved"]  # type: ignore[union-attr]
     put(Engine.VLLM, "v0.34.0")
     elsewhere = measure_job(
@@ -966,9 +1028,16 @@ def submitted(world: World) -> list[str]:
 def test_the_first_walk_bootstraps_an_engine_in_one_chain_with_the_adjacent_pull_and_the_calibration(
     world: World,
 ) -> None:
-    fetch = tag_fetch({"vllm/vllm-openai": ["v0.32.0", "v0.33.0", "v0.33.0.rc1", "latest"]})
+    fetch = tag_fetch(
+        {
+            "vllm/vllm-openai": ["v0.32.0", "v0.33.0", "v0.33.0.rc1", "latest"],
+            "timothystewart6/vllm-gb10": ["v0.33.0-gb10.0"],
+        }
+    )
     record = walk(world, fetch=fetch)
-    pull, measure, adjacent, calibrate, same_client = submitted(world)
+    pull, measure, adjacent, calibrate, community_pull, community, same_client = submitted(world)
+    assert "--tag v0.33.0-gb10.0 --publisher community" in community_pull
+    assert "--tag v0.33.0-gb10.0 --mode candidate" in community  # of the official bootstrapped before it
     assert "--name refresh-pull-vllm" in pull
     assert "--class resume --resume-ok --no-anywhere --cpus 2 --mem 4G" in pull
     assert "--after" not in pull
@@ -976,26 +1045,31 @@ def test_the_first_walk_bootstraps_an_engine_in_one_chain_with_the_adjacent_pull
     assert "--tag v0.33.0 --publisher official" in pull
     assert "--name refresh-engine-vllm" in measure
     assert "--class restart --gpu --mem 61G --after 101" in measure  # the 57.0 GiB seed + 4, ceil
-    assert "timeout --kill-after=30 2400" in measure
+    assert "timeout --kill-after=180 2400" in measure
     assert "--tag v0.33.0 --mode bootstrap" in measure
     assert "--tag v0.32.0" in adjacent
     assert "--after 102" in adjacent  # one chain: one image pulled at a time
     assert "--name refresh-calibrate-vllm" in calibrate
     assert "--after 103 --after 102" in calibrate  # two parents: the adjacent pull and the bootstrap measure
     assert "--adjacent v0.32.0" in calibrate
-    assert "timeout --kill-after=30 3600" in calibrate
+    assert "timeout --kill-after=180 3600" in calibrate
     assert "--name refresh-same-client" in same_client
-    assert "--after 104" in same_client  # last in the chain: no llama.cpp measure job
-    assert "timeout --kill-after=30 600" in same_client
+    assert "--after 106" in same_client  # last in the chain: no llama.cpp measure job
+    assert "timeout --kill-after=180 600" in same_client
     plans = {(p.engine, p.publisher): p for p in record.engines}
     vllm = plans[("vllm", "official")]
     assert (vllm.tag, vllm.mode, vllm.reason) == ("v0.33.0", "bootstrap", "")
-    assert plans[("vllm", "community")].reason == "no new tag"
+    assert (plans[("vllm", "community")].tag, plans[("vllm", "community")].mode) == (
+        "v0.33.0-gb10.0",
+        "candidate",
+    )
     assert plans[("sglang", "official")].reason == "no new tag"
-    assert [job.job for job in record.jobs] == ["101", "102", "103", "104", "105"]
+    assert [job.job for job in record.jobs] == ["101", "102", "103", "104", "105", "106", "107"]
 
 
-def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_lists(world: World) -> None:
+def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_lists(  # noqa: PLR0915 - walk after walk
+    world: World,
+) -> None:
     put(Engine.VLLM, "v0.32.0", gate=GateVerdict.PASSED, current=True)
     put(Engine.SGLANG, "v0.5.22-cu130", gate=GateVerdict.FAILED)  # tried: its newer-than check stops there
     fetch = tag_fetch(
@@ -1016,6 +1090,7 @@ def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_li
     # the approved file on what is then current, in its own job (a community build never becomes current)
     assert "--tag v0.33.0 --mode approved --model org/approved" in approved
     assert "--after 102" in approved
+    assert "engine-vllm-v0.33.0-approved-org--approved.log" in approved  # its own log
     assert "--tag v0.33.0-gb10.0 --publisher community" in community_pull
     assert "--tag v0.33.0-gb10.0 --mode candidate" in community_measure  # measured, recorded, never switched
     assert "--after 900" in same_client  # after llama.cpp's measure job, not the chain's last
@@ -1050,6 +1125,18 @@ def test_walk_plans_for_candidates_community_builds_tried_tags_and_unreadable_li
     assert len(submitted(world)) == 1  # only the same-client job: nothing to pull
 
     world.submitted.unlink()
+    put(
+        Engine.VLLM, "v0.32.0", gate=GateVerdict.PASSED, current=True, pulled=False
+    )  # rolled back: image gone
+    gone = walk(world, fetch=tag_fetch({"vllm/vllm-openai": ["v0.32.0", "v0.33.0"]}))
+    current_pull, candidate_pull = submitted(world)[:2]
+    assert (
+        "--tag v0.32.0 --publisher official" in current_pull
+    )  # current first: the candidate is compared with it
+    assert "--tag v0.33.0" in candidate_pull
+    assert gone.engines[0].tag == "v0.33.0"
+
+    world.submitted.unlink()
     put(Engine.SGLANG, "v0.5.23-cu130")  # pulled, never judged (its measure job never got the card)
     sglang = tag_fetch({"lmsysorg/sglang": ["v0.5.22-cu130", "v0.5.23-cu130"]})
     again = walk(world, fetch=sglang)
@@ -1082,11 +1169,18 @@ def test_the_sparkrun_move_needs_identical_dry_runs_or_a_comparison_job_the_cand
     assert "--name refresh-sparkrun" in compare
     assert "--old v0.4.2 --new v0.4.3" in compare
     assert "--class restart --gpu --mem 61G" in compare
-    assert "timeout --kill-after=30 2400" in compare  # 2,400 s for the one engine that has a current
+    assert "timeout --kill-after=180 2400" in compare  # 2,400 s for the one engine that has a current
     assert "--after" not in compare
     assert "--after 101" in pull  # the candidates are chained after it
     assert "--after 102" in measure
     assert engine_refresh.in_use_version() == "v0.4.2"
+
+    world.submitted.unlink()
+    failing = lambda *_a: "exit 1\nError: something"  # noqa: E731
+    stuck = walk(world, fetch=fetch, sparkrun_tags=newer, sparkrun=Path, dry_runner=failing)
+    assert engine_refresh.in_use_version() == "v0.4.2"  # two identical failures prove nothing
+    assert any("a dry run failed: not checked" in r for r in stuck.engine_reports)
+    assert not any("refresh-sparkrun" in line for line in submitted(world))
 
     world.submitted.unlink()
     keep = engine_refresh.SparkrunState(version="v0.4.2", tried=["v0.4.3"])
@@ -1095,6 +1189,34 @@ def test_the_sparkrun_move_needs_identical_dry_runs_or_a_comparison_job_the_cand
     assert not any(
         "refresh-sparkrun" in line for line in submitted(world)
     )  # a tried version waits for a newer
+
+
+def test_the_sparkrun_comparison_moves_on_a_pass_and_marks_tried_only_a_failed_gate(
+    world: World, fleet: Fleet
+) -> None:
+    put(Engine.VLLM, "v0.33.0", gate=GateVerdict.PASSED, current=True)
+
+    def compare(**script: Any) -> engine_refresh.SparkrunState:
+        fleet.starts.clear()
+        fleet.number = -1
+        fleet.fail_on, fleet.by_start = script.get("fail_on", set()), script.get("by_start", {})
+        write_model(engine_refresh.sparkrun_state_path(), engine_refresh.SparkrunState(version="v0.4.2"))
+        job = engine_refresh.SparkrunCompareJob(world.run_dir, "v0.4.2", "v0.4.3", harness=fleet.harness())
+        assert job.execute() == 0
+        state = engine_refresh.read_sparkrun_state()
+        assert state is not None
+        return state
+
+    unlimited = compare()  # no limits yet: speed passed, quality cannot be judged
+    assert (unlimited.version, unlimited.tried) == ("v0.4.2", [])  # stays, and is compared again next run
+    write_model(engine_refresh.limits_path(Engine.VLLM), limits())
+    old_failed = compare(fail_on={2})  # a start under the old sparkrun failed: not the new one's doing
+    assert (old_failed.version, old_failed.tried) == ("v0.4.2", [])
+    slower = {n: {"figures": {"write_tps_16_at_once": 80.0}} for n in (1, 3)}  # measured starts 1, 3: new
+    failed = compare(by_start=slower)
+    assert (failed.version, failed.tried) == ("v0.4.2", ["v0.4.3"])  # its own gate failed: tried (D12)
+    moved = compare()
+    assert (moved.version, moved.previous) == ("v0.4.3", "v0.4.2")
 
 
 def test_the_sparkrun_dry_runs_compare_after_the_run_specific_values_are_removed() -> None:
@@ -1229,6 +1351,11 @@ def test_the_pull_job_pulls_the_digest_the_record_names_and_refuses_for_want_of_
         "pull",
         image_of(Engine.VLLM, "v0.33.0"),
     ] in docker.calls  # what was measured, even if the tag moved
+
+    put(Engine.VLLM, "v0.33.0", current=True)  # current, on disk
+    low = pull_job(world, tmp_path, Docker(), free_bytes=lambda _path: 99 * 10**9)
+    assert low.execute() == 0
+    assert read_record(Engine.VLLM, "v0.33.0").pulled is True  # type: ignore[union-attr]  # still on disk
 
     put(Engine.VLLM, "v0.36.0", pulled=False, image=False)
     small = Docker()

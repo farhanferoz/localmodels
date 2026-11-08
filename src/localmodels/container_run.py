@@ -166,7 +166,9 @@ class MemoryNeed:
         needs = [
             cls(**{k: v for k, v in result["memory"].items() if k in names}).gib  # type: ignore[attr-defined]
             for result in record.results
-            if result.get("model") == model and isinstance(result.get("memory"), dict)
+            if result.get("model") == model
+            and isinstance(result.get("memory"), dict)
+            and result.get("complete") is not False  # a guard-killed or partial run is no measurement
         ]
         known = [n for n in needs if n is not None]
         return max(known) if known else None
@@ -497,6 +499,11 @@ class ContainerRun:
             fall = max(0.0, self._free_before - self._lowest_free)
         peak = self._host_peak if self._stopped.is_set() else self.host_peak_gib()
         return MemoryNeed(fall_gib=fall, gpu_peak_gib=self._gpu_peak, host_peak_gib=peak)
+
+    @property
+    def launched(self) -> bool:
+        """Whether ``sparkrun run`` was called: False when the start was refused before it (memory, image)."""
+        return self._launched_at is not None
 
     @property
     def killed(self) -> str | None:

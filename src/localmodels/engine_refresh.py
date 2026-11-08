@@ -113,6 +113,9 @@ CALIBRATE_LIMIT_S: Final = 3600
 SAME_CLIENT_LIMIT_S: Final = 600
 SPARKRUN_LIMIT_S: Final = 2400
 JOB_MEM_MARGIN_GIB: Final = 4  # a GPU job's ``--mem`` is its whole need plus this
+#: ``timeout``'s grace after its SIGTERM: a container's stop (sparkrun stop, docker rm, up to 120 s) and the
+#: result file come first; refresh's own 30 s would SIGKILL a job mid-stop.
+KILL_AFTER_S: Final = 180
 PULL_MEM: Final = "4G"
 PULL_CPUS: Final = 2
 PULL_TIMEOUT_S: Final = 1800.0
@@ -330,8 +333,11 @@ def compare_scores(base: TeacherForced, other: TeacherForced) -> ScoreComparison
         )
         raise NotComparableError(msg)
     positions = sum(lengths)
-    if not positions or not base.perplexity:
+    if not positions:
         msg = "no scored positions"
+        raise NotComparableError(msg)
+    if not all(math.isfinite(s.perplexity) and s.perplexity > 0 for s in (base, other)):
+        msg = f"perplexity {base.perplexity} against {other.perplexity}: not a finite positive number"
         raise NotComparableError(msg)
     same = sum(
         a == b
@@ -403,6 +409,8 @@ class EngineVerdict(BaseModel):
     @property
     def reason(self) -> str:
         """The first two failures, else the notes: what a record's ``reason`` says."""
+        if self.gate is GateVerdict.NOT_RUN:
+            return self.notes or self.gate.value
         return "; ".join([*self.speed_failures, *self.quality_failures][:2]) or self.notes or self.gate.value
 
 
@@ -519,6 +527,7 @@ _NORMALISE: Final = (
 )
 
 
+DRY_RUN_OK: Final = "exit 0\n"  # the front of ``EngineWalk._dry_run_output`` for a dry run that worked
 DOCKER_RUN_MARK: Final = "docker run command:"  # sparkrun's -vvv dry run: executors/docker.py's debug line
 SERVE_MARK: Final = "Serve command:"
 
@@ -643,8 +652,13 @@ class JobRunner:
     """The part every GPU job shares: the quiet card, SIGTERM as an exit, and the result file in ``finally``.
 
     A subclass sets ``kind``, ``result_file`` and ``quiet_reason`` and writes ``work()`` (and ``finish()``
-    for what runs whatever happened). Exit 1 only when the card did not go quiet; a refusal, a failed start
-    or a failed gate is a recorded result, exit 0 (D12's afterok rule: the chain goes on).
+    for what runs whatever happened). Every outcome is a recorded result and exits 0, the card not going
+    quiet and an unexpected error included (D12's afterok rule: one job must not cancel the rest of the
+    chain); only an interrupt (``timeout``'s SIGTERM) exits otherwise.
+
+    ``subject`` is the version under judgment: a start that fails for a reason that is not its own (a
+    refusal before launch for want of memory, or another version's start) leaves it unjudged
+    (``not_judged``), to be offered again, rather than failed (D12's tried rule is for its own failures).
     """
 
     kind: ClassVar[EngineJob]
@@ -669,13 +683,21 @@ class JobRunner:
         self.guards = guards
         #: Why no more containers start: nothing starts after a failed start or a guard kill (D22).
         self.stopped: str | None = None
+        #: The version under judgment, and why it was not judged when the stop was not its own doing.
+        self.subject: str | None = None
+        self.not_judged: str | None = None
 
     def work(self) -> None:
         """The measurements, with the card quiet; fills ``self.result``."""
         raise NotImplementedError
 
     def finish(self) -> None:
-        """What runs after the work, whatever happened (before the result file is written)."""
+        """What runs after the work, whatever happened (after the result file is written)."""
+
+    def blameless(self, record: VersionRecord, sparkrun: str | None) -> bool:
+        """Whether a failed start of ``record`` is not the fault of the version under judgment."""
+        del sparkrun  # a sparkrun comparison judges the sparkrun version instead
+        return record.tag != self.subject
 
     def execute(self) -> int:
         """Hold the card quiet and run the work; the result file is always written."""
@@ -687,25 +709,28 @@ class JobRunner:
             raise SystemExit(refresh.SIGTERM_EXIT)
 
         previous = signal.signal(signal.SIGTERM, _terminate)  # before the card; a run chains its own handler
-        code = EXIT_OK
         try:
             with QuietCard(GpuLease(DEFAULT_LEASE_DIR, refresh.LEASE_PROJECT), reason=self.quiet_reason):
                 self.work()
         except QuietCardTimeoutError as exc:
             self.result.not_measured = str(exc)
-            code = EXIT_ERROR
+        except Exception as exc:  # recorded; exit 0 so the rest of the chain still runs
+            self.result.error = f"{type(exc).__name__}: {exc}"
+            log.exception("%s failed", self.kind)
         except BaseException as exc:
             self.result.error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
             signal.signal(signal.SIGTERM, previous)
+            write_model(
+                self.folder / self.result_file, self.result
+            )  # before finish: a kill there loses nothing
             try:
                 self.finish()
             except Exception:
                 log.exception("%s: finishing failed", self.kind)
-            write_model(self.folder / self.result_file, self.result)
         sys.stdout.write(f"{self.kind}: {self.summary()}\n")
-        return code
+        return EXIT_OK
 
     def summary(self) -> str:
         """One line on the outcome."""
@@ -733,10 +758,12 @@ class JobRunner:
             steps[label] = f"{NOT_MEASURED}not started after: {self.stopped}"
             return None
         port = int((recipe.get("defaults") or {}).get("port", 8000))
+        run: Any = None
         try:
             binary = self.harness.sparkrun(sparkrun or in_use_version())
             begun = time.monotonic()
-            with self.harness.start(record, model, recipe, binary, self.guards, kind=self.run_kind) as served:
+            run = self.harness.start(record, model, recipe, binary, self.guards, kind=self.run_kind)
+            with run as served:
                 startup = time.monotonic() - begun  # sparkrun's --no-follow still waits for readiness
                 measured = self.harness.measure(
                     f"http://127.0.0.1:{port}",
@@ -748,9 +775,14 @@ class JobRunner:
         except (ServerStartError, OSError) as exc:
             self.stopped = f"{label}: {type(exc).__name__}: {exc}"
             steps[label] = f"{NOT_MEASURED}{type(exc).__name__}: {exc}"
+            refused = run is not None and not getattr(run, "launched", True)  # refused before sparkrun ran
+            if refused or self.blameless(record, sparkrun):
+                self.not_judged = self.not_judged or self.stopped
             return None
         if served.killed:
             self.stopped = f"{label}: the memory guard killed the container ({served.killed})"
+            if self.blameless(record, sparkrun):
+                self.not_judged = self.not_judged or self.stopped
         unmeasured = [
             f"{phase.value}: {outcome.reason if outcome else 'not run'}"
             for phase in phases
@@ -873,14 +905,18 @@ class MeasureJob(JobRunner):
         guards: MemoryGuards = GUARDS,
     ) -> None:
         self.engine, self.tag, self.mode, self.only_model = engine, tag, mode, model
+        folder = engine_folder(run, engine, tag)
+        if mode is MeasureMode.APPROVED and model:  # its own files: never over the candidate's measure.json
+            folder = folder / "approved" / _slug(model)
         super().__init__(
             run,
-            engine_folder(run, engine, tag),
+            folder,
             EngineMeasureResult(engine=engine.value, tag=tag, mode=mode),
             harness=harness,
             guards=guards,
             run_kind=RunKind.BOOTSTRAP if mode is MeasureMode.BOOTSTRAP else RunKind.REFRESH,
         )
+        self.subject = tag
 
     @property
     def outcome(self) -> EngineMeasureResult:
@@ -909,12 +945,20 @@ class MeasureJob(JobRunner):
             return
         models = [model]
         current = link_target(versions_dir(self.engine))
-        if self.mode is MeasureMode.CANDIDATE:
-            self._candidate(record, models, current)
-        elif self.mode is MeasureMode.BOOTSTRAP:
-            self._bootstrap(record, models, current)
-        else:
+        if self.mode is MeasureMode.APPROVED:
             self._approved(record, models, current)
+            return
+        # Decided now, not when the chain was planned: a version planned behind another engine version's
+        # bootstrap in the same chain finds a `current` (or, when that bootstrap failed, none).
+        mode = MeasureMode.CANDIDATE if current is not None else MeasureMode.BOOTSTRAP
+        if mode is not self.mode:
+            log.info("%s %s: planned as %s, measured as %s", self.engine.value, self.tag, self.mode, mode)
+        self.outcome.mode = mode
+        self.run_kind = RunKind.BOOTSTRAP if mode is MeasureMode.BOOTSTRAP else RunKind.REFRESH
+        if mode is MeasureMode.CANDIDATE:
+            self._candidate(record, models, current)
+        else:
+            self._bootstrap(record, models, current)
 
     def _recipes(self, record: VersionRecord, models: Sequence[str]) -> dict[str, dict[str, Any]]:
         found = {}
@@ -937,8 +981,9 @@ class MeasureJob(JobRunner):
         ours = self._recipes(record, models)
         for model, recipe in ours.items():
             theirs = realized(current, model)
-            if theirs is None:
+            if theirs is None:  # current's gap, not the candidate's: it stays unjudged
                 self.result.steps[model] = f"{NOT_MEASURED}no realized recipe in {current.tag}'s record"
+                self.not_judged = self.not_judged or self.result.steps[model]
                 continue
             prefix = f"{_slug(model)}-" if len(models) > 1 else ""
             cur, cand = interleave(
@@ -992,6 +1037,10 @@ class MeasureJob(JobRunner):
                 EngineVerdict(gate=GateVerdict.FAILED, speed_failures=["not measured: no model was measured"])
             ]
         )
+        if self.not_judged and worst.gate is GateVerdict.FAILED:  # not its own failure: offered again
+            worst = worst.model_copy(
+                update={"gate": GateVerdict.NOT_RUN, "notes": f"not judged: {self.not_judged}"}
+            )
         self.outcome.verdict = worst
         latest = read_record(self.engine, self.tag) or record
         write_record(latest.model_copy(update={"gate": worst.gate, "reason": worst.reason}))
@@ -1328,13 +1377,11 @@ def move_sparkrun(new: str, old: str, reason: str) -> None:
     )
 
 
-def keep_sparkrun(old: str, new: str, reason: str) -> None:
-    """Stay on ``old``: ``new`` is tried and not offered again."""
+def keep_sparkrun(old: str, new: str, reason: str, *, tried: bool = True) -> None:
+    """Stay on ``old``; ``new`` is tried (not offered again) only when its own gate failed."""
     state = read_sparkrun_state() or SparkrunState(version=old)
-    write_model(
-        sparkrun_state_path(),
-        state.model_copy(update={"tried": sorted({*state.tried, new}), "reason": reason}),
-    )
+    kept = sorted({*state.tried, new}) if tried else state.tried
+    write_model(sparkrun_state_path(), state.model_copy(update={"tried": kept, "reason": reason}))
 
 
 class SparkrunCompareJob(JobRunner):
@@ -1377,13 +1424,28 @@ class SparkrunCompareJob(JobRunner):
                 outcome.verdicts[f"{engine.value} {model}"] = judge_rounds(
                     self, engine, old, new, prefix=prefix
                 )
-        failed = [k for k, v in outcome.verdicts.items() if v.gate is not GateVerdict.PASSED]
-        if self.stopped or failed:
-            outcome.reason = self.stopped or f"{self.new} did not pass the gate on: {', '.join(failed)}"
+        verdicts = outcome.verdicts
+        failed = [k for k, v in verdicts.items() if v.gate is GateVerdict.FAILED]
+        unjudged = [k for k, v in verdicts.items() if v.gate is not GateVerdict.PASSED and k not in failed]
+        if self.not_judged:  # the stop was not the new sparkrun's doing: compared again next run
+            outcome.reason = f"not judged: {self.not_judged}"
+            keep_sparkrun(self.old, self.new, outcome.reason, tried=False)
+        elif failed:
+            outcome.reason = f"{self.new} did not pass the gate on: {', '.join(failed)}"
             keep_sparkrun(self.old, self.new, outcome.reason)
+        elif unjudged or not verdicts:  # e.g. an engine whose quality limits are not calibrated yet
+            outcome.reason = (
+                f"{self.new} not judged on: {', '.join(unjudged) or 'no engine'}; stays on {self.old}"
+            )
+            keep_sparkrun(self.old, self.new, outcome.reason, tried=False)
         else:
             outcome.moved, outcome.reason = True, f"{self.new} passed the gate on every engine"
             move_sparkrun(self.new, self.old, outcome.reason)
+
+    def blameless(self, record: VersionRecord, sparkrun: str | None) -> bool:
+        """A start under the old sparkrun failing is not the new version's fault."""
+        del record
+        return sparkrun != self.new
 
 
 # --- the pull job (design 4.2) ----------------------------------------------------------------------
@@ -1425,7 +1487,10 @@ class PullJob:
             return (
                 f"cannot read Docker's root folder: {done.stderr.strip()[-200:] or f'exit {done.returncode}'}"
             )
-        free = self.free_bytes(root)
+        try:
+            free = self.free_bytes(root)
+        except OSError as exc:
+            return f"cannot read the free space of {root}: {exc}"
         if free < MIN_FREE_DISK_GB * GB:
             return f"refused: {root} has {free / GB:.0f} GB free, a pull needs {MIN_FREE_DISK_GB} GB"
         return None
@@ -1489,17 +1554,20 @@ class PullJob:
 
     def execute(self) -> int:
         """Pull, realize and record; see the class."""
-        self.folder.mkdir(parents=True, exist_ok=True)
-        install_recipes()
         record = read_record(self.engine, self.tag) or VersionRecord(
             engine=self.engine, tag=self.tag, publisher=self.publisher
         )
-        problem = self.disk_problem()
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            install_recipes()
+            problem = self.disk_problem()
+        except OSError as exc:  # recorded like a failed pull: the chain goes on
+            problem = f"{type(exc).__name__}: {exc}"
         image = ""
         if problem is None:
             image, problem = self.pulled_image(record)
-        if problem is not None:
-            updated = record.model_copy(update={"pulled": False, "reason": problem})
+        if problem is not None:  # ``pulled`` stays as it was: a failed pull removes nothing from disk
+            updated = record.model_copy(update={"reason": problem})
         else:
             texts, failures = self.realize(image)
             verdict_kept = record.gate is not GateVerdict.NOT_RUN
@@ -1576,7 +1644,7 @@ def _gpu_flags(need_gib: float, after: Sequence[str]) -> list[str]:
 
 def _timed(limit_s: int, command: Sequence[str]) -> list[str]:
     """``command`` under ``timeout``: the hard stop of the whole job."""
-    return ["timeout", f"--kill-after={refresh.KILL_AFTER_S}", str(limit_s), *command]
+    return ["timeout", f"--kill-after={KILL_AFTER_S}", str(limit_s), *command]
 
 
 def _job_argv(
@@ -1614,7 +1682,7 @@ def pull_argv(
     return _job_argv(script, run, EngineJob.PULL, engine, tag, what, [*flags, *_after_flags(after)], command)
 
 
-def measure_job_argv(
+def measure_job_argv(  # noqa: PLR0913 - one job's argv: every argument is a distinct input
     script: Path,
     run: Path,
     engine: Engine,
@@ -1624,9 +1692,14 @@ def measure_job_argv(
     home: str | None = None,
     after: Sequence[str] = (),
     model: str | None = None,
+    also_starts: Sequence[str] = (),
 ) -> list[str]:
-    """The GPU measure job of one version (``--class restart``, 40-minute stop, ``--mem`` the whole need)."""
-    tags = [t for t in (link_target(versions_dir(engine)), tag) if t]
+    """The GPU measure job of one version (``--class restart``, 40-minute stop, ``--mem`` the whole need).
+
+    ``also_starts`` names a version that may be `current` by the time the job runs (one bootstrapped
+    earlier in the same chain): it is started too, so its need counts.
+    """
+    tags = [t for t in (link_target(versions_dir(engine)), *also_starts, tag) if t]
     need = job_need_gib(engine, tags, [model or MEASUREMENT_MODEL])
     command = [
         *refresh._refresh_command(home, "engine-measure"),  # noqa: SLF001
@@ -1639,7 +1712,7 @@ def measure_job_argv(
         run,
         EngineJob.MEASURE,
         engine,
-        tag,
+        f"{tag}-approved-{_slug(model)}" if mode is MeasureMode.APPROVED and model else tag,  # its own log
         what,
         _gpu_flags(need, after),
         _timed(MEASURE_LIMIT_S, command),
@@ -1766,6 +1839,8 @@ class EngineWalk:
         self.dry_runner = dry_runner or self._dry_run_output
         self.specs: list[JobSpec] = []
         self.same_client = False
+        self._bootstrapping: dict[Engine, str] = {}  # an engine's official bootstrap planned in this chain
+        self._current_pulls: set[Engine] = set()
 
     # --- deciding ---
 
@@ -1808,18 +1883,13 @@ class EngineWalk:
         if self.dry:
             reports.append(f"sparkrun {newest} is newer than {in_use}: not checked in a dry run")
             return
-        different = []
         try:
-            old, new = self.sparkrun(in_use), self.sparkrun(newest)
-            for engine, current in current_records().items():
-                for model in current.recipes:
-                    recipe = realized(current, model)
-                    if recipe is not None and self.dry_runner(old, current, model, recipe) != self.dry_runner(
-                        new, current, model, recipe
-                    ):
-                        different.append(f"{engine.value} {model}")
+            different = self._differences(self.sparkrun(in_use), self.sparkrun(newest))
         except (ServerStartError, OSError) as exc:
             reports.append(f"sparkrun {newest}: not checked: {exc}")
+            return
+        if different is None:
+            reports.append(f"sparkrun {newest}: a dry run failed: not checked")
             return
         if different:
             reports.append(
@@ -1839,6 +1909,26 @@ class EngineWalk:
             move_sparkrun(newest, in_use, "the dry runs of every realized recipe are identical")
             reports.append(f"sparkrun moved {in_use} -> {newest}: the dry runs are identical")
 
+    def _differences(self, old: Path, new: Path) -> list[str] | None:
+        """The realized recipes whose dry run differs between two sparkrun binaries; None if one failed.
+
+        Two identical failures are no evidence that the launch is the same.
+        """
+        different = []
+        for engine, current in current_records().items():
+            for model in current.recipes:
+                recipe = realized(current, model)
+                if recipe is None:
+                    continue
+                before = self.dry_runner(old, current, model, recipe)
+                after = self.dry_runner(new, current, model, recipe)
+                if not (before.startswith(DRY_RUN_OK) and after.startswith(DRY_RUN_OK)):
+                    log.warning("dry run of %s %s failed:\n%s\n%s", engine.value, model, before, after)
+                    return None
+                if before != after:
+                    different.append(f"{engine.value} {model}")
+        return different
+
     def _plan(self, engine: Engine, source: VersionSource) -> None:
         plan = refresh.EnginePlan(
             engine=engine.value, repository=source.repository, publisher=source.publisher.value
@@ -1854,11 +1944,16 @@ class EngineWalk:
             return
         plan.tag = tag
         official = source.publisher is Publisher.OFFICIAL
-        has_current = link_target(versions_dir(engine)) is not None
-        mode = MeasureMode.CANDIDATE if has_current else MeasureMode.BOOTSTRAP
+        current = link_target(versions_dir(engine))
+        expected = current or self._bootstrapping.get(engine)  # what is `current` when the job runs
+        mode = MeasureMode.CANDIDATE if expected else MeasureMode.BOOTSTRAP
         plan.mode = mode.value
+        self._pull_current(engine, current)
         self._pull(engine, tag, source.publisher)
-        measure = self._measure(engine, tag, mode)
+        also = [expected] if expected and expected != current else []
+        measure = self._measure(engine, tag, mode, also_starts=also)
+        if official and mode is MeasureMode.BOOTSTRAP:
+            self._bootstrapping[engine] = tag
         if official:  # each approved file on what is then `current` (refused there unless this tag became it)
             for model in recipes_for(engine):
                 if model != MEASUREMENT_MODEL:
@@ -1889,6 +1984,14 @@ class EngineWalk:
             also_after=parents,
         )
 
+    def _pull_current(self, engine: Engine, current: str | None) -> None:
+        """Pull `current` again when its image is gone (a rollback): a candidate is compared with it."""
+        record = read_record(engine, current) if current else None
+        if record is None or record.pulled or not record.image or engine in self._current_pulls:
+            return
+        self._current_pulls.add(engine)
+        self._pull(engine, record.tag, record.publisher)
+
     def _pull(self, engine: Engine, tag: str, publisher: Publisher) -> JobSpec:
         return self._add(
             EngineJob.PULL,
@@ -1897,13 +2000,29 @@ class EngineWalk:
             lambda after: pull_argv(self.script, self.run, engine, tag, publisher, self.home, after),
         )
 
-    def _measure(self, engine: Engine, tag: str, mode: MeasureMode, model: str | None = None) -> JobSpec:
+    def _measure(
+        self,
+        engine: Engine,
+        tag: str,
+        mode: MeasureMode,
+        model: str | None = None,
+        *,
+        also_starts: Sequence[str] = (),
+    ) -> JobSpec:
         return self._add(
             EngineJob.MEASURE,
             engine,
             tag,
             lambda after: measure_job_argv(
-                self.script, self.run, engine, tag, mode, home=self.home, after=after, model=model
+                self.script,
+                self.run,
+                engine,
+                tag,
+                mode,
+                home=self.home,
+                after=after,
+                model=model,
+                also_starts=also_starts,
             ),
         )
 
@@ -1955,6 +2074,8 @@ def _line(  # noqa: PLR0911 - one line per outcome
     if verdict is None:
         return f"{who}: not measured: {result.not_measured or result.error or 'no verdict'}"
     community = plan.publisher == Publisher.COMMUNITY.value
+    if verdict.gate is GateVerdict.NOT_RUN:
+        return f"{who}: {verdict.reason} (offered again next run)"
     if result.mode is MeasureMode.BOOTSTRAP:
         if verdict.gate is GateVerdict.PASSED:
             return f"{who}: bootstrap passed: " + (
