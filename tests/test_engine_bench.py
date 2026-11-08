@@ -190,6 +190,22 @@ def test_a_failing_phase_is_recorded_as_not_measured(
     assert no_path.phases[Phase.TEACHER_FORCED].status is PhaseStatus.NOT_MEASURED
     assert "no teacher-forced scoring" in no_path.phases[Phase.TEACHER_FORCED].reason
 
+    def hung_benchy(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd, engine_bench.BENCHY_TIMEOUT_S)
+
+    folder, pins = prompts
+    hung = engine_bench.measure(
+        stub.url,
+        "vllm",
+        sizes=TINY,
+        prompts_folder=folder,
+        pins=pins,
+        runner=hung_benchy,
+        phases=[Phase.BENCHY],
+    )
+    assert hung.phases[Phase.BENCHY].status is PhaseStatus.NOT_MEASURED  # a timeout is a reason, not a crash
+    assert "TimeoutExpired" in hung.phases[Phase.BENCHY].reason
+
 
 def test_a_server_that_cannot_answer_skips_the_slow_phases(prompts: tuple[Path, PromptPins]) -> None:
     with StubEngine(fail_paths=("/v1/completions",)) as dead:

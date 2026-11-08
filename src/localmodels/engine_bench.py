@@ -12,8 +12,8 @@ response differ per engine.
 
 A phase that fails is recorded as not measured with its reason; ``measure`` never raises for a phase.
 
-Teacher-forced scoring, fields ASSUMED FROM DOCUMENTATION, NOT YET SEEN FROM A REAL ENGINE (E4's bootstrap run
-is where they meet one; a mismatch fails the phase and is recorded as such):
+Teacher-forced scoring, fields from documentation and source, NOT YET SEEN FROM A REAL ENGINE (E4's bootstrap
+run is where they meet one; a mismatch fails the phase and is recorded as such):
 
 - vLLM, ``POST /v1/completions`` with ``max_tokens: 1`` and ``prompt_logprobs: 1`` (docs.vllm.ai
   "OpenAI-Compatible Server", extra parameters). Response ``choices[0].prompt_logprobs``: a list with one
@@ -26,9 +26,9 @@ is where they meet one; a mismatch fails the phase and is recorded as such):
   ``return_logprob: true``, ``logprob_start_len: 0`` and ``top_logprobs_num: 1`` (docs.sglang.ai sampling
   parameters). Response ``meta_info.input_token_logprobs``: one ``[logprob, token_id, text]`` per prompt
   token, the first logprob ``null``; ``meta_info.input_top_logprobs``: per position a list of
-  ``[logprob, token_id, text]`` (the first position ``null`` or empty). The entry layout and the ``meta_info``
-  nesting are from memory of the documented examples, not from the parameter page the request fields come
-  from.
+  ``[logprob, token_id, text]`` (the first position ``null`` or empty). The entry layout is checked against
+  SGLang v0.5.23's source (``tokenizer_manager.py``, ``detokenize_logprob_tokens`` and
+  ``detokenize_top_logprobs_tokens``: ``(logprob, token_id, text or None)``, an empty position ``None``).
 
 Seen from a real file, not assumed: ``llama-benchy`` 0.4.0's JSON (``--format json --save-result``), read from
 sparkrun's run of 2026-11-08 (``benchmarks[].pp_throughput.mean`` and ``tg_throughput.mean`` in tokens per
@@ -47,6 +47,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -649,7 +650,7 @@ def parse_vllm_prompt_logprobs(response: dict[str, Any]) -> ChunkScores:
 
 
 def parse_sglang_input_logprobs(response: dict[str, Any]) -> ChunkScores:
-    """Read ``meta_info.input_token_logprobs`` and ``input_top_logprobs`` (assumed from documentation)."""
+    """Read ``meta_info.input_token_logprobs`` and ``input_top_logprobs`` (layout from SGLang's source)."""
     try:
         meta = response["meta_info"]
         own, top = meta["input_token_logprobs"], meta["input_top_logprobs"]
@@ -835,10 +836,13 @@ PHASE_ERRORS: Final = (
     PhaseError,
     PromptFileError,
     httpx.HTTPError,
+    subprocess.SubprocessError,  # llama-benchy past its timeout
     OSError,
     ValueError,
     KeyError,
     IndexError,
+    TypeError,  # a response of an unexpected shape
+    AttributeError,
 )
 
 
@@ -944,7 +948,7 @@ def measure(  # noqa: PLR0913 - one entry point; every argument is a distinct in
             engine=engine,
             model=served,
             url=base,
-            started=time.strftime("%Y-%m-%d %H:%M:%S"),
+            started=datetime.now(UTC).isoformat(timespec="seconds"),
             tiny=sizes is TINY,
             extra=extra,
             stamp=dict(stamp or {}),
