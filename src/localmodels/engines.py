@@ -781,13 +781,17 @@ def _image_references(record: VersionRecord, runner: Runner) -> list[str]:
     digest alone only drops that name: the image stays on disk under the tag (Docker 29.6.2, 2026-11-09:
     ``Untagged: <repo>@sha256:...`` and nothing deleted; job 2220's prune left vllm v0.33.0's 26.3 GB so).
     The tag goes too only while it still names this image, so a tag since moved to another is left alone.
+    While a container uses the image Docker removes neither name (checked on 29.6.2), so the digest the
+    record holds stays for the next prune to find.
     """
     tagged = f"{record.image.split('@', 1)[0]}:{record.tag}"
     image = _image_id(record.image, runner)
     if image is None:
         return [record.image]  # already gone (or unreadable): ``docker rmi`` says which
-    if _image_id(tagged, runner) != image:
-        log.info("prune %s: %s does not name this image (%s), so it stays", record.tag, tagged, image)
+    other = _image_id(tagged, runner)
+    if other != image:
+        names = "no image" if other is None else f"another image ({other})"
+        log.info("prune %s: %s names %s, so only the digest is removed", record.tag, tagged, names)
         return [record.image]
     return [record.image, tagged]
 
