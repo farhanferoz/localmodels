@@ -7,9 +7,11 @@ manager around one served engine and model:
    plus host-side peaks a run of that engine and model recorded; a D16 seed only for a bootstrap or refresh
    run. The run waits for memory to settle, then refuses a start whose need plus the host reserve exceeds
    available memory.
-2. Start: ``sparkrun run`` offline, telemetry off, labels ``lifecycle=ephemeral``, ``slurm-job=<id>``
-   (preflight's job wrapper counts the container's GPU memory) and ``localmodels.run=<uuid>``; the model's
-   Hub folder mounted read-only behind a per-run Hub root; the recipe validated (no hooks, no ``include``).
+2. Start: ``sparkrun run`` offline, telemetry off, with the user's own loopback login (``loopback``: its
+   steps that log in to this machine over SSH work unattended, whoever is logged in), labels
+   ``lifecycle=ephemeral``, ``slurm-job=<id>`` (preflight's job wrapper counts the container's GPU memory) and
+   ``localmodels.run=<uuid>``; the model's Hub folder mounted read-only behind a per-run Hub root; the recipe
+   validated (no hooks, no ``include``).
 3. Guard: ``launcher.kill_below_floor`` with a ``docker kill`` action; the post-load host-reserve check; the
    container's processes get the guards' OOM score.
 4. Stop on every exit it can catch (normal, exception, SIGTERM, chained to the caller's handler); the
@@ -31,6 +33,7 @@ import math
 import os
 import shutil
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -40,6 +43,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Self
 
+from . import loopback
 from .engines import (
     CONTAINER_ENGINES,
     VersionRecord,
@@ -63,7 +67,6 @@ from .process import ServerSpec
 from .stack import Engine
 
 if TYPE_CHECKING:
-    import subprocess
     import types
     from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
@@ -129,10 +132,27 @@ def sparkrun_env(hub_root: Path | None = None) -> dict[str, str]:
 
 
 def run_sparkrun(
-    binary: Path, args: Sequence[str], *, timeout: float, hub_root: Path | None = None
+    binary: Path,
+    args: Sequence[str],
+    *,
+    timeout: float,
+    hub_root: Path | None = None,
+    logs_in: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """One sparkrun call with telemetry off (and the per-run Hub root); never raises."""
-    return run_command([str(binary), *args], timeout=timeout, env=sparkrun_env(hub_root))
+    """One sparkrun call with telemetry off (and the per-run Hub root); never raises.
+
+    ``logs_in``: a container's start, stop or dry run, whose steps sparkrun may send over ``ssh localhost``;
+    it runs with the loopback login's ``ssh`` first on PATH, and a login that does not work is this call's
+    failure, its reason in stderr. The recipe realize and the telemetry switch dispatch locally (checked
+    2026-11-09: a realize with no agent and no allowed key succeeded), so they leave ``~/.ssh`` alone.
+    """
+    argv, env = [str(binary), *args], sparkrun_env(hub_root)
+    if logs_in:
+        try:
+            env = loopback.loopback_login().env(env)
+        except loopback.LoopbackLoginError as exc:
+            return subprocess.CompletedProcess(argv, 1, "", str(exc))
+    return run_command(argv, timeout=timeout, env=env)
 
 
 def ensure_sparkrun(tag: str, *, root: Path = SPARKRUN_ROOT, runner: Runner = docker_runner) -> Path:
@@ -275,6 +295,10 @@ class ContainerRun:
         problems = recipe_problems(self.recipe)
         if problems:
             raise ContainerStartError("; ".join(problems))
+        try:  # checked before memory is weighed, so a start that cannot log in costs nothing
+            loopback.loopback_login()
+        except loopback.LoopbackLoginError as exc:
+            raise ContainerStartError(str(exc)) from exc
 
     def _settle(self) -> float | None:
         """Wait up to ``SETTLE_LIMIT_S`` for available memory to stop rising (it comes back late)."""
@@ -361,7 +385,11 @@ class ContainerRun:
         self._start_guard()
         self._launched_at = time.time()
         done = run_sparkrun(
-            self.sparkrun, self._run_args(recipe, need), timeout=START_TIMEOUT_S, hub_root=self._run_root
+            self.sparkrun,
+            self._run_args(recipe, need),
+            timeout=START_TIMEOUT_S,
+            hub_root=self._run_root,
+            logs_in=True,
         )
         if done.returncode != 0 or self._killed:
             if done.returncode != 0:  # the cause is often well above the last lines: keep it all in the log
@@ -588,7 +616,9 @@ class ContainerRun:
         try:
             recipe = self._write_recipe(self._prepare_hub())
             args = [*(["-vvv"] if verbose else []), *self._run_args(recipe, self.need_gib()), "--dry-run"]
-            return run_sparkrun(self.sparkrun, args, timeout=STOP_TIMEOUT_S, hub_root=self._run_root)
+            return run_sparkrun(
+                self.sparkrun, args, timeout=STOP_TIMEOUT_S, hub_root=self._run_root, logs_in=True
+            )
         finally:
             self._remove_files()
 
@@ -610,6 +640,7 @@ class ContainerRun:
                 ["stop", str(self._recipe_file), "--tp", "1", "--hosts", "localhost"],
                 timeout=STOP_TIMEOUT_S,
                 hub_root=self._run_root,
+                logs_in=True,
             )
         for cid in self.container_ids():
             self.docker(["docker", "rm", "-f", cid])

@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING, ClassVar, Self
 
 import pytest
 
-from localmodels import container_run
+from localmodels import container_run, loopback
 from localmodels.container_run import ContainerRun, ContainerStartError, MemoryNeed, Reaper, RunKind
 from localmodels.engine_choice import ChoiceRule, EngineChoice
-from localmodels.engines import GateVerdict, Publisher, VersionRecord, write_record
+from localmodels.engines import RUNNER_NOT_FOUND, GateVerdict, Publisher, VersionRecord, write_record
 from localmodels.enums import DeviceType, ServingRole, WorkloadKind
 from localmodels.launcher import MemoryGuards, NotEnoughMemoryError, ServerStartError, kill_below_floor
 from localmodels.settings import ModelIdentity, Settings, SettingsAnswer, SettingsSource, SettingsStatus
@@ -26,6 +26,8 @@ from localmodels.stack import Engine
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from conftest import LoginDouble
 
 IMAGE = "lmsysorg/sglang@sha256:" + "cd" * 32
 MODEL = "nvidia/Qwen3-30B-A3B-NVFP4"
@@ -144,6 +146,29 @@ def test_a_start_is_refused_with_its_remedy(tmp_path: Path, monkeypatch: pytest.
     ):
         pass
     monkeypatch.setenv("SLURM_JOB_ID", "4242")
+
+    def no_login() -> None:
+        msg = "a login with localmodels' key failed (255: Permission denied)"
+        raise loopback.LoopbackLoginError(msg)
+
+    def weighed() -> float:
+        pytest.fail("memory was weighed before the login was checked")
+
+    monkeypatch.setattr(loopback, "loopback_login", no_login)
+    with (
+        pytest.raises(ContainerStartError, match="Permission denied"),
+        make_run(tmp_path, record(), docker, free_gib=weighed),
+    ):
+        pass
+    refused = container_run.run_sparkrun(tmp_path / "sparkrun", ["stop"], timeout=5, logs_in=True)
+    assert (refused.returncode, refused.stderr) == (
+        1,
+        "a login with localmodels' key failed (255: Permission denied)",
+    )
+    plain = container_run.run_sparkrun(
+        tmp_path / "absent", ["setup"], timeout=5
+    )  # a call that needs no login
+    assert plain.returncode == RUNNER_NOT_FOUND  # it ran (and found no binary) without asking for the login
     extra = record().model_copy(
         update={"results": [{"model": MODEL, "memory": {"fall_gib": 30.0, "new": 1}}]}
     )
@@ -153,8 +178,79 @@ def test_a_start_is_refused_with_its_remedy(tmp_path: Path, monkeypatch: pytest.
     assert seeded.need_gib() == container_run.SEED_NEED_GIB[Engine.SGLANG]
 
 
+def test_the_loopback_login_is_made_once_allowed_from_this_machine_only_and_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    answer = {"ssh": subprocess.CompletedProcess([], 0, "", "")}
+
+    def runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if argv[0] == "ssh-keygen":
+            return subprocess.run(argv, check=False, capture_output=True, text=True)  # noqa: S603 - a key in tmp
+        return answer["ssh"]
+
+    client = tmp_path / "client" / "ssh"  # stands in for OpenSSH's client: prints what it was given
+    client.parent.mkdir()
+    client.write_text('#!/bin/sh\necho "$@"\n', encoding="utf-8")
+    client.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{client.parent}{os.pathsep}{os.environ['PATH']}")
+    authorized = tmp_path / "home" / ".ssh" / "authorized_keys"
+    authorized.parent.mkdir(parents=True)
+    authorized.write_bytes(
+        b"ssh-ed25519 AAAAlaptop caf\xe9"
+    )  # someone's line: Latin-1, no newline at the end
+    key = tmp_path / "state" / "ssh" / loopback.KEY_NAME
+    login = loopback.LoopbackLogin(key=key, authorized_keys=authorized, runner=runner)
+    login.ensure()
+    login.ensure()  # the second changes nothing and checks again
+    public = login.public.read_text(encoding="utf-8").strip()
+    line = f'from="127.0.0.1,::1" {public}\n'.encode()
+    assert authorized.read_bytes() == b"ssh-ed25519 AAAAlaptop caf\xe9\n" + line
+    modes = [p.stat().st_mode & 0o777 for p in (authorized, key, key.parent, login.launcher)]
+    assert modes == [0o600, 0o600, 0o700, 0o700]
+    assert [c[0] for c in calls] == ["ssh-keygen", str(login.launcher), str(login.launcher)]
+    # the check and sparkrun's own ``ssh`` take the same launcher: this key alone, ahead of the user's config
+    given = subprocess.run(  # noqa: S603 - the launcher just written, in tmp_path
+        [str(login.launcher), "localhost", "true"], check=True, capture_output=True, text=True
+    )
+    assert given.stdout.split() == [
+        "-o",
+        "IdentityAgent=none",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        str(key),
+        "localhost",
+        "true",
+    ]
+    assert login.env({"PATH": "/usr/bin"})["PATH"] == f"{login.launcher.parent}{os.pathsep}/usr/bin"
+    # a public half lost in a copy is rebuilt; a commented-out copy of the line does not count as allowed
+    login.public.unlink()
+    authorized.write_bytes(b"# " + line)
+    login.ensure()
+    assert login.public.read_text(encoding="utf-8").split()[1] == public.split()[1]
+    assert authorized.read_bytes() == b"# " + line + line
+    # a key that is not this user's own private file, a public half that holds no key and a login that does
+    # not work are each refused with their remedy
+    key.chmod(0o644)
+    with pytest.raises(loopback.LoopbackLoginError, match="not this user's own private file"):
+        login.ensure()
+    key.chmod(0o600)
+    login.public.write_text("", encoding="utf-8")
+    with pytest.raises(loopback.LoopbackLoginError, match="holds no public key"):
+        login.ensure()
+    login.public.unlink()
+    answer["ssh"] = subprocess.CompletedProcess([], 255, "", "Permission denied (publickey)")
+    with pytest.raises(loopback.LoopbackLoginError, match=r"Permission denied.*authorized_keys"):
+        login.ensure()
+
+
 def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0915 - every stop path
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    no_real_loopback_login: LoginDouble,
 ) -> None:
     caplog.set_level(logging.INFO, logger="localmodels.container_run")
     docker = FakeDocker()
@@ -199,6 +295,7 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert " stop " in log[1]
     assert ["docker", "rm", "-f", "run0001"] in docker.calls
     assert not root.exists()
+    assert no_real_loopback_login.calls == 4  # two runs, each start and stop with the loopback login
     # sampled without a kill floor, and the cgroup's peak kept from before the container went
     assert run.memory() == MemoryNeed(fall_gib=0.0, host_peak_gib=2.0)
     # a dry run (the sparkrun move's check) launches nothing, leaves no file, and asks for -vvv when told:
@@ -208,6 +305,7 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert " -vvv run " in dry
     assert dry.endswith("--dry-run")
     assert not root.exists()
+    assert no_real_loopback_login.calls == 5  # the dry run too
 
     docker = FakeDocker()  # an interrupt during the start still stops what it began
     real_run = container_run.run_sparkrun

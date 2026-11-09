@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
 
 @pytest.fixture(autouse=True)
@@ -58,3 +58,25 @@ def container_engines_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("localmodels.engines.urllib_fetch", no_network)
     monkeypatch.setattr(engine_refresh, "list_sparkrun_tags", TagListing)
     monkeypatch.setattr(engine_refresh, "reap_leftovers", list)
+
+
+class LoginDouble:
+    """Stands in for the loopback login: changes nothing, counts the sparkrun calls that asked for it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def env(self, base: Mapping[str, str]) -> dict[str, str]:
+        self.calls += 1
+        return dict(base)
+
+
+@pytest.fixture(autouse=True)
+def no_real_loopback_login(monkeypatch: pytest.MonkeyPatch) -> LoginDouble:
+    """No test makes a key or changes the real ``~/.ssh/authorized_keys``; a test may read the double's count.
+
+    A test of ``LoopbackLogin`` itself builds one on temporary paths with a fake runner.
+    """
+    double = LoginDouble()
+    monkeypatch.setattr("localmodels.loopback.loopback_login", lambda: double)
+    return double
