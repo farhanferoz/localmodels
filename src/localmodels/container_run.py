@@ -106,6 +106,10 @@ RUNTIME_CACHE_SUBDIR: Final = (
 LAST_USED_MARKER: Final = ".sparkrun-last-used"  # touched in the run's cache leaf at every launch
 TUNING_SUBDIR: Final = "tuning"  # tuning/{sglang,vllm}.py: ``<cache>/tuning/<family>``
 ABSENT: Final = "absent"
+#: Where sparkrun's serve command writes the engine's own output inside the container (``dump_serve_log`` in
+#: ``runtimes/_cluster_ops.py``, v0.4.2); the container PID 1 is ``sleep infinity`` (``docker logs``: empty).
+SERVE_LOG: Final = "/tmp/sparkrun_serve.log"  # noqa: S108 - a path inside the container
+OUTPUT_TAIL_LINES: Final = 200
 #: The recipe's own names for the stamp's memory fraction and maximum sequences, by sparkrun runtime.
 MEMORY_FRACTION_KEYS: Final = ("gpu_memory_utilization", "free_gpu_memory_fraction")
 MAX_SEQUENCES_KEYS: Final = ("max_num_seqs", "max_batch_size")
@@ -374,6 +378,10 @@ class ContainerRun:
         try:  # from here on, whatever ends the start (an interrupt included) stops what it began
             self._start(need)
         except BaseException:
+            try:  # before the stop removes the container, and its words with it
+                self._save_output()
+            except Exception:  # its own failure must neither hide the start's nor skip the stop
+                log.exception("container run %s: reading the failed start's output failed", self.run_id)
             self.stop()
             raise
         return self
@@ -412,7 +420,31 @@ class ContainerRun:
         return [
             "run", str(recipe), "--tp", "1", "--hosts", "localhost", "--no-follow", "--offline",
             "--memory-limit", f"{math.ceil(need_gib)}G",  # docker --memory: binary units, the whole need
+            # sparkrun then skips its own removal after a failed start (runtimes/_cluster_ops.py, solo path),
+            # so ``stop`` can first read what the engine said (job 2220's left nothing); ``stop``, the reaper
+            # and the job's end still remove every container of the run
+            "--no-rm",
         ]  # fmt: skip
+
+    def _save_output(self) -> None:
+        """Log why this run's containers failed: Docker's state of each, the last lines of its serve log."""
+        found = self.container_ids()
+        if not found:
+            log.info("container run %s: no container to read output from", self.run_id)
+        for cid in found:
+            state = self.docker(["docker", "inspect", "--format", "{{json .State}}", cid])
+            log.error("container %s, state: %s%s", cid, state.stdout.strip(), state.stderr.strip()[:200])
+            copy = self.work_dir / f"localmodels-serve-{self.run_id}-{cid[:12]}.log"
+            got = self.docker(["docker", "cp", f"{cid}:{SERVE_LOG}", str(copy)])
+            try:
+                if got.returncode != 0 or not copy.is_file():
+                    log.error("container %s: no %s (%s)", cid, SERVE_LOG, got.stderr.strip()[:200])
+                    continue
+                lines = copy.read_text(encoding="utf-8", errors="replace").split("\n")  # not on tqdm's \r
+                tail = lines[-OUTPUT_TAIL_LINES:]
+                log.error("container %s, %s (last %d lines):\n%s", cid, SERVE_LOG, len(tail), "\n".join(tail))
+            finally:
+                copy.unlink(missing_ok=True)
 
     def _install_sigterm(self) -> None:
         if threading.current_thread() is not threading.main_thread():

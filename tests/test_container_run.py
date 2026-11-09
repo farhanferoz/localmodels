@@ -75,6 +75,12 @@ class FakeDocker:
             self.running.discard(cmd[-1])
         if cmd[1:3] == ["image", "inspect"]:
             return subprocess.CompletedProcess(cmd, 0 if cmd[3] in self.images else 1, "", "No such image")
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(
+                cmd, 0, '{"Status":"exited","ExitCode":137,"OOMKilled":true}', ""
+            )
+        if cmd[1] == "cp":  # the engine's serve log, copied out of the container
+            Path(cmd[3]).write_text("engine line 1\nCUDA error: out of memory\n", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
@@ -292,6 +298,7 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert log[0].startswith(f"{root} 1 run ")  # the per-run Hub root and telemetry off
     assert "--offline" in log[0]
     assert "--memory-limit 30G" in log[0]  # the whole need caps the container
+    assert "--no-rm" in log[0]  # a container that dies at start stays to be read
     assert " stop " in log[1]
     assert ["docker", "rm", "-f", "run0001"] in docker.calls
     assert not root.exists()
@@ -323,9 +330,29 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert not root.exists()
     blocked = tmp_path / "not-executable"  # a binary that cannot run is an exit status: the stop completes
     blocked.write_text("#!/bin/sh\n", encoding="utf-8")
-    with pytest.raises(ContainerStartError, match="exited 126"), make_run(tmp_path, record(), FakeDocker(),
+    failed = FakeDocker()
+    with pytest.raises(ContainerStartError, match="exited 126"), make_run(tmp_path, record(), failed,
                                                                           sparkrun=blocked):  # fmt: skip
         pass
+    # a failed start logs why its container failed, before the stop removes it
+    kinds = [c[1] for c in failed.calls if c[1] in {"inspect", "cp", "rm"}]
+    assert kinds[:3] == ["inspect", "cp", "rm"]
+    assert '"OOMKilled":true' in caplog.text
+    assert "CUDA error: out of memory" in caplog.text
+    assert not list(tmp_path.glob("localmodels-serve-*"))
+
+    class BrokenCopy(FakeDocker):
+        def __call__(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            if command[1] == "cp":
+                msg = "denied"
+                raise PermissionError(msg)
+            return super().__call__(command)
+
+    broken = BrokenCopy()  # reading the output fails: the start's own error stands, and the stop still runs
+    with pytest.raises(ContainerStartError, match="exited 126"), make_run(tmp_path, record(), broken,
+                                                                          sparkrun=blocked):  # fmt: skip
+        pass
+    assert ["docker", "rm", "-f", "run0001"] in broken.calls
 
     docker = FakeDocker()  # an exception in the block still stops it
     with pytest.raises(RuntimeError), make_run(tmp_path, record(), docker):
