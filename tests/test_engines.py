@@ -263,8 +263,12 @@ def test_prune_removes_only_what_the_keep_list_does_not_name(
     users = '[projects]\nstudy = "1.4.0rc3"\nlong = "1.2.0"\nfollower = "current"\n'
     (folder / "users.toml").write_text(users, encoding="utf-8")
     run: list[Sequence[str]] = []
+    moved = "repo/trtllm-1.4.0:1.4.0"  # the tag was pulled again since, for another image
 
     def docker(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "image":  # ``docker image inspect --format {{.Id}} <reference>``
+            image = "sha256:b" if command[-1] == moved else "sha256:a"
+            return subprocess.CompletedProcess(command, 0, f"{image}\n", "")
         run.append(command)
         busy = "1.0.0" in command[2]
         return subprocess.CompletedProcess(command, 1 if busy else 0, "", "daemon is busy" if busy else "")
@@ -280,7 +284,11 @@ def test_prune_removes_only_what_the_keep_list_does_not_name(
 
     report = prune(Engine.TRTLLM, pins=pins, runner=docker)
     assert sorted(item.split()[0] for item in report.removed) == ["1.3.0", "1.4.0"]
-    assert [c[:2] for c in run] == [["docker", "rmi"]] * 3
+    assert sorted(map(list, run)) == [  # with its tag: the digest alone untags and frees nothing
+        ["docker", "rmi", f"repo/trtllm-1.0.0@{DIGEST}", "repo/trtllm-1.0.0:1.0.0"],
+        ["docker", "rmi", f"repo/trtllm-1.3.0@{DIGEST}", "repo/trtllm-1.3.0:1.3.0"],
+        ["docker", "rmi", f"repo/trtllm-1.4.0@{DIGEST}"],  # its tag names another image now: left alone
+    ]
     assert len(report.failed) == 1
     assert report.failed[0].startswith("1.0.0")
     assert "daemon is busy" in report.failed[0]

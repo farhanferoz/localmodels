@@ -768,6 +768,30 @@ class PruneReport:
     failed: list[str]
 
 
+def _image_id(reference: str, runner: Runner) -> str | None:
+    """The local image ID ``reference`` names; None when Docker has no such image."""
+    done = runner(["docker", "image", "inspect", "--format", "{{.Id}}", reference])
+    return (done.stdout.strip() or None) if done.returncode == 0 else None
+
+
+def _image_references(record: VersionRecord, runner: Runner) -> list[str]:
+    """The names to remove for ``record``'s image: its digest, and its tag while that names the same image.
+
+    A pull by tag (the refresh's first pull) leaves the image under both names, and ``docker rmi`` of the
+    digest alone only drops that name: the image stays on disk under the tag (Docker 29.6.2, 2026-11-09:
+    ``Untagged: <repo>@sha256:...`` and nothing deleted; job 2220's prune left vllm v0.33.0's 26.3 GB so).
+    The tag goes too only while it still names this image, so a tag since moved to another is left alone.
+    """
+    tagged = f"{record.image.split('@', 1)[0]}:{record.tag}"
+    image = _image_id(record.image, runner)
+    if image is None:
+        return [record.image]  # already gone (or unreadable): ``docker rmi`` says which
+    if _image_id(tagged, runner) != image:
+        log.info("prune %s: %s does not name this image (%s), so it stays", record.tag, tagged, image)
+        return [record.image]
+    return [record.image, tagged]
+
+
 def prune(
     engine: Engine,
     *,
@@ -798,7 +822,7 @@ def prune(
         if dry_run:
             report.removed.append(label)
             continue
-        done = runner(["docker", "rmi", record.image])
+        done = runner(["docker", "rmi", *_image_references(record, runner)])
         if done.returncode == 0 or NO_SUCH_IMAGE in done.stderr:
             latest = read_model(folder / RECORD_FILE, VersionRecord) or record  # a job may have added results
             write_record(latest.model_copy(update={"pulled": False}))
