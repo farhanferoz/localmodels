@@ -29,6 +29,7 @@ from .bench import BenchError, BenchResult, run_bench
 from .catalogue import LicencePolicy, ModelCategory, ModelSpec
 from .download import NoCatalogueMatchError, choose_model, download_model
 from .enums import DeviceType, ModelSizeClass, PreflightVerdict
+from .hardware import is_rocm_device
 from .lease import DEFAULT_LEASE_DIR, GpuLease, LeaseRecord
 from .preflight import PreflightResult, preflight
 from .process import resolve_llama_server_bin
@@ -170,7 +171,7 @@ def refuse_cpu_only_build(*, backend: Backend, device: DeviceType, device_name: 
     if backend is not Backend.CPU or device is DeviceType.CPU:
         return None
     rebuild_flag = {
-        DeviceType.CUDA: "-DGGML_CUDA=ON",
+        DeviceType.CUDA: "-DGGML_HIP=ON" if is_rocm_device(device_name) else "-DGGML_CUDA=ON",
         DeviceType.MPS: "-DGGML_METAL=ON",
     }.get(device, "-DGGML_VULKAN=ON")
     return (
