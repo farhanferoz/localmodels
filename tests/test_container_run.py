@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar, Self
 
 import pytest
 
-from localmodels import container_run, loopback
+from localmodels import container_run, engine_refresh, loopback
 from localmodels.container_run import ContainerRun, ContainerStartError, MemoryNeed, Reaper, RunKind
 from localmodels.engine_choice import ChoiceRule, EngineChoice
 from localmodels.engines import RUNNER_NOT_FOUND, GateVerdict, Publisher, VersionRecord, write_record
@@ -276,8 +276,9 @@ def test_a_run_starts_offline_read_only_labelled_and_always_stops(  # noqa: PLR0
     assert Path(f"/proc/{inside.pid}/oom_score_adj").read_text(encoding="utf-8").strip() == "900"
     assert "OOM score 900 set on the container's 1 processes" in caplog.text  # the allow path is logged
     inside.wait()
-    with make_run(tmp_path, record(), docker) as run:
+    with make_run(tmp_path, record(), docker, recipe=engine_refresh.BASE_RECIPES[Engine.VLLM]) as run:
         body = json.loads(next(tmp_path.glob("localmodels-recipe-*.json")).read_text(encoding="utf-8"))
+        assert body["executor_config"]["entrypoint"] == ""  # vLLM's image would eat sparkrun's command
         real = tmp_path / "hf" / "hub" / "models--nvidia--Qwen3-30B-A3B-NVFP4"
         assert body["container"] == IMAGE
         assert body["model"] == MODEL

@@ -201,8 +201,14 @@ def _recipe(runtime: str, defaults: dict[str, Any], **more: Any) -> dict[str, An
 
 
 BASE_RECIPES: Final[Mapping[Engine, dict[str, Any]]] = {
+    # vllm/vllm-openai declares ENTRYPOINT ["vllm", "serve"], which takes the command sparkrun appends as its
+    # own flags, so the server never starts (sparkrun v0.4.2's own diagnosis, job 2264; it advises this key).
+    # The GB10 community image has no entrypoint, so clearing it changes nothing there. SGLang's and
+    # TensorRT-LLM's images use NVIDIA's pass-through entrypoint script and keep it (registry, 2026-11-09).
     Engine.VLLM: _recipe(
-        "vllm", {"max_num_seqs": 16, "gpu_memory_utilization": 0.30, "served_model_name": "qwen3"}
+        "vllm",
+        {"max_num_seqs": 16, "gpu_memory_utilization": 0.30, "served_model_name": "qwen3"},
+        executor_config={"entrypoint": ""},
     ),
     Engine.SGLANG: _recipe(
         "sglang",
