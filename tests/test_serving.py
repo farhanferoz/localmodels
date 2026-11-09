@@ -300,10 +300,7 @@ def test_unsupported_hardware_is_refused_in_plain_words_before_anything_starts()
     with pytest.raises(ServingError) as refused:
         require_device({DeviceType.CUDA}, cpu)
     assert refused.value.code == ServingErrorCode.NOT_IMPLEMENTED
-    assert (
-        refused.value.message
-        == "This model needs a CUDA GPU (NVIDIA, or AMD under ROCm); this machine has only a CPU (CPU)."
-    )
+    assert refused.value.message == "This model needs a CUDA or ROCm GPU; this machine has only a CPU (CPU)."
 
 
 def test_a_model_server_loads_neither_the_launcher_nor_its_http_client() -> None:

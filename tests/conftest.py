@@ -91,3 +91,7 @@ def no_real_amd_gpu(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytes
     empty = tmp_path_factory.mktemp("no-kfd")
     monkeypatch.setattr("localmodels.hardware._KFD_NODES", empty / "nodes")
     monkeypatch.setattr("localmodels.hardware._DRM", empty / "drm")
+    from localmodels import hardware  # noqa: PLC0415 — as the patches above, only when a test runs
+
+    hardware._driver_fusion.cache_clear()  # answers are kept per process; each test's GPUs are its own
+    hardware._rocm_runtime.cache_clear()

@@ -1,8 +1,12 @@
+import ctypes
+import errno
+import fcntl
 import os
+import struct
 import subprocess
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 import pytest
@@ -121,6 +125,7 @@ _UUID = "GPU-d58339d6-8445-9785-5864-0815072c0f9a"
         ("-1", None),
         ("NoDevFiles", None),
         ("0,0", None),
+        ("9" * 5000, None),  # past Python's digit limit for int(): no GPU, never a ValueError
         ("0abc", "0"),
         ("2,-1", "2"),
         (_UUID, _UUID),
@@ -329,6 +334,7 @@ def fake_rocm(root, monkeypatch, *gpus: FakeAmdGpu, kfd_access: bool = True, run
             ("mem_info_vram_used", gpu.vram_used_gib),
         ):
             (dev / name).write_text(f"{int(gib * _GIB_BYTES)}\n")
+    hw_mod._driver_fusion.cache_clear()  # kept per process; this tree is new
     kfd = root / "kfd"
     kfd.write_text("")
     kfd.chmod(0o600 if kfd_access else 0o000)
@@ -406,12 +412,42 @@ def test_a_gpu_the_driver_does_not_vouch_for_is_taken_as_discrete(tmp_path, monk
     assert inspect_hardware().total_memory_gb == 1.0  # its VRAM: never the GTT limit on a guess
 
 
-def test_a_gpu_this_process_cannot_open_is_left_out_and_the_next_takes_its_number(
-    tmp_path, monkeypatch
-) -> None:
-    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(openable=False), FakeAmdGpu(fusion=False, vram_gib=16.0))
-    assert _visible() == [129]
+def test_a_missing_render_node_is_left_out_and_a_refused_one_leaves_no_gpu(tmp_path, monkeypatch) -> None:
+    fake_rocm(
+        tmp_path / "a", monkeypatch, FakeAmdGpu(openable=False), FakeAmdGpu(fusion=False, vram_gib=16.0)
+    )
+    assert _visible() == [129]  # ENOENT: the thunk skips the GPU and the next takes its number
     assert inspect_hardware().total_memory_gb == 16.0
+    if os.geteuid() != 0:  # root opens a mode-000 file anyway
+        fake_rocm(tmp_path / "b", monkeypatch, FakeAmdGpu(), FakeAmdGpu(fusion=False, vram_gib=16.0))
+        (tmp_path / "b" / "dri" / "renderD128").chmod(0o000)
+        assert _visible() == []  # EACCES fails the thunk's whole topology
+    fake_rocm(tmp_path / "c", monkeypatch, FakeAmdGpu(), FakeAmdGpu(fusion=False, vram_gib=16.0))
+    real_open = os.open
+
+    def refused_by_cgroup(path, *args, **kwargs):
+        if Path(path).name == "renderD128":
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(hw_mod.os, "open", refused_by_cgroup)
+    assert _visible() == [129]  # EPERM (a device cgroup): skipped, as ENOENT is
+    monkeypatch.setattr(hw_mod.os, "open", real_open)
+    nodes = tmp_path / "c" / "nodes" / "1" / "properties"
+    nodes.write_text(nodes.read_text().replace("drm_render_minor 128", "drm_render_minor 0"))
+    assert _visible() == []  # a GPU without a render node fails the thunk's whole topology
+
+
+def test_the_driver_is_asked_once_and_a_node_that_appears_later_is_found(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(openable=False))
+    assert _visible() == []
+    (tmp_path / "dri" / "renderD128").write_text(f"{0x1586} 1")  # the node appears (a late udev rule)
+    asked = []
+    answer = hw_mod._amdgpu_dev_info
+    monkeypatch.setattr(hw_mod, "_amdgpu_dev_info", lambda fd: asked.append(fd) or answer(fd))
+    assert _visible() == [128]
+    assert _visible() == [128]
+    assert len(asked) == 1  # opening again would wake a runtime-suspended card
 
 
 def test_no_access_to_kfd_or_no_rocm_runtime_means_cpu(tmp_path, monkeypatch) -> None:
@@ -426,6 +462,8 @@ def test_no_access_to_kfd_or_no_rocm_runtime_means_cpu(tmp_path, monkeypatch) ->
 def test_no_kfd_means_no_amd_gpu(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(hw_mod, "_KFD_NODES", tmp_path / "absent")
     assert hw_mod._amd_gpus() == []
+    (tmp_path / "properties").write_bytes(b"simd_count \xff\n")
+    assert hw_mod._kfd_properties(tmp_path) == {}  # not what a kernel prints, and not an exception either
 
 
 def test_the_ordinal_picks_the_gpu(tmp_path, monkeypatch) -> None:
@@ -474,6 +512,9 @@ _TWO = (FakeAmdGpu(unique_id=_UID[0]), FakeAmdGpu(unique_id=_UID[1]))
         ("0,0,1", [128]),  # a repeat ends the list
         ("0,5,1", [128]),  # so does an index past the last GPU
         ("0,1,junk", [128, 129]),  # entries past the number of GPUs are not read
+        ("0,,1", []),  # an empty entry among those read: ROCr's parse throws, so no GPU
+        ("0, ,1", []),
+        ("9" * 5000, []),  # past Python's digit limit for int()
         (f"GPU-{_UID[1]:016x}"[:20], [129]),  # a UUID prefix, any case
         ("GPU-4B2C", []),  # a prefix of both UUIDs names neither
         ("GPU-", []),  # shorter than five characters
@@ -500,6 +541,7 @@ def test_rocr_visible_devices_follows_rocr(tmp_path, monkeypatch, value, seen) -
         ("+1", None, []),
         ("0abc", None, []),
         ("0,x,1", None, [128]),  # the first bad entry ends the list
+        ("9" * 5000, None, []),  # past Python's digit limit for int()
         ('"1"', None, [129]),  # HIP's flags drop surrounding double quotes
         (f"GPU-{_UID[1]:016x}", None, [129]),
         (f"{_UID[1]:016x}"[-8:], None, []),  # a piece of a UUID without "GPU-" is read as an index
@@ -606,30 +648,65 @@ def test_a_rocm_runtime_is_found_where_rocm_puts_it(tmp_path, monkeypatch) -> No
             raise hw_mod.importlib.metadata.PackageNotFoundError(dist)
         return versions[dist]
 
+    def files(dist: str) -> list[PurePosixPath]:
+        if dist not in core_files:
+            raise hw_mod.importlib.metadata.PackageNotFoundError(dist)
+        return [PurePosixPath(name) for name in core_files[dist]]
+
+    def found() -> bool:  # the answer is kept per process; each step here is another environment
+        hw_mod._rocm_runtime.cache_clear()
+        return hw_mod._rocm_runtime()
+
+    core_files: dict[str, list[str]] = {}
     monkeypatch.setattr(hw_mod.importlib.metadata, "version", version)
+    monkeypatch.setattr(hw_mod.importlib.metadata, "files", files)
     monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "opt-rocm")
     monkeypatch.delenv("ROCM_PATH", raising=False)
     monkeypatch.setattr(hw_mod.ctypes.util, "find_library", lambda _: None)
-    assert not hw_mod._rocm_runtime()
+    assert not found()
     versions["torch"] = "2.14.0+cu130"
-    assert not hw_mod._rocm_runtime()
+    assert not found()
     versions["torch"] = "2.14.0+rocm10.1.0"
-    assert hw_mod._rocm_runtime()
+    assert found()
     versions.clear()
-    versions["rocm-sdk-core"] = "10.1.0"
-    assert hw_mod._rocm_runtime()
-    versions.clear()
+    core_files["rocm-sdk-core"] = ["rocm_sdk_core-0.1.0.dist-info/METADATA"]  # PyPI's empty placeholder
+    assert not found()
+    core_files["rocm-sdk-core"].append("_rocm_sdk_core/lib/libamdhip64.so.7")  # TheRock's
+    assert found()
+    core_files.clear()
     lib = tmp_path / "rocm" / "lib"
     lib.mkdir(parents=True)
     (lib / "libamdhip64.so.7").write_text("")
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
-    assert hw_mod._rocm_runtime()
+    assert found()
     monkeypatch.delenv("ROCM_PATH")
     monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "rocm")
-    assert hw_mod._rocm_runtime()
+    assert found()
     monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "opt-rocm")
-    monkeypatch.setattr(hw_mod.ctypes.util, "find_library", lambda _: "libamdhip64.so.6")
+    searched: list[str] = []
+    monkeypatch.setattr(
+        hw_mod.ctypes.util, "find_library", lambda name: searched.append(name) or "libamdhip64.so.6"
+    )
+    assert found()
     assert hw_mod._rocm_runtime()
+    assert searched == ["amdhip64"]  # kept: a miss runs ldconfig and gcc (~25 ms) on every call otherwise
+
+
+def test_the_driver_query_is_laid_out_as_amdgpu_drm_h(monkeypatch) -> None:
+    """CI has no AMD driver: the request and the reply offsets, against include/uapi/drm/amdgpu_drm.h."""
+
+    def ioctl(_fd: int, request: int, arg: bytes) -> bytes:
+        assert request == 0x40206445  # DRM_IOW(DRM_COMMAND_BASE 0x40 + DRM_AMDGPU_INFO 0x05), 32-byte struct
+        assert len(arg) == 32  # struct drm_amdgpu_info: return_pointer, return_size, query, 16-byte union
+        pointer, size, query = struct.unpack_from("<QII", arg)
+        assert query == 0x16  # AMDGPU_INFO_DEV_INFO
+        reply = (ctypes.c_char * size).from_address(pointer)
+        struct.pack_into("<I", reply, 0, 0x1586)  # drm_amdgpu_info_device.device_id
+        struct.pack_into("<Q", reply, 136, 0x1)  # .ids_flags: AMDGPU_IDS_FLAGS_FUSION
+        return arg
+
+    monkeypatch.setattr(fcntl, "ioctl", ioctl)
+    assert hw_mod._amdgpu_dev_info(-1) == (0x1586, 0x1)
 
 
 _REAL_KFD = Path("/sys/class/kfd/kfd/topology/nodes")

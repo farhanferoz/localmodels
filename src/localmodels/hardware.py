@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
+import functools
 import importlib.metadata
 import os
 import platform
@@ -81,7 +83,10 @@ def _cuda_gpu(ordinal: int) -> str | None:
             index = _CUDA_INDEX.match(entry)
             if index is None:
                 break
-            entry = str(int(index.group()))
+            number = _int_or_none(index.group())
+            if number is None:
+                break
+            entry = str(number)
         if entry in gpus:
             return None
         gpus.append(entry)
@@ -222,6 +227,10 @@ _DEV_INFO_BYTES = 1024  # room for the whole struct: the kernel writes the small
 _HIP_INDEX = re.compile(r"0|[1-9][0-9]*")  # HIP keeps an entry only when it is std::to_string of its value
 _STRTOL_INDEX = re.compile(r"[+-]?(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)")  # strtol(s, &end, 0), all of s
 _ROCR_UUID_CHARS = range(5, 21)  # ROCr reads a GPU-... entry of 5 to 20 characters
+# An open of a render node that fails with one of these leaves that GPU out (the thunk's
+# topology_sysfs_check_node_supported); any other failure, EACCES included, fails the thunk's whole topology.
+_SKIPPED_OPEN_ERRORS = frozenset({errno.ENOENT, errno.EPERM})
+_RENDER_MINORS = range(128, 256)  # the thunk fails its whole topology on a GPU outside these (fmm.c)
 
 
 def _nvidia_on_host() -> bool:
@@ -291,9 +300,18 @@ def _kfd_properties(node: Path) -> dict[str, int]:
             key, _, value = line.partition(" ")
             if value.strip().lstrip("-").isdigit():
                 props[key] = int(value)
-    except OSError:
-        pass
+    # ValueError: not ASCII, or not "name number" lines, neither of which the kernel prints
+    except (OSError, ValueError):
+        return {}
     return props
+
+
+def _int_or_none(digits: str, base: int = 10) -> int | None:
+    """``int(digits, base)``, or None where Python refuses it (decimal past the int_info digit limit)."""
+    try:
+        return int(digits, base)
+    except ValueError:
+        return None
 
 
 def _gfx_name(target_version: int) -> str:
@@ -318,17 +336,28 @@ def _amdgpu_dev_info(fd: int) -> tuple[int, int] | None:
 
 
 def _render_node_fusion(minor: int, device_id: int) -> bool | None:
-    """Open render node ``minor`` read-write, as ROCm does, and ask the driver whether the GPU is integrated.
+    """Whether the GPU on render node ``minor`` is integrated, asked as ROCm asks (``_driver_fusion``).
 
-    None when this process cannot open it (no such node, or no permission: outside the render and video
-    groups, a container started without /dev/dri), which is when the thunk leaves the GPU out. False when the
-    driver does not answer, or answers for another device than KFD's ``device_id``: a discrete card's figures
-    are its own VRAM, so an unknown never overstates.
+    None when the node is missing or the open is refused with EPERM (a device cgroup), which is when the thunk
+    leaves the GPU out. Any other failure to open (EACCES: outside the render group) raises OSError, as it
+    fails the thunk's whole topology. A failed open is not remembered, so a node that appears later is found.
     """
     try:
-        fd = os.open(_DRI / f"renderD{minor}", os.O_RDWR | os.O_CLOEXEC)
-    except OSError:
-        return None
+        return _driver_fusion(minor, device_id)
+    except OSError as error:
+        if error.errno in _SKIPPED_OPEN_ERRORS:
+            return None
+        raise
+
+
+@functools.cache  # fixed for the process's life, and each open would wake a runtime-suspended card
+def _driver_fusion(minor: int, device_id: int) -> bool:
+    """Open render node ``minor`` read-write and ask the driver; raises OSError when it cannot be opened.
+
+    False when the driver does not answer, or answers for another device than KFD's ``device_id``: a discrete
+    card's figures are its own VRAM, so an unknown never overstates.
+    """
+    fd = os.open(_DRI / f"renderD{minor}", os.O_RDWR | os.O_CLOEXEC)
     try:
         info = _amdgpu_dev_info(fd)
     finally:
@@ -336,20 +365,27 @@ def _render_node_fusion(minor: int, device_id: int) -> bool | None:
     return info is not None and info[0] == device_id and bool(info[1] & _AMDGPU_IDS_FLAGS_FUSION)
 
 
+@functools.cache  # fixed for the process's life; find_library runs ldconfig and gcc on a miss (~25 ms)
 def _rocm_runtime() -> bool:
     """Whether this environment has a ROCm runtime to run an AMD GPU with.
 
     KFD lists every GPU the amdgpu driver runs, with or without ROCm installed, so without this an AMD laptop
-    with ordinary PyTorch would be told "cuda". Found: TheRock's wheels (``rocm-sdk-core``, which carries
-    libamdhip64), a ROCm build of torch (its version ends ``+rocmX``; PyTorch's ROCm wheels bundle HIP), or a
-    system HIP runtime (``$ROCM_PATH``, /opt/rocm, or on the loader's path).
+    with ordinary PyTorch would be told "cuda". Found: TheRock's ``rocm-sdk-core`` when it carries libamdhip64
+    (PyPI's package of that name is an empty placeholder), a ROCm build of torch (its version ends ``+rocmX``;
+    PyTorch's ROCm wheels bundle HIP), or a system HIP runtime (``$ROCM_PATH``, /opt/rocm, or on the loader's
+    path).
     """
-    for dist, mark in (("rocm-sdk-core", ""), ("torch", "+rocm")):
-        try:
-            if mark in importlib.metadata.version(dist):
-                return True
-        except importlib.metadata.PackageNotFoundError:
-            pass
+    try:
+        if "+rocm" in importlib.metadata.version("torch"):
+            return True
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    try:
+        core = importlib.metadata.files("rocm-sdk-core") or []
+    except importlib.metadata.PackageNotFoundError:
+        core = []
+    if any(file.name.startswith("libamdhip64.so") for file in core):
+        return True
     roots = [Path(os.environ["ROCM_PATH"])] if os.environ.get("ROCM_PATH") else []
     if any(next((root / "lib").glob("libamdhip64.so*"), None) for root in [*roots, _ROCM_SYSTEM_ROOT]):
         return True
@@ -360,14 +396,15 @@ def _amd_gpus() -> list[_AmdGpu]:
     """The AMD GPUs ROCr enumerates for this process, in its order, before any visibility variable.
 
     Empty without KFD, without read-write access to /dev/kfd, or without a ROCm runtime (``_rocm_runtime``).
-    A GPU whose render node this process cannot open is left out, as the thunk leaves it out
-    (``topology_sysfs_check_node_supported``). Not checked: whether ROCr knows the GPU's ISA (it skips one it
-    does not) or whether the installed runtime has kernels for it; such a GPU is reported as an NVIDIA GPU
-    is whose compute capability the installed torch lacks.
+    A GPU whose render node is missing or refused with EPERM is left out, as the thunk leaves it out
+    (``topology_sysfs_check_node_supported``); any other refusal (EACCES), or a GPU without a render node,
+    leaves none, as it fails the thunk's whole topology. Not checked: whether ROCr knows the GPU's ISA (it
+    skips one it does not) or whether the installed runtime has kernels for it; such a GPU is reported the way
+    an NVIDIA GPU is reported when the installed torch lacks its compute capability.
     """
     try:
-        nodes = sorted((p for p in _KFD_NODES.iterdir() if p.name.isdigit()), key=lambda p: int(p.name))
-    except OSError:
+        nodes = sorted((p for p in _KFD_NODES.iterdir() if p.name.isdecimal()), key=lambda p: int(p.name))
+    except (OSError, ValueError):  # ValueError: a node name past int()'s digit limit, which KFD never makes
         return []
     found = [props for node in nodes if (props := _kfd_properties(node)).get("simd_count", 0) > 0]
     found = [props for props in found if props.get("vendor_id") == _AMD_PCI_VENDOR]
@@ -376,7 +413,12 @@ def _amd_gpus() -> list[_AmdGpu]:
     gpus = []
     for props in found:
         minor, device_id = props.get("drm_render_minor", 0), props.get("device_id", 0)
-        unified = _render_node_fusion(minor, device_id) if minor > 0 else None
+        if minor not in _RENDER_MINORS:
+            return []  # the thunk fails its whole topology on a GPU without a render node
+        try:
+            unified = _render_node_fusion(minor, device_id)
+        except OSError:
+            return []  # so does an open refused other than by ENOENT or EPERM
         if unified is not None:
             gpus.append(
                 _AmdGpu(
@@ -399,7 +441,8 @@ def _strtol_index(token: str) -> int | None:
         return None
     digits = token.lstrip("+-")
     base = 16 if digits[:2].lower() == "0x" else 8 if digits.startswith("0") else 10
-    return -int(digits, base) if token.startswith("-") else int(digits, base)
+    value = _int_or_none(digits, base)
+    return None if value is None else -value if token.startswith("-") else value
 
 
 def _rocr_visible(gpus: list[_AmdGpu]) -> list[_AmdGpu]:
@@ -408,7 +451,8 @@ def _rocr_visible(gpus: list[_AmdGpu]) -> list[_AmdGpu]:
     Unset: every GPU. Set, even empty: only those it names, in its order, so "" hides them all. Entries are
     trimmed and upper-cased; one is an index read by ``strtol`` in base 0 that must use the whole entry, or a
     ``GPU-`` prefix (5 to 20 characters) of exactly one GPU's ``GPU-%016X`` UUID. The first entry that is
-    invalid, out of range or repeated ends the list; entries past the number of GPUs are not read.
+    invalid, out of range or repeated ends the list; entries past the number of GPUs are not read. An empty
+    entry among those read ("0,,1") hides every GPU: ROCr's parse throws on it (``token.at(0)``).
     """
     value = os.environ.get("ROCR_VISIBLE_DEVICES")
     if value is None:
@@ -418,6 +462,8 @@ def _rocr_visible(gpus: list[_AmdGpu]) -> list[_AmdGpu]:
     picked: list[int] = []
     for raw in entries[: len(gpus)] if value else []:
         entry = raw.strip().upper()
+        if not entry:
+            return []
         if entry.startswith("G"):
             fits = len(entry) in _ROCR_UUID_CHARS
             named = [i for i, uuid in enumerate(uuids) if fits and uuid.startswith(entry)]
@@ -463,10 +509,11 @@ def _hip_visible(gpus: list[_AmdGpu]) -> list[_AmdGpu]:
         entry = raw
         if "GPU-" in entry:
             entry = next((str(i) for i, uuid in enumerate(uuids) if entry in uuid), entry)
-        if not _HIP_INDEX.fullmatch(entry) or int(entry) >= len(gpus):
+        index = _int_or_none(entry) if _HIP_INDEX.fullmatch(entry) else None
+        if index is None or index >= len(gpus):
             break
-        if int(entry) not in picked:
-            picked.append(int(entry))
+        if index not in picked:
+            picked.append(index)
     return [gpus[i] for i in picked]
 
 
