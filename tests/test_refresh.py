@@ -720,6 +720,7 @@ class Fleet:
         self.by_start: dict[int, dict[str, Any]] = {}  # start number -> erun() keywords
         self.by_tag: dict[str, dict[str, Any]] = {}
         self.removed: list[str] = []
+        self.tokenizers: set[str] = set()
         self.number = -1
 
     def harness(self) -> engine_refresh.Harness:
@@ -738,8 +739,9 @@ class Fleet:
             raise ContainerStartError(msg)
         return Refused(number) if number in self.refuse_on else Served(self, record.tag)
 
-    def measure(self, url, engine, *, stamp, startup_s, phases):
+    def measure(self, url, engine, *, stamp, startup_s, phases, tokenizer):
         self.number += 1
+        self.tokenizers.add(tokenizer)
         return erun(
             **{**self.by_tag.get(stamp["tag"], {}), **self.by_start.get(self.number, {}), "phases": phases}
         )
@@ -790,6 +792,7 @@ def test_a_candidate_is_measured_interleaved_judged_and_switched_only_on_a_pass(
     assert results[1]["complete"] is True
     assert results[1]["gpu_peak_gib"] == 20.0
     assert set(recorded.steps.values()) == {"ok"}
+    assert fleet.tokenizers == {MODEL}  # llama-benchy counts the model's own tokens, never the served name's
     assert fleet.removed == [image_of(Engine.VLLM, "v0.33.0")]  # a candidate that is not current goes at once
 
     write_model(engine_refresh.limits_path(Engine.VLLM), limits())  # calibrated
@@ -1309,10 +1312,21 @@ def pull_job(world: World, tmp_path: Path, docker: Docker, **kw: Any) -> engine_
 
 
 def test_the_pull_job_records_the_digest_and_realized_recipes_and_a_failed_pull_is_a_tried_tag(
-    world: World, tmp_path: Path
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    installs: list[str] = []
+
+    def install() -> list[Path]:
+        installs.append("install")
+        if len(installs) > 1:
+            msg = "cannot read the D16 inputs"
+            raise engine_bench.PromptFileError(msg)
+        return []
+
+    monkeypatch.setattr(engine_bench, "install_prompts", install)
     docker = Docker()
     assert pull_job(world, tmp_path, docker).execute() == 0
+    assert installs == ["install"]  # the prompts were missing: installed on the CPU, before any GPU start
     record = read_record(Engine.VLLM, "v0.33.0")
     assert record is not None
     assert (record.pulled, record.image, record.sparkrun_version) == (True, f"repo/vllm@{DIGEST}", "v0.4.2")
@@ -1332,7 +1346,8 @@ def test_the_pull_job_records_the_digest_and_realized_recipes_and_a_failed_pull_
         free_bytes=lambda _p: 10**12,
         tools=failing,
     )
-    assert job.execute() == 0  # exit 0 whatever the outcome: the chain goes on
+    assert job.execute() == 0  # exit 0 whatever the outcome (a refused prompt install too): the chain goes on
+    assert len(installs) == 2
     tried = read_record(Engine.VLLM, "v0.35.0")
     assert tried is not None
     assert (tried.pulled, tried.image) == (False, "")

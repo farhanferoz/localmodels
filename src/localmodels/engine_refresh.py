@@ -777,6 +777,7 @@ class JobRunner:
                     stamp=served.stamp(),
                     startup_s=startup,
                     phases=tuple(phases),
+                    tokenizer=model,  # the Hub name: llama-benchy cannot load the served name's (slurm 2265)
                 )
         except (ServerStartError, OSError) as exc:
             self.stopped = f"{label}: {type(exc).__name__}: {exc}"
@@ -1622,7 +1623,24 @@ class PullJob:
             return EXIT_ERROR
         sys.stdout.write(f"pull {self.engine.value} {self.tag}: {problem or 'ok'}\n")
         self.fetch_tools()
+        self.ensure_prompts()
         return EXIT_OK
+
+    @staticmethod
+    def ensure_prompts() -> None:
+        """Install the pinned measuring prompts now when they are missing or changed, on the CPU.
+
+        Without them every phase but llama-benchy's fails after the GPU start (slurm 2265, where `engines
+        prompts install` had never been run). A refused install is only logged: the phases say what to do.
+        """
+        try:
+            engine_bench.load_prompts()
+        except engine_bench.PromptFileError as missing:
+            try:
+                for path in engine_bench.install_prompts():
+                    log.info("installed %s (%s)", path, missing)
+            except engine_bench.PromptFileError as exc:
+                log.warning("measuring prompts not installed: %s", exc)
 
     def fetch_tools(self) -> None:
         """Put the pinned llama-benchy in uv's cache now, on the CPU.
