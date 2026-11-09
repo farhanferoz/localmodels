@@ -3,6 +3,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -273,3 +274,385 @@ def test_gpu_process_memory_is_per_process_and_none_without_a_reading(monkeypatc
     assert after is not None
     assert after - before >= 200  # the reading follows the process, not a constant
     assert hw_mod.process_anon_mib(2**22 + 1) is None  # above the kernel's pid limit
+
+
+# --- AMD GPUs under ROCm ----------------------------------------------------------------------------------
+
+_GIB_BYTES = 1024**3
+_AMD_VARS = ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+_UID = (0x4B2C5E6F70810001, 0x4B2C5E6F70810002)  # two GPUs whose UUIDs share a prefix, as boards of a kind do
+
+
+class FakeAmdGpu(NamedTuple):
+    """One GPU of ``fake_rocm``. ``fusion`` None: the driver does not answer; ``openable`` False: no node."""
+
+    fusion: bool | None = True
+    vram_gib: float = 1.0
+    vram_used_gib: float = 0.0
+    gtt_gib: float = 109.0
+    gtt_used_gib: float = 0.0
+    unique_id: int = 0
+    device_id: int = 0x1586
+    gfx_target_version: int = 110501
+    openable: bool = True
+
+
+def fake_rocm(root, monkeypatch, *gpus: FakeAmdGpu, kfd_access: bool = True, runtime: bool = True) -> None:
+    """KFD, /dev and the driver's answers for ``gpus`` (default: one M5 APU), behind a CPU node 0.
+
+    KFD's local_mem_size is 0 for every GPU, as the kernel prints it, so only the driver's FUSION flag can
+    tell an APU from a discrete card. A render node file holds what the fake driver answers: device id and
+    flags.
+    """
+    gpus = gpus or (FakeAmdGpu(),)
+    nodes, drm, dri = root / "nodes", root / "drm", root / "dri"
+    (nodes / "0").mkdir(parents=True)
+    (nodes / "0" / "properties").write_text("simd_count 0\nvendor_id 0\ngpu_id 0\n")
+    dri.mkdir()
+    for i, gpu in enumerate(gpus, start=1):
+        minor = 127 + i
+        (nodes / str(i)).mkdir()
+        (nodes / str(i) / "properties").write_text(
+            f"simd_count 80\ngfx_target_version {gpu.gfx_target_version}\nvendor_id 4098\n"
+            f"device_id {gpu.device_id}\nlocal_mem_size 0\ndrm_render_minor {minor}\n"
+            f"unique_id {gpu.unique_id}\n"
+        )
+        if gpu.openable:
+            answer = "none" if gpu.fusion is None else f"{gpu.device_id} {int(gpu.fusion)}"
+            (dri / f"renderD{minor}").write_text(answer)
+        dev = drm / f"renderD{minor}" / "device"
+        dev.mkdir(parents=True)
+        for name, gib in (
+            ("mem_info_gtt_total", gpu.gtt_gib),
+            ("mem_info_gtt_used", gpu.gtt_used_gib),
+            ("mem_info_vram_total", gpu.vram_gib),
+            ("mem_info_vram_used", gpu.vram_used_gib),
+        ):
+            (dev / name).write_text(f"{int(gib * _GIB_BYTES)}\n")
+    kfd = root / "kfd"
+    kfd.write_text("")
+    kfd.chmod(0o600 if kfd_access else 0o000)
+
+    def dev_info(fd: int) -> tuple[int, int] | None:
+        words = os.pread(fd, 64, 0).decode().split()
+        return None if words == ["none"] else (int(words[0]), int(words[1]))
+
+    monkeypatch.setattr(hw_mod, "_KFD_NODES", nodes)
+    monkeypatch.setattr(hw_mod, "_DRM", drm)
+    monkeypatch.setattr(hw_mod, "_DRI", dri)
+    monkeypatch.setattr(hw_mod, "_KFD_DEVICE", kfd)
+    monkeypatch.setattr(hw_mod, "_amdgpu_dev_info", dev_info)
+    monkeypatch.setattr(hw_mod, "_rocm_runtime", lambda: runtime)
+    monkeypatch.setattr(hw_mod, "_cuda_memory_gb", lambda: None)  # no NVIDIA GPU
+    monkeypatch.setattr(hw_mod.shutil, "which", lambda _: None)
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    monkeypatch.setattr(hw_mod, "_system_memory_gb", lambda: 122.0)
+    for var in _AMD_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def _visible() -> list[int]:
+    """The render minors of the GPUs this process sees, in HIP's order."""
+    return [gpu.render_minor for i in range(4) if (gpu := hw_mod._amd_gpu(i)) is not None]
+
+
+def _meminfo_gib(tmp_path, gib: float) -> str:
+    path = tmp_path / "meminfo"
+    path.write_text(f"MemTotal: 134217728 kB\nMemAvailable: {int(gib * 1024**2)} kB\n")
+    return str(path)
+
+
+def test_the_real_paths_are_the_kernels(monkeypatch) -> None:
+    monkeypatch.undo()  # conftest's no_real_amd_gpu points them at an empty tree for every test
+    assert Path("/sys/class/kfd/kfd/topology/nodes") == hw_mod._KFD_NODES
+    assert Path("/dev/kfd") == hw_mod._KFD_DEVICE
+    assert Path("/dev/dri") == hw_mod._DRI
+    assert Path("/sys/class/drm") == hw_mod._DRM
+
+
+def test_gfx_name_follows_llvm_target_names() -> None:
+    assert hw_mod._gfx_name(110501) == "gfx1151"
+    assert hw_mod._gfx_name(90402) == "gfx942"
+    assert hw_mod._gfx_name(90010) == "gfx90a"
+
+
+def test_an_amd_apu_is_a_cuda_device_with_its_gtt_limit_as_memory(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    rep = inspect_hardware()
+    assert rep.device == DeviceType.CUDA
+    assert rep.device_name == "AMD GPU gfx1151 (1002:1586, ROCm)"
+    assert rep.total_memory_gb == 109.0
+    assert rep.tier == DeviceTier.FAST_ACCELERATED
+    assert rep.assumptions == []
+    assert resolve_device(None) == "cuda"
+    assert hw_mod.is_rocm_device(rep.device_name)
+
+
+def test_a_discrete_card_is_its_vram_though_kfd_reports_no_local_memory(tmp_path, monkeypatch) -> None:
+    """A 24 GiB card with 20 GiB in use on a 128 GiB host: 24 GiB with 4 GiB free, not the GTT limit."""
+    card = FakeAmdGpu(fusion=False, vram_gib=24.0, vram_used_gib=20.0, gtt_gib=62.0, device_id=0x744C)
+    fake_rocm(tmp_path, monkeypatch, card)
+    assert inspect_hardware().total_memory_gb == 24.0
+    got = hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 120))
+    assert got is not None
+    assert not got.unified
+    assert got.bytes == 4 * _GIB_BYTES
+
+
+@pytest.mark.parametrize("answer", ["none", "29772 1"])  # no answer; an answer for another device than KFD's
+def test_a_gpu_the_driver_does_not_vouch_for_is_taken_as_discrete(tmp_path, monkeypatch, answer) -> None:
+    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(vram_gib=1.0, gtt_gib=109.0))
+    (tmp_path / "dri" / "renderD128").write_text(answer)
+    assert inspect_hardware().total_memory_gb == 1.0  # its VRAM: never the GTT limit on a guess
+
+
+def test_a_gpu_this_process_cannot_open_is_left_out_and_the_next_takes_its_number(
+    tmp_path, monkeypatch
+) -> None:
+    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(openable=False), FakeAmdGpu(fusion=False, vram_gib=16.0))
+    assert _visible() == [129]
+    assert inspect_hardware().total_memory_gb == 16.0
+
+
+def test_no_access_to_kfd_or_no_rocm_runtime_means_cpu(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path / "a", monkeypatch, kfd_access=False)
+    if os.geteuid() != 0:  # root opens a mode-000 file anyway
+        assert inspect_hardware().device == DeviceType.CPU
+    fake_rocm(tmp_path / "b", monkeypatch, runtime=False)
+    assert inspect_hardware().device == DeviceType.CPU
+    assert hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 100)) is None
+
+
+def test_no_kfd_means_no_amd_gpu(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(hw_mod, "_KFD_NODES", tmp_path / "absent")
+    assert hw_mod._amd_gpus() == []
+
+
+def test_the_ordinal_picks_the_gpu(tmp_path, monkeypatch) -> None:
+    fake_rocm(
+        tmp_path,
+        monkeypatch,
+        FakeAmdGpu(fusion=False, vram_gib=24.0, vram_used_gib=4.0),
+        FakeAmdGpu(fusion=False, vram_gib=16.0, vram_used_gib=1.0),
+    )
+    meminfo = _meminfo_gib(tmp_path, 100)
+    free = [hw_mod.available_memory(f"cuda:{i}", meminfo) for i in range(3)]
+    assert [None if got is None else got.bytes for got in free] == [20 * _GIB_BYTES, 15 * _GIB_BYTES, None]
+
+
+def test_available_memory_on_an_amd_apu_is_capped_by_the_gtt_room(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(gtt_gib=109.0, gtt_used_gib=9.0))
+    got = hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 120))
+    assert got is not None
+    assert got.unified
+    assert got.bytes == 100 * _GIB_BYTES
+    assert "GTT" in got.source
+
+
+def test_available_memory_on_an_amd_apu_is_the_host_when_that_is_smaller(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    got = hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 10))
+    assert got is not None
+    assert got.bytes == 10 * _GIB_BYTES
+    assert "MemAvailable" in got.source
+
+
+_TWO = (FakeAmdGpu(unique_id=_UID[0]), FakeAmdGpu(unique_id=_UID[1]))
+
+
+@pytest.mark.parametrize(
+    ("value", "seen"),
+    [
+        (None, [128, 129]),
+        ("", []),  # set but empty: ROCr shows no GPU
+        ("1", [129]),
+        ("1,0", [129, 128]),
+        (" 1 ", [129]),  # entries are trimmed
+        ("0x1", [129]),  # strtol, base 0
+        ("01", [129]),  # octal
+        ("0abc", []),  # strtol must read the whole entry
+        ("0,0,1", [128]),  # a repeat ends the list
+        ("0,5,1", [128]),  # so does an index past the last GPU
+        ("0,1,junk", [128, 129]),  # entries past the number of GPUs are not read
+        (f"GPU-{_UID[1]:016x}"[:20], [129]),  # a UUID prefix, any case
+        ("GPU-4B2C", []),  # a prefix of both UUIDs names neither
+        ("GPU-", []),  # shorter than five characters
+    ],
+)
+def test_rocr_visible_devices_follows_rocr(tmp_path, monkeypatch, value, seen) -> None:
+    fake_rocm(tmp_path, monkeypatch, *_TWO)
+    if value is not None:
+        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", value)
+    assert _visible() == seen
+
+
+@pytest.mark.parametrize(
+    ("hip", "cuda", "seen"),
+    [
+        (None, None, [128, 129]),
+        ("", None, []),  # set but empty reads as " " in HIP's flags: no GPU (measured, HIP 7.16)
+        (None, "", []),
+        (" ", None, []),
+        ("1", None, [129]),
+        ("1,0", None, [129, 128]),
+        ("0,0,1", None, [128, 129]),  # a repeat is skipped, the list goes on
+        ("00", None, []),  # only the exact decimal index
+        ("+1", None, []),
+        ("0abc", None, []),
+        ("0,x,1", None, [128]),  # the first bad entry ends the list
+        ('"1"', None, [129]),  # HIP's flags drop surrounding double quotes
+        (f"GPU-{_UID[1]:016x}", None, [129]),
+        (f"{_UID[1]:016x}"[-8:], None, []),  # a piece of a UUID without "GPU-" is read as an index
+        (f"GPU-{_UID[1]:016X}", None, []),  # HIP's match is case-sensitive, its UUIDs lower-case
+        ("1", "0", [129]),  # HIP_VISIBLE_DEVICES wins; the two are never chained
+        (None, "1", [129]),
+        ("", "1", []),  # set, so HIP_VISIBLE_DEVICES still wins
+    ],
+)
+def test_hip_and_cuda_visible_devices_follow_hip(tmp_path, monkeypatch, hip, cuda, seen) -> None:
+    fake_rocm(tmp_path, monkeypatch, *_TWO)
+    for var, value in (("HIP_VISIBLE_DEVICES", hip), ("CUDA_VISIBLE_DEVICES", cuda)):
+        if value is not None:
+            monkeypatch.setenv(var, value)
+    assert _visible() == seen
+
+
+def test_a_repeat_ends_rocrs_list_where_hip_skips_it(tmp_path, monkeypatch) -> None:
+    fake_rocm(
+        tmp_path, monkeypatch, FakeAmdGpu(), FakeAmdGpu(), FakeAmdGpu()
+    )  # three, so "0,0,1" is read whole
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,0,1")
+    assert _visible() == [128]
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,0,1")
+    assert _visible() == [128, 129]
+
+
+def test_hip_numbers_what_rocr_left(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, *_TWO)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    assert _visible() == [129]
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    assert _visible() == []
+
+
+def test_a_cuda_override_on_an_amd_gpu_measures_it(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    rep = inspect_hardware("cuda:0")
+    assert rep.device_name.startswith("AMD GPU gfx1151")
+    assert rep.total_memory_gb == 109.0
+    assert rep.assumptions == []
+
+
+# --- a host with both vendors: "cuda" is NVIDIA's, and AMD never answers for it
+
+
+def test_nvidia_wins_on_a_host_with_both(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    _fake_cuda(monkeypatch, "NVIDIA RTX 4090, 24564\n")
+    monkeypatch.setattr(hw_mod, "_cuda_memory_gb", lambda: ("NVIDIA RTX 4090", 24.0))
+    assert inspect_hardware().device_name == "NVIDIA RTX 4090"
+    assert hw_mod._amd_gpu(0) is None
+
+
+def test_a_failing_nvidia_smi_is_not_replaced_by_the_amd_gpu(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    _fake_cuda(monkeypatch, "", run_raises=True)
+    monkeypatch.setattr(hw_mod, "_cuda_memory_gb", lambda: None)
+    assert inspect_hardware().device == DeviceType.CPU
+    assert hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 100)) is None
+
+
+def test_nvml_without_nvidia_smi_is_still_nvidia(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    nvml = types.SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetMemoryInfo=lambda _h: types.SimpleNamespace(free=7 * _GIB_BYTES),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    got = hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 100))
+    assert got is not None
+    assert got.bytes == 7 * _GIB_BYTES  # NVML's figure, not the AMD APU's
+
+
+def test_a_unified_nvidia_gpu_is_not_capped_by_an_amd_apus_gtt(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch, FakeAmdGpu(gtt_gib=20.0, gtt_used_gib=10.0))
+    _fake_cuda(monkeypatch, "[N/A]\n")  # a GB10: unified, no free figure of its own
+    got = hw_mod.available_memory("cuda", _meminfo_gib(tmp_path, 100))
+    assert got is not None
+    assert got.bytes == 100 * _GIB_BYTES
+
+
+def test_a_cuda_override_on_a_unified_nvidia_gpu_never_reports_the_amd_one(tmp_path, monkeypatch) -> None:
+    fake_rocm(tmp_path, monkeypatch)
+    _fake_cuda(monkeypatch, "NVIDIA GB10, [N/A]\n")
+    monkeypatch.setattr(hw_mod, "_cuda_memory_gb", lambda: ("NVIDIA GB10", None))
+    rep = inspect_hardware("cuda")
+    assert not rep.device_name.startswith("AMD")
+    assert rep.total_memory_gb == 122.0
+
+
+# --- the ROCm runtime and the driver query
+
+
+def test_a_rocm_runtime_is_found_where_rocm_puts_it(tmp_path, monkeypatch) -> None:
+    versions: dict[str, str] = {}
+
+    def version(dist: str) -> str:
+        if dist not in versions:
+            raise hw_mod.importlib.metadata.PackageNotFoundError(dist)
+        return versions[dist]
+
+    monkeypatch.setattr(hw_mod.importlib.metadata, "version", version)
+    monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "opt-rocm")
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.setattr(hw_mod.ctypes.util, "find_library", lambda _: None)
+    assert not hw_mod._rocm_runtime()
+    versions["torch"] = "2.14.0+cu130"
+    assert not hw_mod._rocm_runtime()
+    versions["torch"] = "2.14.0+rocm10.1.0"
+    assert hw_mod._rocm_runtime()
+    versions.clear()
+    versions["rocm-sdk-core"] = "10.1.0"
+    assert hw_mod._rocm_runtime()
+    versions.clear()
+    lib = tmp_path / "rocm" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libamdhip64.so.7").write_text("")
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
+    assert hw_mod._rocm_runtime()
+    monkeypatch.delenv("ROCM_PATH")
+    monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "rocm")
+    assert hw_mod._rocm_runtime()
+    monkeypatch.setattr(hw_mod, "_ROCM_SYSTEM_ROOT", tmp_path / "opt-rocm")
+    monkeypatch.setattr(hw_mod.ctypes.util, "find_library", lambda _: "libamdhip64.so.6")
+    assert hw_mod._rocm_runtime()
+
+
+_REAL_KFD = Path("/sys/class/kfd/kfd/topology/nodes")
+
+
+@pytest.mark.skipif(not Path("/dev/kfd").exists(), reason="needs an AMD GPU under KFD")
+def test_the_driver_query_answers_for_the_device_kfd_names() -> None:
+    """On real hardware: the ioctl's layout holds, device id for device id (the M5: 0x1586, integrated)."""
+    checked = 0
+    for node in sorted(p for p in _REAL_KFD.iterdir() if p.name.isdigit()):
+        props = hw_mod._kfd_properties(node)
+        if props.get("simd_count", 0) <= 0:
+            continue
+        try:
+            fd = os.open(f"/dev/dri/renderD{props['drm_render_minor']}", os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            info = hw_mod._amdgpu_dev_info(fd)
+        finally:
+            os.close(fd)
+        assert info is not None
+        assert info[0] == props["device_id"]
+        checked += 1
+    if not checked:
+        pytest.skip("no render node this process may open")

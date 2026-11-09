@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from localmodels.hardware import HardwareReport
 
 DEVICE_NAMES: Final = {
-    DeviceType.CUDA: "an NVIDIA GPU",
+    DeviceType.CUDA: "a CUDA GPU (NVIDIA, or AMD under ROCm)",
     DeviceType.MPS: "an Apple GPU",
     DeviceType.CPU: "only a CPU",
 }
