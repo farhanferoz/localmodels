@@ -124,7 +124,14 @@ def test_the_fingerprint_reads_the_host_files_and_says_unknown_for_a_missing_sou
     assert fingerprint(**absent, rocm_root=none)["rocm"] == UNKNOWN
     # a ROCm upgrade makes a record stale; a record from before the component, on a host without it, is not
     assert stale_components(amd, {**amd, "rocm": "7.2.0"}) == ["rocm: 7.1.0 -> 7.2.0"]
-    assert stale_components({k: v for k, v in gone.items() if k != "rocm"}, gone) == []
+    unknown = {**gone, "rocm": UNKNOWN}  # this host's own torch never decides the case
+    assert stale_components({k: v for k, v in unknown.items() if k != "rocm"}, unknown) == []
+
+    def unreadable(_name: str) -> str:
+        raise OSError("damaged dist-info")
+
+    monkeypatch.setattr(importlib.metadata, "version", unreadable)
+    assert fingerprint(**absent, rocm_root=none)["rocm"] == UNKNOWN  # never raises
 
 
 def test_the_build_commit_is_read_from_the_library_beside_the_binary(tmp_path: Path) -> None:

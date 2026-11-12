@@ -267,9 +267,9 @@ def _rocm_version(root: Path | None) -> str:
     if re.fullmatch(r"\d+(?:\.\d+)+", text):
         return text
     try:
-        torch = importlib.metadata.version("torch")
-    except importlib.metadata.PackageNotFoundError:
-        return UNKNOWN
+        torch = importlib.metadata.version("torch") or ""  # None or KeyError: metadata without a Version line
+    except (importlib.metadata.PackageNotFoundError, OSError, KeyError, ValueError):
+        return UNKNOWN  # an unreadable install is "unknown": the fingerprint never raises
     return torch.partition(ROCM_TORCH_MARK)[2] or UNKNOWN
 
 
