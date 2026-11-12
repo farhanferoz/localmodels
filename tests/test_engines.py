@@ -455,7 +455,8 @@ def test_approve_refuses_what_it_cannot_trust_and_stores_one_approval_per_projec
     assert register_approval(paired) is None
     labels = engine_refresh.same_client_targets()
     assert len(labels) == 3  # the fixed pair, q4 and q5
-    assert {g.filename for g in labels.values()} >= {"q4.gguf", "q5.gguf"}
+    assert {t.gguf.filename for t in labels.values()} >= {"q4.gguf", "q5.gguf"}
+    assert {t.tokenizer for t in labels.values()} == {engine_refresh.MEASUREMENT_MODEL, first.file_repository}
     approvals_path = state / "engines" / "approvals.json"
     approvals_path.write_text('{"schema": 1, "approvals": [{}]}', encoding="utf-8")
     assert register_approval(first) is not None  # a damaged store is reported and never replaced

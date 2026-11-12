@@ -1396,7 +1396,8 @@ def test_the_pull_job_pulls_the_digest_the_record_names_and_refuses_for_want_of_
 def test_the_same_client_job_measures_llama_cpp_once_per_build(world: World, fleet: Fleet) -> None:
     calls: list[Path] = []
 
-    def llama(binary: Path, model: Path, lease: Path) -> engine_bench.EngineRun:
+    def llama(binary: Path, model: Path, lease: Path, tokenizer: str) -> engine_bench.EngineRun:
+        assert tokenizer == MODEL  # the container file's Hub name: llama-benchy cannot read a GGUF's (2233)
         calls.append(model)
         return erun()
 

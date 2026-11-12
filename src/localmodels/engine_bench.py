@@ -76,6 +76,10 @@ BENCHY_WRITE_TOKENS: Final = 32
 BENCHY_RUNS: Final = 3
 # what llama-benchy 0.4.0 prints (corpus.py) when it cannot load the named tokenizer and counts with gpt2's
 BENCHY_GPT2_FALLBACK: Final = "Falling back to 'gpt2' tokenizer"
+# How llama-benchy 0.4.0 (client.py) prints a refused request: it still exits 0 and saves a result whose
+# throughput fields are null, so these lines are the only record of the server's answer (slurm 2226, 2230).
+BENCHY_FAILURE_PREFIXES: Final = ("HTTP ", "Warmup failed", "Coherence test FAILED")
+ERROR_TEXT_CHARS: Final = 600  # how much of a server's refusal a phase's reason keeps
 TF_TOP_K: Final = 1  # top tokens asked for per position
 VARIANT_STRIDE: Final = 7919  # a prime, so successive variants start far apart in the text
 
@@ -423,6 +427,8 @@ def stream_completion(target: Target, prompt: str, max_tokens: int, *, ignore_eo
     usage: dict[str, Any] = {}
     finish: str | None = None
     with target.client.stream("POST", "/v1/completions", json=body) as response:
+        if response.is_error:
+            response.read()  # the body says what the server refused; the phase's reason keeps it
         response.raise_for_status()
         for raw in response.iter_lines():
             line = raw.strip()
@@ -812,7 +818,15 @@ def phase_benchy(
             data = json.loads(result_file.read_text())
         except (OSError, ValueError) as exc:
             raise PhaseError(f"llama-benchy wrote no readable result: {exc}") from exc
-    return parse_benchy(data)
+    try:
+        return parse_benchy(data)
+    except PhaseError as exc:
+        lines = (x.strip() for x in (done.stdout or "").splitlines())
+        refused = [x for x in lines if x.startswith(BENCHY_FAILURE_PREFIXES)]
+        if not refused:
+            raise
+        said = " | ".join(dict.fromkeys(refused))[:ERROR_TEXT_CHARS]
+        raise PhaseError(f"{exc}; llama-benchy's requests failed: {said}") from exc
 
 
 # --- the run --------------------------------------------------------------------------------------
@@ -925,6 +939,8 @@ def _measure_phase(run: _Run, phase: Phase) -> None:
         data = run.run(phase)
     except PHASE_ERRORS as exc:
         reason = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, httpx.HTTPStatusError):  # the server's own words name the refused field
+            reason += f"\nserver said: {exc.response.text[:ERROR_TEXT_CHARS]}"
         log.warning("phase %s not measured: %s", phase.value, reason)
         run.record.phases[phase] = PhaseOutcome(
             status=PhaseStatus.NOT_MEASURED, reason=reason, seconds=time.perf_counter() - t0

@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, NamedTuple
 
 import httpx
 from pydantic import BaseModel, Field
@@ -630,8 +630,9 @@ class Harness:
     start: Callable[..., AbstractContextManager[Any]] = ContainerRun
     measure: Callable[..., EngineRun] = engine_bench.measure
     sparkrun: Callable[[str], Path] = ensure_sparkrun
-    #: llama.cpp's ``llama-server`` on the same client: (server binary, model file, lease folder) -> one run.
-    llama: Callable[[Path, Path, Path], EngineRun] | None = None
+    #: llama.cpp's ``llama-server`` on the same client:
+    #: (server binary, model file, lease folder, llama-benchy's tokenizer) -> one run.
+    llama: Callable[[Path, Path, Path, str], EngineRun] | None = None
     docker: engines.Runner = docker_runner  # ``docker rmi`` of the images a job leaves unkept
 
 
@@ -1252,18 +1253,30 @@ def same_client_record(commit: str, gguf: refresh.Model) -> EngineRun | None:
     return read_model(same_client_path(commit, gguf), engine_bench.EngineRun)
 
 
-def same_client_targets() -> dict[str, refresh.Model]:
+class SameClientTarget(NamedTuple):
+    """One llama.cpp file for the same-client job, and the Hub name of the container file it is set beside.
+
+    llama-benchy counts its prompt with that container file's tokenizer: it cannot load one from a GGUF path
+    (slurm 2233), and the same tokenizer gives llama.cpp the very prompt the container engines were given.
+    """
+
+    gguf: refresh.Model
+    tokenizer: str
+
+
+def same_client_targets() -> dict[str, SameClientTarget]:
     """The llama.cpp files measured on the container engines' client, by label.
 
     ``SAME_CLIENT_FILES`` (labelled by their container model) and each approval's GGUF: a chooser rule needs
     llama.cpp's figures for every file an approval pairs with a container file. Records are keyed by the
     llama.cpp file, so two approvals pairing one container file with different GGUFs never collide.
     """
-    targets = dict(SAME_CLIENT_FILES)
+    targets = {label: SameClientTarget(gguf, label) for label, gguf in SAME_CLIENT_FILES.items()}
     for approval in engines.read_approvals().approvals:
         gguf = refresh.Model(approval.gguf_repository, approval.gguf_revision, approval.gguf_file)
-        if gguf not in targets.values():
-            targets[f"{gguf.repository}@{gguf.revision}--{gguf.filename}"] = gguf
+        if all(gguf != t.gguf for t in targets.values()):
+            label = f"{gguf.repository}@{gguf.revision}--{gguf.filename}"
+            targets[label] = SameClientTarget(gguf, approval.file_repository)
     return targets
 
 
@@ -1275,7 +1288,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-async def _measure_llama(binary: Path, model_file: Path, lease_dir: Path) -> EngineRun:
+async def _measure_llama(binary: Path, model_file: Path, lease_dir: Path, tokenizer: str) -> EngineRun:
     async with httpx.AsyncClient(timeout=engine_bench.REQUEST_TIMEOUT_S) as http:
         port = _free_port()
         manager = LocalServerManager(
@@ -1304,14 +1317,15 @@ async def _measure_llama(binary: Path, model_file: Path, lease_dir: Path) -> Eng
                 },
                 startup_s=time.monotonic() - begun,
                 phases=SAME_CLIENT_PHASES,
+                tokenizer=tokenizer,
             )
         finally:
             await manager.stop()
 
 
-def measure_llama(binary: Path, model_file: Path, lease_dir: Path) -> EngineRun:
+def measure_llama(binary: Path, model_file: Path, lease_dir: Path, tokenizer: str) -> EngineRun:
     """Start ``llama-server`` on D16's layout inside the tune's guards and measure it (one run)."""
-    return asyncio.run(_measure_llama(binary, model_file, lease_dir))
+    return asyncio.run(_measure_llama(binary, model_file, lease_dir, tokenizer))
 
 
 class SameClientJob(JobRunner):
@@ -1339,7 +1353,7 @@ class SameClientJob(JobRunner):
         if commit is None:
             self.result.not_measured = "llama.cpp has no current build"
             return
-        for label, pin in same_client_targets().items():
+        for label, (pin, tokenizer) in same_client_targets().items():
             if same_client_record(commit, pin) is not None:
                 self.result.steps[label] = STEP_OK
                 continue
@@ -1349,7 +1363,7 @@ class SameClientJob(JobRunner):
                 continue
             try:
                 measured = (self.harness.llama or measure_llama)(
-                    current_server(base), file, self.folder / "lease"
+                    current_server(base), file, self.folder / "lease", tokenizer
                 )
             except (ServerStartError, httpx.HTTPError, OSError) as exc:
                 self.result.steps[label] = f"{NOT_MEASURED}{type(exc).__name__}: {exc}"
@@ -1913,7 +1927,7 @@ class EngineWalk:
                 self._plan(engine, source)
         commit = current_commit(llama_home(self.home))
         self.same_client = commit is not None and any(
-            same_client_record(commit, gguf) is None for gguf in same_client_targets().values()
+            same_client_record(commit, target.gguf) is None for target in same_client_targets().values()
         )
 
     @staticmethod

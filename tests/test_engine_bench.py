@@ -187,6 +187,7 @@ def test_a_failing_phase_is_recorded_as_not_measured(
     tf = record.phases[Phase.TEACHER_FORCED]
     assert (tf.status, record.teacher_forced) == (PhaseStatus.NOT_MEASURED, None)
     assert "400" in tf.reason
+    assert "stub failure" in tf.reason  # the server's own words, which name what it refused
     assert record.phases[Phase.DECODE].status is PhaseStatus.MEASURED  # the other phases are unaffected
 
     no_path = _measure(stub, prompts, "llama.cpp", phases=[Phase.TEACHER_FORCED])
@@ -215,6 +216,7 @@ def test_a_server_that_cannot_answer_skips_the_slow_phases(prompts: tuple[Path, 
         record = _measure(dead, prompts, "vllm", phases=[Phase.WARM, Phase.PREFILL, Phase.TEACHER_FORCED])
     assert {o.status for o in record.phases.values()} == {PhaseStatus.NOT_MEASURED}
     assert "warm-up request failed" in record.phases[Phase.PREFILL].reason
+    assert "stub failure" in record.phases[Phase.WARM].reason  # a streamed refusal keeps its body too
     unreachable = engine_bench.measure(
         "http://127.0.0.1:9", "vllm", sizes=TINY, phases=[Phase.WARM, Phase.DECODE]
     )
@@ -283,6 +285,15 @@ def test_benchy_command_is_pinned_and_its_json_read(tmp_path: Path) -> None:
         engine_bench.phase_benchy("http://h:1", "local-alias", gpt2_counted)
     with pytest.raises(PhaseError, match="not in the expected shape"):
         engine_bench.parse_benchy({"benchmarks": [{"concurrency": 4}]})
+
+    def refused(c: list[str]) -> subprocess.CompletedProcess[str]:  # exits 0, every request refused
+        nulls = {"concurrency": 1, "prompt_size": 2048, "response_size": 32, "pp_throughput": None}
+        Path(c[c.index("--save-result") + 1]).write_text(json.dumps({"benchmarks": [nulls]}))
+        said = 'Running coherence test...\nHTTP 400: {"detail": "bad field"}\n' * 2
+        return subprocess.CompletedProcess(c, 0, said, "")
+
+    with pytest.raises(PhaseError, match=r"requests failed: HTTP 400: \{\"detail\": \"bad field\"\}$"):
+        engine_bench.phase_benchy("http://h:1", "m", refused)  # the server's answer, once
 
 
 def test_command_line_measures_and_installs(
