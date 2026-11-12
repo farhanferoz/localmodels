@@ -3,7 +3,7 @@
 Also the settings types (``Settings`` and the statuses of an answer) that ``settings.py`` and a stamp share,
 so that ``stack`` never imports ``settings``.
 
-``fingerprint`` reads the host without starting CUDA (driver, CUDA, kernel, DGX OS, this package).
+``fingerprint`` reads the host without starting CUDA (driver, CUDA, ROCm, kernel, DGX OS, this package).
 ``llama_cpp_build`` reads the commit llama.cpp embeds in its own library without running it. ``ServerStamp``
 joins them with what a server was started with, so a result can say how it was made; a tune record keeps the
 fingerprint, and ``stale_components`` names what changed since. Imported on demand: ``import localmodels``
@@ -12,6 +12,8 @@ does not load this module.
 
 from __future__ import annotations
 
+import importlib.metadata
+import os
 import platform
 import re
 import shutil
@@ -24,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Final
 from pydantic import BaseModel, ConfigDict, Field
 
 from localmodels.enums import Precision  # noqa: TC001 - pydantic needs it at runtime
-from localmodels.hardware import _nvml_read
+from localmodels.hardware import _ROCM_SYSTEM_ROOT, _nvml_read
 from localmodels.pinned import PinnedFile  # noqa: TC001 - pydantic needs it at runtime
 from localmodels.version import package_version
 
@@ -33,6 +35,14 @@ if TYPE_CHECKING:
 
 UNKNOWN: Final = "unknown"
 NVIDIA_VERSION_FILE: Final = Path("/proc/driver/nvidia/version")
+# The kernel makes /sys/module/<name>/version only for a module that declares a version (kernel/module/main.c,
+# MODINFO_ATTR(version)): AMD's out-of-tree amdgpu-dkms does, the in-tree amdgpu does not (amdgpu_drv.c has
+# no MODULE_VERSION), and there the kernel component already names the driver.
+AMDGPU_VERSION_FILE: Final = Path("/sys/module/amdgpu/version")
+# rocm-core writes MAJOR.MINOR.PATCH[.POINT] to <install root>/.info/version (its CMakeLists.txt:122-131);
+# the root is $ROCM_PATH when set and not empty, else /opt/rocm (rocm_getpath.cpp:104-120, CMakeLists.txt:66).
+ROCM_VERSION_FILE: Final = Path(".info/version")
+ROCM_TORCH_MARK: Final = "+rocm"  # a ROCm build of torch: "2.9.1+rocm7.13.0a20260612"
 DGX_RELEASE_FILE: Final = Path("/etc/dgx-release")
 LLAMA_COMMIT_SYMBOL: Final = "LLAMA_COMMIT"
 LLAMA_COMMON_LIBRARY: Final = "libllama-common.so"
@@ -43,13 +53,20 @@ class Component(StrEnum):
 
     DRIVER = "driver"
     CUDA = "cuda"
+    ROCM = "rocm"
     KERNEL = "kernel"
     DGX_OS = "dgx_os"
     LOCALMODELS = "localmodels"
 
 
 #: A change in any of these can change what a model computes or how fast, so a record made before it is stale.
-STALE_COMPONENTS: Final = (Component.DRIVER, Component.CUDA, Component.KERNEL, Component.DGX_OS)
+STALE_COMPONENTS: Final = (
+    Component.DRIVER,
+    Component.CUDA,
+    Component.ROCM,
+    Component.KERNEL,
+    Component.DGX_OS,
+)
 
 
 class Engine(StrEnum):
@@ -234,11 +251,26 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _driver_version(version_file: Path) -> str:
-    """The driver version in /proc/driver/nvidia/version ("NVRM version: ... aarch64  580.173.02  ...")."""
+def _driver_version(version_file: Path, amdgpu_version_file: Path) -> str:
+    """NVIDIA's driver version ("NVRM version: ... aarch64  580.173.02  ..."), else out-of-tree amdgpu's."""
     text = _read_text(version_file)
     match = re.search(r"NVRM version:.*?\s(\d+(?:\.\d+)+)\s", text or "")
-    return match.group(1) if match else UNKNOWN
+    if match:
+        return match.group(1)
+    return (_read_text(amdgpu_version_file) or "").strip() or UNKNOWN
+
+
+def _rocm_version(root: Path | None) -> str:
+    """ROCm's release: rocm-core's version file under the install root, else that of a ROCm build of torch."""
+    root = root or Path(os.environ.get("ROCM_PATH") or _ROCM_SYSTEM_ROOT)
+    text = (_read_text(root / ROCM_VERSION_FILE) or "").strip()
+    if re.fullmatch(r"\d+(?:\.\d+)+", text):
+        return text
+    try:
+        torch = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return UNKNOWN
+    return torch.partition(ROCM_TORCH_MARK)[2] or UNKNOWN
 
 
 def _dgx_os_version(release_file: Path) -> str:
@@ -274,11 +306,18 @@ def fingerprint(
     nvidia_version_file: Path = NVIDIA_VERSION_FILE,
     dgx_release_file: Path = DGX_RELEASE_FILE,
     cuda_version: Callable[[], str] = _cuda_driver_version,
+    amdgpu_version_file: Path = AMDGPU_VERSION_FILE,
+    rocm_root: Path | None = None,
 ) -> dict[str, str]:
-    """The host's stack by component name (``Component``); "unknown" for a source that is missing."""
+    """The host's stack by component name (``Component``); "unknown" for a source that is missing.
+
+    A record made before a component existed lacks its key, which reads as "unknown", so on a host without
+    that component it is not stale.
+    """
     return {
-        Component.DRIVER.value: _driver_version(nvidia_version_file),
+        Component.DRIVER.value: _driver_version(nvidia_version_file, amdgpu_version_file),
         Component.CUDA.value: cuda_version(),
+        Component.ROCM.value: _rocm_version(rocm_root),
         Component.KERNEL.value: platform.release() or UNKNOWN,
         Component.DGX_OS.value: _dgx_os_version(dgx_release_file),
         Component.LOCALMODELS.value: package_version(),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import struct
 import subprocess
 import sys
@@ -28,12 +29,15 @@ from localmodels.stack import (
     SettingsStatus,
     fingerprint,
     llama_cpp_build,
+    stale_components,
 )
 from localmodels.version import package_version
 from tests.test_serving import ECHO, ECHO_ARGV, ECHO_ENV
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 NVIDIA_VERSION = (
     "NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  580.173.02  Release Build  (dvs-builder)\n"
@@ -89,7 +93,9 @@ def fake_llama_library(path: Path, commit: str, *, relocated: bool = True, machi
     return path
 
 
-def test_the_fingerprint_reads_the_host_files_and_says_unknown_for_a_missing_source(tmp_path: Path) -> None:
+def test_the_fingerprint_reads_the_host_files_and_says_unknown_for_a_missing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     driver, dgx = tmp_path / "version", tmp_path / "dgx-release"
     driver.write_text(NVIDIA_VERSION)
     dgx.write_text(DGX_RELEASE)
@@ -98,12 +104,27 @@ def test_the_fingerprint_reads_the_host_files_and_says_unknown_for_a_missing_sou
     assert found["localmodels"] == package_version()
     assert found["kernel"]
 
-    gone = fingerprint(
-        nvidia_version_file=tmp_path / "none",
-        dgx_release_file=tmp_path / "none",
-        cuda_version=lambda: UNKNOWN,
-    )
+    none = tmp_path / "none"
+    absent = {"nvidia_version_file": none, "dgx_release_file": none, "cuda_version": lambda: UNKNOWN}
+    gone = fingerprint(**absent, amdgpu_version_file=none, rocm_root=none)
     assert (gone["driver"], gone["cuda"], gone["dgx_os"]) == (UNKNOWN, UNKNOWN, UNKNOWN)
+
+    # an AMD host: an out-of-tree amdgpu's own version, rocm-core's version file, else a ROCm build of torch's
+    amdgpu, rocm = tmp_path / "amdgpu-version", tmp_path / "rocm"
+    amdgpu.write_text("6.14.14-2204008.24.04\n")
+    (rocm / ".info").mkdir(parents=True)
+    (rocm / ".info" / "version").write_text("7.1.0\n")
+    amd = fingerprint(**absent, amdgpu_version_file=amdgpu, rocm_root=rocm)
+    assert (amd["driver"], amd["rocm"]) == ("6.14.14-2204008.24.04", "7.1.0")
+    monkeypatch.setenv("ROCM_PATH", str(rocm))  # ROCm's own override of the install root
+    assert fingerprint(**absent)["rocm"] == "7.1.0"
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "2.9.1+rocm7.13.0a20260612")
+    assert fingerprint(**absent, rocm_root=none)["rocm"] == "7.13.0a20260612"
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "2.14.0+cu130")
+    assert fingerprint(**absent, rocm_root=none)["rocm"] == UNKNOWN
+    # a ROCm upgrade makes a record stale; a record from before the component, on a host without it, is not
+    assert stale_components(amd, {**amd, "rocm": "7.2.0"}) == ["rocm: 7.1.0 -> 7.2.0"]
+    assert stale_components({k: v for k, v in gone.items() if k != "rocm"}, gone) == []
 
 
 def test_the_build_commit_is_read_from_the_library_beside_the_binary(tmp_path: Path) -> None:
