@@ -289,11 +289,18 @@ def test_benchy_command_is_pinned_and_its_json_read(tmp_path: Path) -> None:
     def refused(c: list[str]) -> subprocess.CompletedProcess[str]:  # exits 0, every request refused
         nulls = {"concurrency": 1, "prompt_size": 2048, "response_size": 32, "pp_throughput": None}
         Path(c[c.index("--save-result") + 1]).write_text(json.dumps({"benchmarks": [nulls]}))
-        said = 'Running coherence test...\nHTTP 400: {"detail": "bad field"}\n' * 2
+        said = 'Running coherence test...\nHTTP 400: {\n  "detail": "bad field"\n}\n' * 2  # a body over lines
         return subprocess.CompletedProcess(c, 0, said, "")
 
-    with pytest.raises(PhaseError, match=r"requests failed: HTTP 400: \{\"detail\": \"bad field\"\}$"):
-        engine_bench.phase_benchy("http://h:1", "m", refused)  # the server's answer, once
+    whole = r'requests failed: HTTP 400: \{ \| "detail": "bad field" \| \} \| Running'
+    with pytest.raises(PhaseError, match=whole):
+        engine_bench.phase_benchy("http://h:1", "m", refused)  # the whole answer, each line once
+
+    def no_file(c: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(c, 0, "Warmup failed: HTTP 503: busy\n", "")
+
+    with pytest.raises(PhaseError, match=r"no readable result.*failed: Warmup failed: HTTP 503: busy$"):
+        engine_bench.phase_benchy("http://h:1", "m", no_file)
 
 
 def test_command_line_measures_and_installs(

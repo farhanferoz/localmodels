@@ -814,19 +814,25 @@ def phase_benchy(
                 "with gpt2's, so its prompt is not 2,048 of the model's tokens; "
                 "pass the model's Hub name as --tokenizer"
             )
+        refused = benchy_refusals(done.stdout or "")
+        said = f"; llama-benchy's requests failed: {refused}" if refused else ""
         try:
             data = json.loads(result_file.read_text())
         except (OSError, ValueError) as exc:
-            raise PhaseError(f"llama-benchy wrote no readable result: {exc}") from exc
+            raise PhaseError(f"llama-benchy wrote no readable result: {exc}{said}") from exc
     try:
         return parse_benchy(data)
     except PhaseError as exc:
-        lines = (x.strip() for x in (done.stdout or "").splitlines())
-        refused = [x for x in lines if x.startswith(BENCHY_FAILURE_PREFIXES)]
         if not refused:
             raise
-        said = " | ".join(dict.fromkeys(refused))[:ERROR_TEXT_CHARS]
-        raise PhaseError(f"{exc}; llama-benchy's requests failed: {said}") from exc
+        raise PhaseError(f"{exc}{said}") from exc
+
+
+def benchy_refusals(stdout: str) -> str:
+    """What llama-benchy printed from its first refused request on ("" if none): a body may span lines."""
+    lines = [x.strip() for x in stdout.splitlines() if x.strip()]
+    first = next((i for i, x in enumerate(lines) if x.startswith(BENCHY_FAILURE_PREFIXES)), None)
+    return "" if first is None else " | ".join(dict.fromkeys(lines[first:]))[:ERROR_TEXT_CHARS]
 
 
 # --- the run --------------------------------------------------------------------------------------
@@ -939,7 +945,7 @@ def _measure_phase(run: _Run, phase: Phase) -> None:
         data = run.run(phase)
     except PHASE_ERRORS as exc:
         reason = f"{type(exc).__name__}: {exc}"
-        if isinstance(exc, httpx.HTTPStatusError):  # the server's own words name the refused field
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.text.strip():  # names the refused field
             reason += f"\nserver said: {exc.response.text[:ERROR_TEXT_CHARS]}"
         log.warning("phase %s not measured: %s", phase.value, reason)
         run.record.phases[phase] = PhaseOutcome(
