@@ -98,6 +98,10 @@ _FIT_ROW_RE = re.compile(r"^(\S+) (\d+) (\d+) (\d+)\s*$", re.MULTILINE)
 _FIT_HOST_ROW = "Host"
 _FIT_PARAMS_TIMEOUT_S = 600.0
 _PAIR = 2  # a flag and its value
+#: slurm's ``--mem`` of the job this process runs in, in MB (slurm's MB are MiB); absent outside a job or with
+#: ``--mem-per-cpu``. On a GPU that shares the host's RAM the job's card memory counts against it too: the
+#: site's memory guard stops the job furthest over its ask (preflight D42/D44), whatever the machine has free.
+SLURM_MEM_ENV = "SLURM_MEM_PER_NODE"
 
 _FILE_FLAGS = ("-m", "--api-key-file", *DRAFT_MODEL_FLAGS)
 
@@ -236,6 +240,12 @@ def _launched_flags(args: list[str], *, cache_ram: bool, load_mode: bool) -> tup
     if load_mode and end >= _PAIR and args[end - _PAIR : end] == [LOAD_MODE_FLAGS[0], LOAD_MODE_MMAP]:
         end -= _PAIR
     return tuple(args[end:])
+
+
+def _job_ask_gib() -> float | None:
+    """The memory the slurm job running this process asked for, in GiB; None outside one (D30)."""
+    value = os.environ.get(SLURM_MEM_ENV, "").strip()
+    return int(value) / _MIB_PER_GIB if value.isdigit() and int(value) > 0 else None
 
 
 @dataclass(frozen=True)
@@ -763,7 +773,10 @@ class LocalServerManager:
         with them counted starts as before. One that does not, but fits without them, gets ``-lm mmap``.
         A caller's own load mode wins: ``mmap`` leaves them out of the need, any other counts them. A GPU
         with its own memory, a server without the GPU and a model with no host-side weights are unchanged.
-        A peak the tune measured counts only at the load mode of this start.
+        A peak the tune measured counts only at the load mode of this start. Inside a slurm job (its ``--mem``
+        in ``SLURM_MEM_PER_NODE``) a model that would hold more than the job asked for also gets ``-lm mmap``
+        when that fits: there the site's guard stops a job over its ask, however much the machine has free.
+        The ask never refuses a start by itself (D22's check is on available memory, as before).
         """
         if not (self.params.n_gpu_layers != 0 and _gpu_shares_host_ram() is True):
             projection = replace(projection, host_weights_gib=0.0)
@@ -778,7 +791,9 @@ class LocalServerManager:
                 )  # fmt: skip
             return self._need_gib(projection, mode), (), ""
         full = self._need_gib(projection, "")
-        if reserve is None or free is None or host <= 0 or full + reserve <= free:
+        ask = _job_ask_gib()  # in a slurm job the ask binds too: host and card count against it here
+        within_ask = ask is None or full <= ask
+        if reserve is None or free is None or host <= 0 or (full + reserve <= free and within_ask):
             return full, (), ""
         lean = self._need_gib(projection, LOAD_MODE_MMAP)
         if lean + reserve > free:
@@ -789,8 +804,8 @@ class LocalServerManager:
             return full, (), also
         log.info(
             "memory need: %.1f GiB with -lm mmap; %.1f GiB of host weights served from the page cache "
-            "(the model needs %.1f GiB with them in memory, %.1f GiB available)",
-            lean, host, full, free,
+            "(the model needs %.1f GiB with them in memory, %.1f GiB available%s)",
+            lean, host, full, free, "" if within_ask else f", over the job's {ask:.1f} GiB slurm ask",
         )  # fmt: skip
         return lean, (LOAD_MODE_FLAGS[0], LOAD_MODE_MMAP), ""
 

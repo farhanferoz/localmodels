@@ -378,6 +378,7 @@ class _CacheCase:
     fit_runs: int = 0
     refuses: str | None = None  # a pattern the refusal's message must match, when the start is refused
     peak: tuple[float, str] | None = None  # a tune's measured peak (GiB, load mode), when the answer has one
+    ask_mib: int | None = None  # the slurm job's --mem (SLURM_MEM_PER_NODE), when the start runs in one
 
 
 # D30: 60 GiB projected, 20 GiB of it host weights (the Host row's model column); the reserve is 10 GiB, so
@@ -432,6 +433,19 @@ _CACHE_CASES = [
             guards=_RESERVE, fit_output=_HOST_HEAVY, available=80, cap=("--cache-ram", "8192"), fit_runs=1
         ),
         id="fits-with-host-weights-no-mmap",
+    ),
+    # the machine has room (70 <= 80) but the slurm job asked for 55 GiB: over its ask with the host weights
+    # counted, so `-lm mmap` (preflight's guard stops a job over its ask, not one over the machine)
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=80,
+            ask_mib=55 * 1024,
+            cap=(*_MMAP, "--cache-ram", "8192"),
+            fit_runs=1,
+        ),
+        id="over-the-slurm-ask-mmap",
     ),
     # it does not fit with them (70 > 55) but fits without (50 <= 55): `-lm mmap`, cap from the 40 GiB need
     pytest.param(
@@ -540,6 +554,9 @@ async def test_the_prompt_cache_and_the_load_mode_follow_the_memory_the_model_le
     tmp_path: Path, calls: list[list[str]], monkeypatch: pytest.MonkeyPatch, case: _CacheCase
 ) -> None:
     monkeypatch.setattr(launcher, "_gpu_shares_host_ram", lambda: case.shares)
+    monkeypatch.delenv(launcher.SLURM_MEM_ENV, raising=False)  # a test run inside a slurm job keeps its own
+    if case.ask_mib is not None:
+        monkeypatch.setenv(launcher.SLURM_MEM_ENV, str(case.ask_mib))
     answer = _answer(
         spec=SpecType.NONE
     )  # an answer that adds no flag: adopting a server compares its arguments
