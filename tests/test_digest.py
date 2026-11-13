@@ -24,6 +24,7 @@ def isolated_llama_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     home = tmp_path_factory.mktemp("llama-home")
     monkeypatch.setenv("LOCALMODELS_LLAMA_HOME", str(home))
     monkeypatch.setenv("LOCALMODELS_REFRESH_DIR", str(home / "refresh"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(home / "hub"))  # an empty Hub cache, never this machine's
     return home
 
 
@@ -56,6 +57,8 @@ class FixtureNet:
 
     def get(self, url: str, *, browser: bool = False) -> str:
         assert browser or url != digest.FORUM_URL
+        if url not in self.pages:
+            raise ConnectionError(url)
         return self.pages[url]
 
     def head(self, url: str) -> dict[str, str]:
@@ -122,3 +125,42 @@ def test_note_lines_follow_the_format_the_rules_command_parses(tmp_path: Path) -
     assert d15.group("link") == "https://pypi.org/project/llama-cpp-python/0.3.36/"  # a page, not the API
     again = Context(net, SINCE, {"version": "0.3.36"})
     assert digest.check_llama_cpp_python(again) == []  # the same release is reported once
+
+
+def test_cached_models_reports_files_replaced_on_main_once_and_names_unanswered_repos(
+    isolated_llama_home: Path,
+) -> None:
+    old, kept, new = "a" * 64, "b" * 64, "c" * 64
+    snapshot = isolated_llama_home / "hub" / "models--unsloth--M-GGUF" / "snapshots" / ("1" * 40)
+    blobs = snapshot.parents[1] / "blobs"
+    (snapshot / "Q4").mkdir(parents=True)
+    blobs.mkdir()
+    for name, sha in (("Q4/m-00001-of-00002.gguf", old), ("Q4/m-00002-of-00002.gguf", kept)):
+        (blobs / sha).write_text("x")
+        (snapshot / name).symlink_to(Path("../../..") / "blobs" / sha)
+    (blobs / ("f" * 40)).write_text("readme")  # a small file's blob is named by its git hash: never compared
+    (snapshot / "README.md").symlink_to(Path("../..") / "blobs" / ("f" * 40))
+    gated = isolated_llama_home / "hub" / "models--google--gated" / "snapshots" / ("2" * 40)
+    gated.mkdir(parents=True)
+    converted = isolated_llama_home / "hub" / "models--facebook--opt" / "snapshots" / ("3" * 40)
+    converted.mkdir(parents=True)  # fetched from a conversion pull request only: never compared, never asked
+    (converted.parents[1] / "refs" / "pr").mkdir(parents=True)
+    (converted.parents[1] / "refs" / "pr" / "29").write_text("3" * 40)
+    net = FixtureNet()
+    siblings = [
+        {"rfilename": "README.md", "blobId": "e" * 40},
+        {"rfilename": "Q4/m-00001-of-00003.gguf", "lfs": {"sha256": new}},  # re-quantised: 3 parts now
+        {"rfilename": "Q4/m-00002-of-00002.gguf", "lfs": {"sha256": kept}},
+    ]
+    net.pages[digest.HF_MODEL_URL.format(repo="unsloth/M-GGUF")] = json.dumps(
+        {"sha": "9" * 40, "siblings": siblings}
+    )
+    ctx = Context(net, SINCE)
+    found = digest.check_cached_models(ctx)
+    replaced = "1 of the 2 large files on disk (snapshot 1111111) replaced or removed on main 9999999"
+    assert [f.text for f in found] == [
+        f"unsloth/M-GGUF: {replaced}, e.g. Q4/m-00001-of-00002.gguf",
+        "not checked, the Hub did not answer: google/gated (ConnectionError)",
+    ]
+    again = digest.check_cached_models(Context(net, SINCE, ctx.mem))
+    assert [f.text for f in again][:-1] == []  # the same state of main is reported once

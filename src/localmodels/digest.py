@@ -106,6 +106,9 @@ AWESOME_REPO = "bidual/awesome-dgx-spark"
 HF_ORGS = ("Qwen", "unsloth", "google", "microsoft", "openai", "nvidia", "ggml-org")
 HF_FAMILIES = re.compile(r"qwen|phi|gemma|gpt-oss|nemotron|glm|llama", re.IGNORECASE)
 HF_LIST_URL = "https://huggingface.co/api/models?author={org}&sort=lastModified&direction=-1&limit=20"
+HF_MODEL_URL = "https://huggingface.co/api/models/{repo}?blobs=true"  # each file with its LFS SHA-256
+HF_CACHE_PREFIX = "models--"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 HOST_UPGRADE_WORDS = re.compile(r"nvidia|cuda|dgx", re.IGNORECASE)
 DGX_RELEASE = "/etc/dgx-release"
 SPARK_TABLE = re.compile(r"DGX OS\s+([\d.]+)\s+NVIDIA GPU Driver\s+([\d.]+)\s+NVIDIA CUDA Toolkit\s+([\d.]+)")
@@ -113,7 +116,7 @@ TAGS = re.compile(r"<[^>]+>|\s+")
 
 
 class Source(StrEnum):
-    """The digest's sources: D1-D13 and D15 look outside, D14 is this host's own refresh run."""
+    """The digest's sources: D1-D13, D15 and D16 look outside, D14 is this host's own refresh run."""
 
     D1 = "D1"
     D2 = "D2"
@@ -130,6 +133,7 @@ class Source(StrEnum):
     D13 = "D13"
     D14 = "D14"
     D15 = "D15"
+    D16 = "D16"
 
 
 ALL_KINDS = tuple(WorkloadKind)
@@ -422,6 +426,78 @@ def check_models(ctx: Context) -> list[Finding]:
     return found
 
 
+def _cached_repos(hub: Path) -> dict[str, Path]:
+    """Each model repository in the Hub cache and its newest snapshot (by folder time): what is on disk.
+
+    A snapshot named only by a branch other than main (``refs/pr/N``: transformers fetches safetensors from a
+    conversion pull request) is left out: its files were never on main, so they cannot have left it.
+    """
+    repos = {}
+    for folder in sorted(hub.glob(f"{HF_CACHE_PREFIX}*")):
+        refs = folder / "refs"
+        side = {r.read_text().strip() for r in refs.rglob("*") if r.is_file() and r != refs / "main"}
+        side -= {(refs / "main").read_text().strip()} if (refs / "main").is_file() else set()
+        snapshots = [s for s in (folder / "snapshots").glob("*") if s.is_dir() and s.name not in side]
+        if snapshots:
+            repo = folder.name.removeprefix(HF_CACHE_PREFIX).replace("--", "/", 1)
+            repos[repo] = max(snapshots, key=lambda s: s.stat().st_mtime)
+    return repos
+
+
+def _lfs_files(snapshot: Path) -> dict[str, str]:
+    """The snapshot's large files, path -> SHA-256: the blob name the Hub cache gives an LFS file."""
+    from .pull import _repo_blob_name  # noqa: PLC0415 - the digest CLI imports no model code to start
+
+    found = {}
+    for path in snapshot.rglob("*"):
+        if _SHA256.fullmatch(name := _repo_blob_name(path)):
+            found[path.relative_to(snapshot).as_posix()] = name
+    return found
+
+
+def check_cached_models(ctx: Context) -> list[Finding]:
+    """D16: model files on disk that the Hub has since replaced or removed on the main branch.
+
+    A repository whose files changed in place (a re-quantised upload under the same name) is not a new
+    model, so D12 never sees it. Compares the large files of each cached repository's newest snapshot with
+    ``main``; a README edit changes nothing. Reported once per state of ``main``; a repository the Hub would
+    not answer for is named, not hidden.
+    """
+    from .pull import _default_hub_cache  # noqa: PLC0415 - the digest CLI imports no model code to start
+
+    hub = _default_hub_cache()
+    repos = _cached_repos(hub)
+    if not repos:
+        msg = f"no model in the Hugging Face cache at {hub}"
+        raise FileNotFoundError(msg)
+    found, unanswered = [], []
+    for repo, snapshot in repos.items():
+        try:
+            info = json.loads(ctx.net.get(HF_MODEL_URL.format(repo=repo)))
+        except (OSError, ValueError) as exc:  # urllib's errors are OSErrors; a body that is not JSON
+            unanswered.append(f"{repo} ({type(exc).__name__})")
+            continue
+        main = {s["rfilename"]: (s.get("lfs") or {}).get("sha256", "") for s in info.get("siblings", [])}
+        local = _lfs_files(snapshot)
+        stale = sorted(path for path, sha in local.items() if main.get(path) != sha)
+        head = str(info.get("sha", ""))
+        if stale and ctx.mem.get(repo) != head:
+            what = f"{len(stale)} of the {len(local)} large files on disk (snapshot {snapshot.name[:7]})"
+            found.append(
+                Finding(
+                    f"{repo}: {what} replaced or removed on main {head[:7]}, e.g. {stale[0]}",
+                    f"https://huggingface.co/{repo}/commits/main",
+                )
+            )
+        ctx.mem[repo] = head
+    if len(unanswered) == len(repos):
+        msg = f"the Hub answered for none of the {len(repos)} cached repositories"
+        raise ConnectionError(msg)
+    if unanswered:
+        found.append(Finding(f"not checked, the Hub did not answer: {', '.join(unanswered)}", HF_MODEL_URL))
+    return found
+
+
 def check_refresh(_ctx: Context) -> list[Finding]:
     """D14: what the newest ``localmodels refresh`` run did with its candidate, and the rules it measured."""
     from .refresh import headline, newest_view, rules_line  # noqa: PLC0415 - refresh imports rules, which imports this
@@ -485,6 +561,7 @@ SOURCES: dict[Source, SourceSpec] = {
     Source.D13: SourceSpec("this host", ALL_KINDS, check_host),
     Source.D14: SourceSpec("llama.cpp refresh", LLAMA_KINDS, check_refresh, local=True),
     Source.D15: SourceSpec("llama-cpp-python", LLAMA_KINDS, check_llama_cpp_python),
+    Source.D16: SourceSpec("models on disk", MODEL_KINDS, check_cached_models),
 }
 
 

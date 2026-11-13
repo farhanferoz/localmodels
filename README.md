@@ -232,7 +232,7 @@ playbooks, Spark Arena, new models, and this host's driver, kernel and DGX OS) w
 language model. It writes `DIR/<date>.md` (default `DIR` is `~/cache/localmodels/digests`), the raw findings in
 `DIR/.raw/<date>.json`, and `DIR/.state.json` (what the next run compares with). A finding line reads
 `- [K1,K2] D1 llama.cpp: <finding> (<link>)`, tagged with the workload kinds the source touches. A source whose
-check fails is listed under "Failed sources" and never stops the run; the exit code is 1 only if every network source failed. A fourteenth, local source (D14) adds the newest `localmodels refresh` run; a fifteenth (D15) reports a new llama-cpp-python release on PyPI.
+check fails is listed under "Failed sources" and never stops the run; the exit code is 1 only if every network source failed. A fourteenth, local source (D14) adds the newest `localmodels refresh` run; a fifteenth (D15) reports a new llama-cpp-python release on PyPI; a sixteenth (D16) compares the large files of every model in the Hugging Face cache with the Hub's main branch and reports those replaced or removed there (a re-quantised upload under the same name, which D12's new-model check never sees).
 `deploy/localmodels-digest.timer` runs it on the 1st of each month at 07:00 (install steps in the `.service` file).
 
 ## Monthly llama.cpp refresh
