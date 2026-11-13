@@ -173,6 +173,7 @@ def test_two_lookups_at_once_queue_one_job_with_the_exact_call(
             "--what", "localmodels tune: google/medgemma-1.5-4b-it K5 (first use)",
             "--class", "restart",
             "--gpu",
+            "--no-check", retune.NO_CHECK,
             "--name", f"tune-google--medgemma-1.5-4b-it-{change}",
             "--workdir", str(tmp_path),
             "--log", str(settings.settings_dir() / "tune-logs" / f"{change}.log"),

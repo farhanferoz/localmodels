@@ -200,6 +200,8 @@ def test_run_submits_build_then_measure_after_it_and_skips_when_nothing_is_due( 
     build, measure, same_client = world.submitted.read_text().splitlines()
     assert "--class resume --resume-ok --no-anywhere --cpus 8 --mem 8G" in build
     assert "--name refresh-build" in build
+    assert f"--no-check {refresh.NO_CHECK[refresh.JobName.BUILD]}" in build  # how each job was checked
+    assert f"--no-check {refresh.NO_CHECK[refresh.JobName.MEASURE]}" in measure
     assert f"refresh --home {world.home} build --run {run_dir} --commit b12" in build
     assert "--class restart --gpu --mem 52G --after 101" in measure
     assert f"--workdir {run_dir}" in measure
@@ -279,6 +281,7 @@ def test_run_measures_a_candidate_built_ahead_and_urgent_goes_through_urgent_py(
     world.submitted.unlink()
     urgent = urgent_log.read_text()
     assert "--name refresh-measure" in urgent
+    assert "--no-check " in urgent  # urgent.py asks the same as submit.py
     assert "--time 1:30:00 --gpu --mem 52G --wait" in urgent
     assert "--after" not in urgent
     run_dir = refresh.newest_run()
@@ -1042,6 +1045,7 @@ def test_the_first_walk_bootstraps_an_engine_in_one_chain_with_the_adjacent_pull
     assert "--tag v0.33.0-gb10.0 --publisher community" in community_pull
     assert "--tag v0.33.0-gb10.0 --mode candidate" in community  # of the official bootstrapped before it
     assert "--name refresh-pull-vllm" in pull
+    assert all("--no-check the job is itself" in job for job in (pull, measure, calibrate, same_client))
     assert "--class resume --resume-ok --no-anywhere --cpus 2 --mem 4G" in pull
     assert "--after" not in pull
     assert "engine-pull --run" in pull

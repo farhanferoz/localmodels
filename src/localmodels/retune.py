@@ -65,6 +65,8 @@ SLURM_TIMEOUT_S: Final = 10  # for each squeue or sacct call
 SACCT_MARGIN_S: Final = 60  # sacct is asked from this long before the attempt it looks for
 TUNE_LIMIT_S: Final = 2400  # the hard ceiling, by ``timeout``: 40 minutes (D19, was D2's 15)
 KILL_AFTER_S: Final = 30
+# slurm's ``--no-check`` reason: a tune is a GPU measurement, and a project's tune command has no CPU dry run
+NO_CHECK: Final = "the tune is itself a GPU measurement; the project's tune command has no CPU dry run"
 _CHANGE_ID_CHARS: Final = 8
 _CHANGE_ID = re.compile(r"[0-9a-f]{8}")
 _JOB_NAME_FIELDS: Final = 2  # squeue's "%i %j": the job id and the job name
@@ -395,6 +397,7 @@ def _submit_argv(
         "--what", what,
         "--class", "restart",
         "--gpu",
+        "--no-check", NO_CHECK,
         "--name", name,
         "--workdir", str(recipe.workdir or Path.cwd()),
         "--log", str(log_path),

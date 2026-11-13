@@ -146,6 +146,13 @@ class JobName(StrEnum):
     MEASURE = "refresh-measure"
 
 
+# slurm's ``--no-check`` reason per job: each job's first step is the work itself, with no smaller CPU run.
+NO_CHECK: Final[dict[JobName, str]] = {
+    JobName.BUILD: "the build is itself the check: a CPU job whose first step is the compile",
+    JobName.MEASURE: "the job is itself a GPU measurement of a built llama.cpp; it has no CPU dry run",
+}
+
+
 class Model(NamedTuple):
     """A model file in the Hugging Face cache by repository, revision and file name."""
 
@@ -519,8 +526,10 @@ def _submit(
     flags: Sequence[str],
     command: Sequence[str],
     *,
+    no_check: str,
     log_stem: str | None = None,
 ) -> list[str]:
+    """One job's ``submit.py`` (or ``urgent.py``) call; ``no_check``: why it has no check before queuing."""
     from . import retune  # noqa: PLC0415 - the CLI must not import the lookup's modules to start
 
     return [
@@ -531,6 +540,7 @@ def _submit(
         "--what", what,
         "--workdir", str(run),  # a systemd user service starts in the home folder
         "--log", str(run / f"{log_stem or name.removeprefix('refresh-')}.log"),
+        "--no-check", no_check,
         *flags,
         "--",
         *command,
@@ -557,6 +567,7 @@ def build_argv(script: Path, run: Path, tag: str, home: str | None) -> list[str]
         what,
         flags,
         [*_refresh_command(home, "build"), "--run", str(run), "--commit", tag],
+        no_check=NO_CHECK[JobName.BUILD],
     )
 
 
@@ -564,7 +575,8 @@ def measure_argv(script: Path, run: Path, after: str | None, home: str | None) -
     """The ``submit.py`` call of the GPU measure job, chained after the build job when there is one."""
     flags = ["--class", "restart", "--gpu", "--mem", MEASURE_MEM, *(["--after", after] if after else [])]
     what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name})"
-    return _submit(script, run, JobName.MEASURE, what, flags, _measure_command(home, run))
+    command = _measure_command(home, run)
+    return _submit(script, run, JobName.MEASURE, what, flags, command, no_check=NO_CHECK[JobName.MEASURE])
 
 
 def urgent_argv(script: Path, run: Path, home: str | None) -> list[str]:
@@ -572,7 +584,13 @@ def urgent_argv(script: Path, run: Path, home: str | None) -> list[str]:
     flags = ["--time", URGENT_TIME, "--gpu", "--mem", MEASURE_MEM, "--wait"]
     what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name}, urgent)"
     return _submit(
-        script.with_name(URGENT_SCRIPT), run, JobName.MEASURE, what, flags, _measure_command(home, run)
+        script.with_name(URGENT_SCRIPT),
+        run,
+        JobName.MEASURE,
+        what,
+        flags,
+        _measure_command(home, run),
+        no_check=NO_CHECK[JobName.MEASURE],
     )
 
 

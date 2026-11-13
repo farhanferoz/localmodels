@@ -142,6 +142,16 @@ class EngineJob(StrEnum):
     SPARKRUN = "refresh-sparkrun"
 
 
+# slurm's ``--no-check`` reason per job kind: each starts with the work itself, with no smaller CPU run.
+NO_CHECK: Final[dict[EngineJob, str]] = {
+    EngineJob.PULL: "the job is itself a docker pull; there is nothing smaller to try",
+    EngineJob.MEASURE: "the job is itself a GPU measurement of an engine's server; it has no CPU dry run",
+    EngineJob.CALIBRATE: "the job is itself a GPU measurement of two engine versions; it has no CPU dry run",
+    EngineJob.SAME_CLIENT: "the job is itself a GPU measurement of llama.cpp's server; it has no CPU dry run",
+    EngineJob.SPARKRUN: "the job is itself a GPU measurement of two sparkrun versions; it has no CPU dry run",
+}
+
+
 class MeasureMode(StrEnum):
     """Why a version is measured: a first ``current``, a candidate for it, or an approved file."""
 
@@ -1727,7 +1737,9 @@ def _job_argv(
     stem = "-".join(
         part for part in (kind.value.removeprefix("refresh-"), engine.value if engine else "", tag) if part
     )
-    return refresh._submit(script, run, job_name(kind, engine), what, flags, command, log_stem=stem)  # noqa: SLF001
+    return refresh._submit(  # noqa: SLF001
+        script, run, job_name(kind, engine), what, flags, command, no_check=NO_CHECK[kind], log_stem=stem
+    )
 
 
 def pull_argv(
