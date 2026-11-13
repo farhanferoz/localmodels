@@ -20,6 +20,7 @@ import re
 import signal
 import socket
 import time
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
@@ -35,6 +36,10 @@ from .process import (
     CACHE_RAM_FLAGS,
     DRAFT_MODEL_ENV,
     DRAFT_MODEL_FLAGS,
+    LOAD_MODE_AUTO,
+    LOAD_MODE_ENV,
+    LOAD_MODE_FLAGS,
+    LOAD_MODE_MMAP,
     SPEC_TYPE_ENV,
     SPEC_TYPE_FLAG,
     UBATCH_ENV,
@@ -92,6 +97,7 @@ _MIB_PER_GIB = 1024
 _FIT_ROW_RE = re.compile(r"^(\S+) (\d+) (\d+) (\d+)\s*$", re.MULTILINE)
 _FIT_HOST_ROW = "Host"
 _FIT_PARAMS_TIMEOUT_S = 600.0
+_PAIR = 2  # a flag and its value
 
 _FILE_FLAGS = ("-m", "--api-key-file", *DRAFT_MODEL_FLAGS)
 
@@ -170,10 +176,13 @@ def _kill_group(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
 
 
-def check_fits(what: str, need_gib: float, free_gib: float | None, reserve_gib: float) -> None:
+def check_fits(
+    what: str, need_gib: float, free_gib: float | None, reserve_gib: float, *, also: str = ""
+) -> None:
     """Refuse a load whose memory need plus the host reserve exceeds available memory (D22).
 
     ``ServerStartError`` when available memory cannot be read, ``NotEnoughMemoryError`` when it is short.
+    ``also`` is a clause for the refusal that names the need under another load mode (D30).
     """
     need = need_gib + reserve_gib
     if free_gib is None:
@@ -182,7 +191,7 @@ def check_fits(what: str, need_gib: float, free_gib: float | None, reserve_gib: 
     if need > free_gib:
         msg = (
             f"{what} needs {need:.1f} GiB (its projected or measured memory plus a {reserve_gib:g} GiB host "
-            f"reserve) but {free_gib:.1f} GiB is available; not loading it"
+            f"reserve) but {free_gib:.1f} GiB is available{f' ({also})' if also else ''}; not loading it"
         )
         raise NotEnoughMemoryError(msg)
 
@@ -215,13 +224,31 @@ def _gpu_shares_host_ram() -> bool | None:
     return None if reading is None else reading.unified
 
 
-def _launched_cache_cap(args: list[str]) -> tuple[str, ...]:
-    """The ``--cache-ram`` pair this manager puts last in a server's arguments, else ``()``."""
-    try:
-        flag, value = args[-2:]
-    except ValueError:  # fewer than two arguments
-        return ()
-    return (flag, value) if flag in CACHE_RAM_FLAGS else ()
+def _launched_flags(args: list[str], *, cache_ram: bool, load_mode: bool) -> tuple[str, ...]:
+    """The flags this manager puts last in a server's arguments, else ``()``.
+
+    They are ``-lm mmap`` (D30), then the ``--cache-ram`` pair (D20); ``cache_ram`` and ``load_mode`` say
+    which of the two this manager may have added (a caller's own value is no launch flag).
+    """
+    end = len(args)
+    if cache_ram and end >= _PAIR and args[end - _PAIR] in CACHE_RAM_FLAGS:
+        end -= _PAIR
+    if load_mode and end >= _PAIR and args[end - _PAIR : end] == [LOAD_MODE_FLAGS[0], LOAD_MODE_MMAP]:
+        end -= _PAIR
+    return tuple(args[end:])
+
+
+@dataclass(frozen=True)
+class _Projection:
+    """``llama-fit-params``' projection of a server, in GiB (D22, D30).
+
+    ``host_weights_gib`` is the reference file's host-side weights (the ``Host`` row's model column): the
+    part ``-lm mmap`` serves from the page cache instead of anonymous memory. A draft file adds to
+    ``total_gib`` only.
+    """
+
+    total_gib: float
+    host_weights_gib: float
 
 
 class SupervisorExit(StrEnum):
@@ -512,7 +539,14 @@ class LocalServerManager:
         return self._available_gib(self.params.n_gpu_layers != 0)
 
     async def _projected_gib(self) -> float:
+        """llama.cpp's whole projection in GiB (``_projection``'s total), as the tune's screen reads it."""
+        return (await self._projection()).total_gib
+
+    async def _projection(self) -> _Projection:
         """llama.cpp's projection of the server's memory (weights, context, compute); raises if none.
+
+        ``host_weights_gib`` is the reference file's host-side weights, which ``-lm mmap`` leaves out of the
+        memory the server holds (D30); the total counts them, as llama.cpp's default load mode does.
 
         With a settings answer it is projected at the effective ``-ub`` and, when a draft model is among the
         effective flags, the draft file's own projection is added: ``llama-fit-params`` fits one model only.
@@ -535,7 +569,8 @@ class LocalServerManager:
             )
             raise ServerStartError(msg)
         shares = bool(shares)
-        total = await self._fit_gib(self.spec.model_path, ubatch, shares=shares)
+        reference = await self._fit_gib(self.spec.model_path, ubatch, shares=shares)
+        total = reference.total_gib
         if draft is not None and SpecType.DRAFT_MTP in (kinds or "").split(","):
             try:
                 total += (await asyncio.to_thread(Path(draft).stat)).st_size / _GIB
@@ -543,11 +578,14 @@ class LocalServerManager:
                 msg = f"the draft file cannot be read ({exc}); not loading a model it has not projected"
                 raise ServerStartError(msg) from exc
         elif draft is not None:
-            total += await self._fit_gib(Path(draft), ubatch, shares=shares)
-        return total
+            total += (await self._fit_gib(Path(draft), ubatch, shares=shares)).total_gib
+        return _Projection(total_gib=total, host_weights_gib=reference.host_weights_gib)
 
-    async def _fit_gib(self, model_path: Path, ubatch: str | None, *, shares: bool) -> float:
+    async def _fit_gib(self, model_path: Path, ubatch: str | None, *, shares: bool) -> _Projection:
         """One ``llama-fit-params`` projection of ``model_path`` at this server's layout, in GiB.
+
+        The ``Host`` row's model column is kept apart as ``host_weights_gib``: ``-lm`` does not change what
+        ``llama-fit-params`` prints, so the part ``-lm mmap`` leaves out is read from it (D30).
 
         It counts the memory the server draws from: on a GPU that shares the host's RAM every line, GPU and
         host (llama.cpp places part of a model on the host: 28 of Flash-Next's 89 GiB, 2026-11-08, which a
@@ -569,10 +607,9 @@ class LocalServerManager:
         except (OSError, TimeoutError) as exc:
             msg = f"llama-fit-params could not run ({exc}); not loading a model it has not projected"
             raise ServerStartError(msg) from exc
-        rows = {
-            name: int(model) + int(context) + int(compute)
-            for name, model, context, compute in _FIT_ROW_RE.findall(out.decode(errors="replace"))
-        }
+        found = _FIT_ROW_RE.findall(out.decode(errors="replace"))
+        rows = {name: int(model) + int(context) + int(compute) for name, model, context, compute in found}
+        host_weights_mib = sum(int(model) for name, model, _, _ in found if name == _FIT_HOST_ROW)
         if proc.returncode != 0 or _FIT_HOST_ROW not in rows:
             msg = (
                 f"llama-fit-params printed no projection for {model_path.name} "
@@ -592,26 +629,66 @@ class LocalServerManager:
                 "not loading a model it has not projected"
             )
             raise ServerStartError(msg)
-        return mib / _MIB_PER_GIB
+        return _Projection(total_gib=mib / _MIB_PER_GIB, host_weights_gib=host_weights_mib / _MIB_PER_GIB)
 
-    def _measured_peak_gib(self) -> float | None:
-        """The peak memory the answer's tune measured, when it ran this server's layout; else None (D22).
+    def _caller_load_mode(self) -> str | None:
+        """The load mode the caller's flags or environment set (``-lm``, its env variable); else None."""
+        return llama_option(self.effective_flags, self.extra_env, LOAD_MODE_FLAGS, LOAD_MODE_ENV)
+
+    @property
+    def load_mode(self) -> str:
+        """The load mode this server runs with: "" is llama.cpp's default (auto), else the value (D30)."""
+        mode = llama_option(self._server_flags, self.extra_env, LOAD_MODE_FLAGS, LOAD_MODE_ENV)
+        return "" if mode in (None, LOAD_MODE_AUTO) else mode
+
+    def _measured_peak_gib(self, load_mode: str = "") -> float | None:
+        """The peak the answer's tune measured, when it ran this server's layout and load mode (D22, D30).
 
         The figure is the model as it runs, which llama.cpp's projection can miss (CUDA's own buffers, the
-        prompt cache); it can only raise the need, so a peak from an older build is still a safe floor.
+        prompt cache); it can only raise the need, so a peak from an older build is still a safe floor. A
+        peak recorded at another load mode is no figure for this one: ``-lm mmap`` leaves the host-side
+        weights out of the memory the server holds.
         """
         record = self.settings.record if self.settings is not None else None
         peak = record.peak if record is not None else None
         params = self.params
-        here = LlamaLayout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+        here = LlamaLayout(
+            n_ctx=params.n_ctx,
+            n_parallel=params.n_parallel,
+            kv_unified=params.kv_unified,
+            load_mode=load_mode,
+        )
         return peak.gib if peak is not None and peak.layout == here else None
 
-    def _check_fits(self, projection: float, free: float | None, reserve: float) -> None:
-        """Refuse to load when the projection plus the host reserve exceeds available memory."""
-        check_fits(self.spec.model_path.name, projection, free, reserve)
+    def _check_fits(self, need: float, free: float | None, reserve: float, *, also: str = "") -> None:
+        """Refuse to load when the need plus the host reserve exceeds available memory."""
+        check_fits(self.spec.model_path.name, need, free, reserve, also=also)
+
+    def _need_gib(self, projection: _Projection, load_mode: str) -> float:
+        """The memory need at ``load_mode`` (D22, D30): the projection or the tune's peak there, the larger.
+
+        Under ``mmap`` the projection leaves out the host-side weights (file pages in the page cache); a peak
+        recorded at another mode is not used.
+        """
+        host = projection.host_weights_gib if load_mode == LOAD_MODE_MMAP else 0.0
+        projected = projection.total_gib - host
+        peak = self._measured_peak_gib(load_mode)
+        if peak is not None and peak > projected:
+            log.info(
+                "memory need: %.1f GiB, the peak its tune measured (llama.cpp projects %.1f GiB)",
+                peak, projected,
+            )  # fmt: skip
+            return peak
+        return projected
 
     def _caller_sets_cache_ram(self) -> bool:
         return llama_option(self.extra_flags, self.extra_env, CACHE_RAM_FLAGS, CACHE_RAM_ENV) is not None
+
+    def _launched_in(self, args: list[str]) -> tuple[str, ...]:
+        """The flags this manager added last in a running server's ``args`` (D20, D30); never the caller's."""
+        return _launched_flags(
+            args, cache_ram=not self._caller_sets_cache_ram(), load_mode=self._caller_load_mode() is None
+        )
 
     def _cache_cap_skipped(self) -> str | None:
         """Why this server gets no computed prompt-cache cap, in words for the log; None when it gets one."""
@@ -624,7 +701,7 @@ class LocalServerManager:
         return None
 
     async def _prepare_launch(self) -> None:
-        """Before the load: check the model fits (host reserve) and size the prompt cache (D20).
+        """Before the load: check the fit (host reserve), pick the load mode (D30), size the cache (D20).
 
         ``llama-fit-params`` runs at most once, for whichever of the two needs it. On a GPU that shares the
         host's RAM, llama.cpp's prompt cache (default 8 GiB) grows in the same RAM the model and the host
@@ -632,7 +709,8 @@ class LocalServerManager:
         and llama.cpp's default: the reserve stays free above the floor for what the need misses (2.55 GiB
         on Flash-Next, slurm 2187; a full cache sized to the floor alone would reach it, D22). Without a
         host reserve a missing projection or reading gives a cap of 0 (memory safety over a speed-up); with
-        one the start is refused, as it always was.
+        one the start is refused, as it always was. The load mode is ``_plan_load_mode``'s (D30): ``-lm mmap``
+        goes in front of the cache cap, and the need that sizes the cap is the one at that mode.
         """
         self._launch_flags = ()
         reserve = self.guards.host_reserve_gib
@@ -641,39 +719,80 @@ class LocalServerManager:
             log.info("prompt cache: %s", skipped)
         if reserve is None and skipped is not None:
             return
-        projection: float | None = None
+        projection: _Projection | None = None
         problem = "available memory cannot be read"
         try:
-            projection = await self._projected_gib()
-            peak = self._measured_peak_gib()
-            if peak is not None and peak > projection:
-                log.info(
-                    "memory need: %.1f GiB, the peak its tune measured (llama.cpp projects %.1f GiB)",
-                    peak, projection,
-                )  # fmt: skip
-                projection = peak
+            projection = await self._projection()
         except ServerStartError as exc:
             if reserve is not None:
                 raise
             problem = str(exc)
         free = self.free_gib()
+        need: float | None = None
+        load_flags: tuple[str, ...] = ()
+        also = ""
+        if projection is not None:
+            need, load_flags, also = self._plan_load_mode(projection, free, reserve)
         if reserve is not None:
-            assert projection is not None  # noqa: S101 - narrowing for mypy; a failed projection raised above
-            self._check_fits(projection, free, reserve)
+            assert need is not None  # noqa: S101 - narrowing for mypy; a failed projection raised above
+            self._check_fits(need, free, reserve, also=also)
+        self._launch_flags = load_flags
         if skipped is not None:
             return
         margin = (reserve or 0.0) + (self.guards.kill_below_gib or 0.0)
-        if projection is None or free is None:
+        if need is None or free is None:
             log.warning("prompt cache: --cache-ram 0 (%s; no cache rather than an unsized one)", problem)
             mib = 0
         else:
-            mib = max(0, min(CACHE_RAM_DEFAULT_MIB, math.floor((free - projection - margin) * _MIB_PER_GIB)))
+            mib = max(0, min(CACHE_RAM_DEFAULT_MIB, math.floor((free - need - margin) * _MIB_PER_GIB)))
             log.info(
                 "prompt cache: --cache-ram %s MiB (available %.1f GiB, projection %.1f GiB, margin %g GiB; "
                 "GPU shares the host's RAM)",
-                f"{mib:,}", free, projection, margin,
+                f"{mib:,}", free, need, margin,
             )  # fmt: skip
-        self._launch_flags = (CACHE_RAM_FLAGS[-1], str(mib))
+        self._launch_flags = (*load_flags, CACHE_RAM_FLAGS[-1], str(mib))
+
+    def _plan_load_mode(
+        self, projection: _Projection, free: float | None, reserve: float | None
+    ) -> tuple[float, tuple[str, ...], str]:
+        """The memory need, the load flags to add and what a refusal should say besides (D30).
+
+        On a GPU that shares the host's RAM, llama.cpp's ``-lm auto`` turns mmap off (a device without mmap
+        support), so the host-side weights are copied into anonymous memory (Flash-Next: 26.8 GiB). With
+        ``-lm mmap`` they stay file pages in the page cache, so the need leaves them out. A model that fits
+        with them counted starts as before. One that does not, but fits without them, gets ``-lm mmap``.
+        A caller's own load mode wins: ``mmap`` leaves them out of the need, any other counts them. A GPU
+        with its own memory, a server without the GPU and a model with no host-side weights are unchanged.
+        A peak the tune measured counts only at the load mode of this start.
+        """
+        if not (self.params.n_gpu_layers != 0 and _gpu_shares_host_ram() is True):
+            projection = replace(projection, host_weights_gib=0.0)
+        host = projection.host_weights_gib
+        if (caller := self._caller_load_mode()) is not None:
+            mode = "" if caller == LOAD_MODE_AUTO else caller
+            if mode == LOAD_MODE_MMAP and host > 0:
+                log.info(
+                    "memory need: %.1f GiB with the caller's -lm mmap; %.1f GiB of host weights left out "
+                    "(served from the page cache)",
+                    self._need_gib(projection, mode), host,
+                )  # fmt: skip
+            return self._need_gib(projection, mode), (), ""
+        full = self._need_gib(projection, "")
+        if reserve is None or free is None or host <= 0 or full + reserve <= free:
+            return full, (), ""
+        lean = self._need_gib(projection, LOAD_MODE_MMAP)
+        if lean + reserve > free:
+            also = (
+                f"with {LOAD_MODE_FLAGS[0]} {LOAD_MODE_MMAP}, which leaves out {host:.1f} GiB of host "
+                f"weights, it would need {lean + reserve:.1f} GiB"
+            )
+            return full, (), also
+        log.info(
+            "memory need: %.1f GiB with -lm mmap; %.1f GiB of host weights served from the page cache "
+            "(the model needs %.1f GiB with them in memory, %.1f GiB available)",
+            lean, host, full, free,
+        )  # fmt: skip
+        return lean, (LOAD_MODE_FLAGS[0], LOAD_MODE_MMAP), ""
 
     async def _check_left_over(self) -> None:
         """After the load: stop the server if it left less than the host reserve available."""
@@ -735,11 +854,9 @@ class LocalServerManager:
                         await self.stop()
                         return None
                     # the stamp says what the adopted server runs; a caller's own value is in its flags
-                    self._launch_flags = () if self._caller_sets_cache_ram() else _launched_cache_cap(args)
+                    self._launch_flags = self._launched_in(args)
                     if self._launch_flags:
-                        log.info(
-                            "prompt cache: the adopted server's --cache-ram %s MiB", self._launch_flags[1]
-                        )
+                        log.info("launch flags: the adopted server's %s", " ".join(self._launch_flags))
                     return ServerHandle(pid=pid, port=self.spec.port, model_path=self.spec.model_path)
         return None
 
@@ -753,11 +870,11 @@ class LocalServerManager:
         """Whether a running server's arguments are those this manager would start it with.
 
         The binary is not compared, and a file given under another spelling of its path is the same file. The
-        prompt-cache cap this manager adds at launch is left out of the running arguments: it follows the
-        memory at the time, so it is no part of the server's identity (a caller's own value is).
+        prompt-cache cap and the ``-lm mmap`` this manager adds at launch are left out of the running
+        arguments: they follow the memory at the time, so they are no part of the server's identity (a
+        caller's own value is).
         """
-        if not self._caller_sets_cache_ram():
-            args = args[: len(args) - len(_launched_cache_cap(args))]
+        args = args[: len(args) - len(self._launched_in(args))]
         wanted = build_args(self.binary, self.spec, self.params, self.effective_flags)
         return _resolved(args[len(args) - len(wanted) + 1 :]) == _resolved(wanted[1:])
 

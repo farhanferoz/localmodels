@@ -198,6 +198,9 @@ minus the model's memory need (above) minus the guards' `host_reserve_gib` and `
 8,192 MiB (0 when the projection cannot be made and no host reserve is set; the start is refused when one is); a GPU with its own memory, a server
 without GPU layers, and a caller's own `--cache-ram` or `LLAMA_ARG_CACHE_RAM` keep llama.cpp's default or the caller's value (D20). The cap is logged,
 stamped in `layout.extra_flags` (for an adopted server too), and is no part of a running server's identity: a server whose cap differs is adopted, not restarted.
+On that same GPU, a model that does not fit with its host-side weights counted (the `Host` row's model column of `llama-fit-params`) but fits with them left out is started with `-lm mmap`, and its need then leaves those weights out (D30).
+Why: llama.cpp's default `-lm auto` turns mmap off on a device without mmap support, so on a DGX Spark the host-side weights are copied into anonymous memory; under `mmap` they stay file pages in the page cache (Qwen3.8-Flash-Next: 26.8 GiB less). A model that fits keeps its default start, a caller's own `-lm` or `LLAMA_ARG_LOAD_MODE` wins (`mmap` leaves the weights out of the need, any other mode counts them), and a refusal states the need at both modes.
+A tune's measured peak (`MeasuredPeak.layout.load_mode`, "" for the default) is used only at the load mode of the start; the `-lm mmap` the manager adds is, like the cap, no part of a running server's identity.
 `python -m localmodels.llama_tune --help` is the tune that makes such a record (the recipe command for llama.cpp; run it through slurm,
 never by hand on the card). It measures the reference first, then `-ub` (`llama-bench`, then a teacher-forced `llama-perplexity` check
 against 512 with a restart control; only for prompts of at least 512 tokens), the speculation candidates you declare and, with your own

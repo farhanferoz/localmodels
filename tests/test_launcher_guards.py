@@ -118,10 +118,11 @@ async def test_the_projection_counts_the_memory_the_server_draws_from(
 ) -> None:
     # llama.cpp put Flash-Next 62 GiB on the GPU and 28 GiB on the host; the GPU line alone let it start
     monkeypatch.setattr(launcher, "_gpu_shares_host_ram", lambda: shares)
+    # a caller's own load mode keeps the host-side weights counted (D30 adds `-lm mmap` only without one)
     async with httpx.AsyncClient() as http:
         manager = _manager(
             tmp_path, http, MemoryGuards(host_reserve_gib=12), _steady(counted + 11),
-            params=_cpu_params() if cpu else None,
+            params=_cpu_params() if cpu else None, extra_flags=("-lm", "none"),
         )  # fmt: skip
         _fit_params(Path(manager.binary), "CUDA0 20000 400 80\nHost 10000 200 40")
         with pytest.raises(ServerStartError, match=rf"needs {counted + 12}\.0 GiB"):
@@ -375,7 +376,16 @@ class _CacheCase:
     fit_output: str | None = None  # what llama-fit-params prints, if not a 20 GiB projection
     cap: tuple[str, ...] = ()  # the `--cache-ram` flags expected
     fit_runs: int = 0
+    refuses: str | None = None  # a pattern the refusal's message must match, when the start is refused
+    peak: tuple[float, str] | None = None  # a tune's measured peak (GiB, load mode), when the answer has one
 
+
+# D30: 60 GiB projected, 20 GiB of it host weights (the Host row's model column); the reserve is 10 GiB, so
+# the model needs 70 GiB with them in memory and 50 GiB without, and the cap is available - need - 10 GiB
+_HOST_HEAVY = "CUDA0 40960 0 0\nHost 20480 0 0"
+_RESERVE = MemoryGuards(host_reserve_gib=10)
+_MMAP = ("-lm", "mmap")
+_COUNTED = r"needs 70\.0 GiB .* 55\.0 GiB is available; not loading it"
 
 # the projection is 20 GiB, so a cap is (available - 20 - margin) GiB, between 0 and llama.cpp's 8,192 MiB
 _CACHE_CASES = [
@@ -416,17 +426,130 @@ _CACHE_CASES = [
     # a GPU with its own memory, or no GPU at all: llama.cpp's default stays
     pytest.param(_CacheCase(shares=False), id="gpu-with-own-memory"),
     pytest.param(_CacheCase(cpu=True), id="cpu"),
+    # D30: with the host weights counted it fits, so nothing changes (cap clamped to 8,192 MiB)
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE, fit_output=_HOST_HEAVY, available=80, cap=("--cache-ram", "8192"), fit_runs=1
+        ),
+        id="fits-with-host-weights-no-mmap",
+    ),
+    # it does not fit with them (70 > 55) but fits without (50 <= 55): `-lm mmap`, cap from the 40 GiB need
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            cap=(*_MMAP, "--cache-ram", "5120"),
+            fit_runs=1,
+        ),
+        id="fits-only-without-host-weights-mmap",
+    ),
+    # not even without them (50 > 45): refused, and the message gives both figures
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=45,
+            fit_runs=1,
+            refuses=(
+                r"needs 70\.0 GiB .* 45\.0 GiB is available \(with -lm mmap, which leaves out 20\.0 GiB "
+                r"of host weights, it would need 50\.0 GiB\)"
+            ),
+        ),
+        id="does-not-fit-even-with-mmap",
+    ),
+    # a caller's own load mode wins: `mmap` leaves the host weights out of the need, any other counts them
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            own={"extra_flags": _MMAP},
+            cap=("--cache-ram", "5120"),
+            fit_runs=1,
+        ),
+        id="caller-mmap",
+    ),
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            own={"extra_env": {"LLAMA_ARG_LOAD_MODE": "none"}},
+            fit_runs=1,
+            refuses=_COUNTED,
+        ),
+        id="caller-none-env",
+    ),
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            own={"extra_flags": ("--load-mode=none",)},
+            fit_runs=1,
+            refuses=_COUNTED,
+        ),
+        id="caller-none-flag",
+    ),
+    # a GPU with its own memory counts the GPU rows (50 GiB with the reserve) and never gets `-lm mmap`
+    pytest.param(
+        _CacheCase(shares=False, guards=_RESERVE, fit_output=_HOST_HEAVY, available=55, fit_runs=1),
+        id="own-memory-fits",
+    ),
+    pytest.param(
+        _CacheCase(
+            shares=False,
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=45,
+            fit_runs=1,
+            refuses=r"^(?!.*-lm mmap).*needs 50\.0 GiB .* 45\.0 GiB is available",
+        ),
+        id="own-memory-refused-without-mmap-note",
+    ),
+    # a peak measured at the default load mode (65 GiB) is not this start's: mmap goes by the projection
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            peak=(65, ""),
+            cap=(*_MMAP, "--cache-ram", "5120"),
+            fit_runs=1,
+        ),
+        id="default-mode-peak-not-used-for-mmap",
+    ),
+    # one measured at mmap is (52 GiB, over the 40 projected): 62 > 55, refused with that figure
+    pytest.param(
+        _CacheCase(
+            guards=_RESERVE,
+            fit_output=_HOST_HEAVY,
+            available=55,
+            peak=(52, "mmap"),
+            fit_runs=1,
+            refuses=r"needs 70\.0 GiB .* it would need 62\.0 GiB\)",
+        ),
+        id="mmap-peak-used-for-mmap",
+    ),
 ]
 
 
 @pytest.mark.parametrize("case", _CACHE_CASES)
-async def test_the_prompt_cache_is_capped_to_the_memory_the_model_leaves(
+async def test_the_prompt_cache_and_the_load_mode_follow_the_memory_the_model_leaves(
     tmp_path: Path, calls: list[list[str]], monkeypatch: pytest.MonkeyPatch, case: _CacheCase
 ) -> None:
     monkeypatch.setattr(launcher, "_gpu_shares_host_ram", lambda: case.shares)
     answer = _answer(
         spec=SpecType.NONE
     )  # an answer that adds no flag: adopting a server compares its arguments
+    if case.peak is not None:
+        gib, load_mode = case.peak
+        answer.record = RecordRef(
+            path="r.json", measured_at=datetime.now(UTC), hardware="h", candidate="reference", quality="",
+            stack=None, build=None, recipe_project=None,
+            peak=MeasuredPeak(gib=gib, layout=LlamaLayout(n_ctx=8192, n_parallel=1, load_mode=load_mode)),
+        )  # fmt: skip
 
     def manager(available: float, **own: Any) -> LocalServerManager:
         made = _manager(
@@ -439,6 +562,10 @@ async def test_the_prompt_cache_is_capped_to_the_memory_the_model_leaves(
 
     async with httpx.AsyncClient() as http:
         first = manager(case.available, **case.own)
+        if case.refuses is not None:
+            with pytest.raises(ServerStartError, match=case.refuses):
+                await first.start()
+            return
         try:
             started = await first.start()
             flags = (*case.own.get("extra_flags", ()), *case.cap)
@@ -446,7 +573,8 @@ async def test_the_prompt_cache_is_capped_to_the_memory_the_model_leaves(
             assert calls[-1] == build_args(first.binary, first.spec, first.params, flags)
 
             # the cap follows the memory at the time, so it is no part of a server's identity: a manager
-            # whose own cap would differ adopts the running server, stamps its cap, and projects nothing
+            # whose own cap would differ adopts the running server, stamps its flags (`-lm mmap` too: D30)
+            # and projects nothing
             calls.clear()
             later = manager(case.available + 50, **case.own)
             assert (await later.start()).pid == started.pid

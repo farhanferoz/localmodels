@@ -632,6 +632,9 @@ async def test_a_real_server_start_carries_the_flags_and_gives_speeds_acceptance
     assert arm.predicted_per_second == 50.0
     assert arm.acceptance == pytest.approx(0.6)  # the warm-up's line is left out
     assert arm.peak_gib == pytest.approx((4468 + 2048) / 1024)  # the largest sample, not the last
+    assert (
+        arm.load_mode == ""
+    )  # the start's load mode is recorded with its peak: llama.cpp's default here (D30)
     # a GPU with its own memory: the host side is not added
     tune._unified, peaks, lows = False, [], []
     sampler = asyncio.create_task(tune._sample(4242, peaks, lows))
@@ -792,7 +795,18 @@ async def test_the_command_holds_the_card_writes_the_record_and_adopts_only_what
     exit_code: int,
     adopted: bool,
 ) -> None:
-    command_with(monkeypatch, commanded, {**arm_script(), **script})
+    served_at = {"load_mode": "mmap"}  # D30: the servers ran with `-lm mmap`; the peak is recorded at it
+    arms = arm_script()
+    command_with(
+        monkeypatch,
+        commanded,
+        {
+            **arms,
+            "reference": {**arms["reference"], **served_at},
+            "draft-mtp": {**arms["draft-mtp"], **served_at},
+            **script,
+        },
+    )
     code = await tune_and_adopt(make_spec(tmp_path, **changes))
     assert code == exit_code
     assert commanded == ["enter", "tune", "exit"]  # the card is held for the whole tune and let go after it
@@ -810,7 +824,9 @@ async def test_the_command_holds_the_card_writes_the_record_and_adopts_only_what
         params = make_spec(tmp_path).params
         assert peak is not None
         assert peak.gib == max(m["peak_gib"] for m in runs)
-        here = LlamaLayout(n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified)
+        here = LlamaLayout(
+            n_ctx=params.n_ctx, n_parallel=params.n_parallel, kv_unified=params.kv_unified, load_mode="mmap"
+        )
         assert peak.layout == here
 
 

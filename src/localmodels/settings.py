@@ -982,13 +982,14 @@ def _measured_peak(record: SettingsRecord) -> MeasuredPeak | None:
     """The chosen candidate's peak memory over its runs in a llama.cpp tune; None when none was measured.
 
     Read from the record's untyped steps (``llama_tune``'s "layout" and "server" entries; a restart is named
-    ``<candidate>#restart``), so a record of another shape gives None rather than an error.
+    ``<candidate>#restart``), so a record of another shape gives None rather than an error. The peak's layout
+    carries the load mode (``-lm``) its server ran with, "" for a record made before D30 or at the default.
     """
     steps = record.llama_measurements
     layout = next((m for m in steps if m.get("step") == Step.LAYOUT), None)
     names = {record.candidate, f"{record.candidate}#restart"}
     peaks = [
-        m["peak_gib"]
+        (m["peak_gib"], str(m.get("load_mode") or ""))
         for m in steps
         if m.get("step") == Step.SERVER
         and m.get("name") in names
@@ -998,7 +999,8 @@ def _measured_peak(record: SettingsRecord) -> MeasuredPeak | None:
         return None
     try:
         fields = {k: layout[k] for k in ("n_ctx", "n_parallel", "kv_unified") if layout.get(k) is not None}
-        return MeasuredPeak(gib=max(peaks), layout=LlamaLayout(**fields))
+        gib, load_mode = max(peaks)  # the largest peak, with the load mode it was measured at (D30)
+        return MeasuredPeak(gib=gib, layout=LlamaLayout(**fields, load_mode=load_mode))
     except ValidationError:
         return None
 

@@ -178,6 +178,12 @@ CACHE_RAM_FLAGS: Final = ("-cram", "--cache-ram")
 CACHE_RAM_ENV: Final = "LLAMA_ARG_CACHE_RAM"
 #: llama.cpp's own default for ``--cache-ram`` in MiB (arg.cpp:1686; tools/server/README.md: "0 - disable").
 CACHE_RAM_DEFAULT_MIB: Final = 8192
+#: ``-lm`` / ``--load-mode`` (arg.cpp:2662-2679: auto, none, mmap, mlock, mmap+mlock, dio; default auto). Auto
+#: turns mmap off on a device without mmap support, so the host-side weights become anonymous memory (D30).
+LOAD_MODE_FLAGS: Final = ("-lm", "--load-mode")
+LOAD_MODE_ENV: Final = "LLAMA_ARG_LOAD_MODE"
+LOAD_MODE_MMAP: Final = "mmap"
+LOAD_MODE_AUTO: Final = "auto"
 DRAFT_MODEL_FLAGS: Final = ("--spec-draft-model", "-md", "--model-draft")
 DRAFT_MODEL_ENV: Final = "LLAMA_ARG_SPEC_DRAFT_MODEL"
 SPEC_TYPE_FLAG: Final = "--spec-type"

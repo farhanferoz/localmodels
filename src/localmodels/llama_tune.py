@@ -403,6 +403,7 @@ class ArmResult(BaseModel):
     predicted_per_second: float | None = None
     acceptance: float | None = None
     peak_gib: float | None = None
+    load_mode: str = ""  # llama.cpp's -lm the server ran with ("" = default); the peak holds at it (D30)
     free_gib: float | None = None  # available memory just before the start
     fits: bool | None = None  # None: memory not measured
     check: Agreement | None = None  # the project's task-quality check
@@ -1183,6 +1184,7 @@ class LlamaTune:
                     started = self._clock()
                     handle = await manager.start()
                     arm.start_s = self._clock() - started
+                    arm.load_mode = manager.load_mode
                     sampler = asyncio.create_task(self._sample(handle.pid, peaks, lows))
                     started = self._clock()
                     await self._send_prompts(http, manager, arm)

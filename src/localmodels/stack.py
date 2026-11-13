@@ -174,6 +174,8 @@ class LlamaLayout(BaseModel):
     n_parallel: int
     kv_unified: bool = False
     extra_flags: tuple[str, ...] = ()
+    #: llama.cpp's ``-lm`` the server ran with ("" = its default, auto); a peak holds at this mode (D30)
+    load_mode: str = ""
 
 
 class LoadOptions(BaseModel):
