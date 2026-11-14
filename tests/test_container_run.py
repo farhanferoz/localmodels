@@ -126,6 +126,7 @@ def make_run(tmp_path: Path, rec: VersionRecord, docker: FakeDocker, **kw: objec
         "work_dir": tmp_path,
         "docker": docker,
         "free_gib": lambda: 100.0,
+        "gpu_memory": lambda: None,  # never the real nvidia-smi: at each 10 ms poll it outran the waits
         "run_id": run_id,
         "reaper": Reaper(docker=docker, squeue=lambda c: subprocess.CompletedProcess(c, 0, "", "")),
     }
