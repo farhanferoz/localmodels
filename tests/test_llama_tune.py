@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shlex
 import signal
 import sys
 from pathlib import Path
@@ -698,6 +699,21 @@ async def test_every_llama_cpp_program_runs_with_the_servers_oom_score_and_memor
     fails = [sys.executable, "-c", "import sys; sys.exit('failed to load model')"]
     with pytest.raises(LlamaTuneError, match="exited 1: failed to load model"):
         await quick._run_tool(fails, 10, with_stderr=False)
+
+    # and at the reference's load mode (D30): their screens add to its peak, measured at `-lm mmap`; at
+    # llama.cpp's default they would copy the host weights into memory no screen counted
+    ran: list[list[str]] = []
+
+    async def recorded(cmd: list[str], *_: Any, **__: Any) -> str:
+        ran.append(cmd)
+        return "[]"
+
+    quick._run_tool = recorded  # type: ignore[method-assign]
+    quick.text = tmp_path / "text.txt"
+    quick.arms = [ArmResult(name="reference", settings=Settings(), load_mode="mmap")]
+    await quick._run_bench()
+    await quick._perplexity(512, base=True)
+    assert [" -lm mmap " in f" {shlex.join(cmd)} " for cmd in ran] == [True, True]
 
 
 async def test_no_step_runs_past_the_hard_limit(tmp_path: Path, fake_bin: Path) -> None:

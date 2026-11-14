@@ -64,7 +64,13 @@ from localmodels.lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardT
 from localmodels.llama_builds import current_server, llama_home
 from localmodels.params import ServingParams, derive_serving_params
 from localmodels.pinned import snapshot_dir
-from localmodels.process import LocalModelsError, ServerSpec, oom_wrapped, resolve_llama_server_bin
+from localmodels.process import (
+    LOAD_MODE_FLAGS,
+    LocalModelsError,
+    ServerSpec,
+    oom_wrapped,
+    resolve_llama_server_bin,
+)
 from localmodels.pull import _default_hub_cache
 from localmodels.retune import TUNE_LIMIT_S
 from localmodels.serving.protocol import ResultMessage
@@ -609,6 +615,17 @@ class LlamaTune:
         return max((run.peak_gib for run in self._reference_runs() if run.peak_gib is not None), default=None)
 
     @property
+    def tool_load_flags(self) -> tuple[str, ...]:
+        """``-lm <mode>`` for llama-bench and llama-perplexity when the reference ran with one (D30).
+
+        Their screens add to the reference's peak, measured at that mode. Left at
+        llama.cpp's default they would copy host weights the server served from the page cache into
+        memory (Flash-Next: 26.8 GiB) that no screen counted.
+        """
+        mode = self.reference.load_mode if self.arms else ""
+        return (LOAD_MODE_FLAGS[0], mode) if mode else ()
+
+    @property
     def reference_fits(self) -> bool:
         """False once a run of the reference left less than the margin free: nothing loads it again (D22)."""
         return all(run.fits is not False for run in self._reference_runs())
@@ -957,7 +974,7 @@ class LlamaTune:
         ubatches = ",".join(str(u) for u in (UB_REFERENCE, *UB_CANDIDATES))
         cmd = bench_command(
             bench_bin, self.spec.reference.path, n_prompt=self.spec.prompt_tokens, n_gen=0,
-            repetitions=BENCH_REPETITIONS, extra_flags=("-ub", ubatches),
+            repetitions=BENCH_REPETITIONS, extra_flags=("-ub", ubatches, *self.tool_load_flags),
         )  # fmt: skip
         try:
             result = parse_bench_output(await self._run_tool(cmd, max(self.left(), 1.0), with_stderr=False))
@@ -1098,6 +1115,7 @@ class LlamaTune:
             str(self.spec.server_bin.with_name("llama-perplexity")),
             *("-m", str(self.spec.reference.path), "-c", str(KL_CHUNK), "-b", str(KL_CHUNK)),
             *("-ngl", "99", "-fa", "on", "-ub", str(ubatch)),
+            *self.tool_load_flags,
             *mode,
         ]
         result = KlResult(
