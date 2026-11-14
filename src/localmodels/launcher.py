@@ -720,7 +720,9 @@ class LocalServerManager:
         on Flash-Next, slurm 2187; a full cache sized to the floor alone would reach it, D22). Without a
         host reserve a missing projection or reading gives a cap of 0 (memory safety over a speed-up); with
         one the start is refused, as it always was. The load mode is ``_plan_load_mode``'s (D30): ``-lm mmap``
-        goes in front of the cache cap, and the need that sizes the cap is the one at that mode.
+        goes in front of the cache cap, and the need that sizes the cap is the one at that mode. Inside a
+        slurm job the cap also keeps the need plus the host reserve within the job's ask (D30's amendment):
+        the cache grows inside the job, and the site's guard stops a job over its ask.
         """
         self._launch_flags = ()
         reserve = self.guards.host_reserve_gib
@@ -754,11 +756,18 @@ class LocalServerManager:
             log.warning("prompt cache: --cache-ram 0 (%s; no cache rather than an unsized one)", problem)
             mib = 0
         else:
-            mib = max(0, min(CACHE_RAM_DEFAULT_MIB, math.floor((free - need - margin) * _MIB_PER_GIB)))
+            room = free - need - margin
+            in_ask = ""
+            ask = _job_ask_gib()  # the site's guard stops a job over its ask, whatever the machine has free
+            if ask is not None:
+                ask_room = ask - need - (reserve or 0.0)
+                room = min(room, ask_room)
+                in_ask = f", the job's {ask:.1f} GiB slurm ask leaves {ask_room:.1f} GiB"
+            mib = max(0, min(CACHE_RAM_DEFAULT_MIB, math.floor(room * _MIB_PER_GIB)))
             log.info(
-                "prompt cache: --cache-ram %s MiB (available %.1f GiB, projection %.1f GiB, margin %g GiB; "
+                "prompt cache: --cache-ram %s MiB (available %.1f GiB, projection %.1f GiB, margin %g GiB%s; "
                 "GPU shares the host's RAM)",
-                f"{mib:,}", free, need, margin,
+                f"{mib:,}", free, need, margin, in_ask,
             )  # fmt: skip
         self._launch_flags = (*load_flags, CACHE_RAM_FLAGS[-1], str(mib))
 

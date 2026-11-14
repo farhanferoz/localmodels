@@ -435,14 +435,15 @@ _CACHE_CASES = [
         id="fits-with-host-weights-no-mmap",
     ),
     # the machine has room (70 <= 80) but the slurm job asked for 55 GiB: over its ask with the host weights
-    # counted, so `-lm mmap` (preflight's guard stops a job over its ask, not one over the machine)
+    # counted, so `-lm mmap` (preflight's guard stops a job over its ask, not one over the machine); the cap
+    # comes from the ask too: 55 - 40 - 10 = 5 GiB, not the machine's 80 - 40 - 10 = 30 (clamped to 8 GiB)
     pytest.param(
         _CacheCase(
             guards=_RESERVE,
             fit_output=_HOST_HEAVY,
             available=80,
             ask_mib=55 * 1024,
-            cap=(*_MMAP, "--cache-ram", "8192"),
+            cap=(*_MMAP, "--cache-ram", "5120"),
             fit_runs=1,
         ),
         id="over-the-slurm-ask-mmap",
