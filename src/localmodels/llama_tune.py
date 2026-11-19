@@ -1691,12 +1691,15 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
             )
             raise SystemExit(msg)
         params = params.model_copy(update={"n_parallel": args.parallel})
+    if not 2 * STOP_MARGIN_S < args.limit_s < math.inf:
+        msg = f"--limit-s {args.limit_s:g}: give the job's timeout in seconds, above {2 * STOP_MARGIN_S:g}"
+        raise SystemExit(msg)
     hard = args.limit_s - STOP_MARGIN_S
     soft = hard - STOP_MARGIN_S if args.soft_limit_s is None else args.soft_limit_s
     if not 0 < soft <= hard:
         msg = (
-            f"--soft-limit-s {soft:g} must be above 0 and at most {hard:g} s (--limit-s {args.limit_s:g} "
-            f"less {STOP_MARGIN_S:g} s); raise --limit-s together with the job's timeout"
+            f"--soft-limit-s {soft:g}: give it above 0 and at most {hard:g} s (--limit-s less "
+            f"{STOP_MARGIN_S:g} s), or raise --limit-s together with the job's timeout"
         )
         raise SystemExit(msg)
     return TuneSpec(

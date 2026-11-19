@@ -989,9 +989,13 @@ def test_the_arguments_resolve_the_models_head_file_and_alternatives_from_the_hu
         ["--speculation", "draft-mtp", "--draft-file", "MTP/missing.gguf"],  # a tune never downloads
         ["--alternative", "Q4/missing.gguf"],
         ["--soft-limit-s", str(llama_tune.HARD_LIMIT_S + 1)],  # a step could start that the hard limit cuts
+        ["--soft-limit-s", "0"],
     ):
         with pytest.raises(SystemExit):
             llama_tune.spec_from_args(parse([*base, *bad]))
+    for ceiling in ("120", "inf"):  # no time left once both margins are kept; the ceiling must be finite
+        with pytest.raises(SystemExit, match=f"--limit-s {ceiling}:"):
+            llama_tune.spec_from_args(parse([*base, "--limit-s", ceiling]))
     in_dev = [*base[:-1], str(Path.home() / "dev" / "x")]
     with pytest.raises(SystemExit, match="Syncthing"):
         llama_tune.spec_from_args(parse(in_dev))
