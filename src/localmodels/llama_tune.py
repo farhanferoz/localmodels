@@ -143,7 +143,8 @@ CHECK_TIMEOUT_FACTOR: Final = 2.0
 CHECK_TIMEOUT_MIN_S: Final = 60.0
 
 # time (design 5.4, 6.7)
-# both limits follow the job's ceiling, ``retune.TUNE_LIMIT_S`` (D19): set the time there, nowhere else
+# both limits follow the job's ceiling: ``retune.TUNE_LIMIT_S`` (D19) for the tunes it submits, ``--limit-s``
+# for a job submitted by hand with a longer ``timeout`` (a model whose steps need more: Flash-Next on mmap)
 STOP_MARGIN_S: Final = 60.0
 HARD_LIMIT_S: Final = TUNE_LIMIT_S - STOP_MARGIN_S  # no step runs past it: to stop and write before SIGTERM
 SOFT_LIMIT_S: Final = HARD_LIMIT_S - STOP_MARGIN_S  # no step starts that would end past it
@@ -1634,10 +1635,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="a local folder outside ~/dev for logs and the base file (about 16 GiB while it runs)",
     )
     add(
+        "--limit-s",
+        type=float,
+        default=TUNE_LIMIT_S,
+        help="the job's ceiling, which its `timeout` enforces (default D19's 40 minutes); no step runs "
+        "past it less a minute. Raise it together with the job's timeout",
+    )
+    add(
         "--soft-limit-s",
         type=float,
-        default=SOFT_LIMIT_S,
-        help="no candidate is started that would end after this",
+        help="no candidate is started that would end after this (default: --limit-s less two minutes)",
     )
     add("--max-prompts", type=int, default=DEFAULT_MAX_PROMPTS)
     add("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -1684,6 +1691,14 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
             )
             raise SystemExit(msg)
         params = params.model_copy(update={"n_parallel": args.parallel})
+    hard = args.limit_s - STOP_MARGIN_S
+    soft = hard - STOP_MARGIN_S if args.soft_limit_s is None else args.soft_limit_s
+    if not 0 < soft <= hard:
+        msg = (
+            f"--soft-limit-s {soft:g} must be above 0 and at most {hard:g} s (--limit-s {args.limit_s:g} "
+            f"less {STOP_MARGIN_S:g} s); raise --limit-s together with the job's timeout"
+        )
+        raise SystemExit(msg)
     return TuneSpec(
         reference=reference,
         alternatives=tuple(_file_set(args.repository, args.revision, a.split(",")) for a in args.alternative),
@@ -1700,7 +1715,8 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
         quality_name=args.quality_name,
         check_s=args.check_seconds,
         headroom_gib=args.headroom_gib,
-        soft_limit_s=args.soft_limit_s,
+        soft_limit_s=soft,
+        hard_limit_s=hard,
         max_tokens=args.max_tokens,
         project=args.project,
     )

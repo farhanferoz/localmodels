@@ -976,6 +976,9 @@ def test_the_arguments_resolve_the_models_head_file_and_alternatives_from_the_hu
     assert spec.alternatives[0].path == root / "Q4" / "m.gguf"  # the reference's own repository and revision
     assert spec.alternatives[0].identity.revision == MODEL.revision
     assert spec.params.n_parallel == 4  # the interactive role's slots
+    assert (spec.hard_limit_s, spec.soft_limit_s) == (llama_tune.HARD_LIMIT_S, llama_tune.SOFT_LIMIT_S)
+    longer = llama_tune.spec_from_args(parse([*base, "--limit-s", "3600"]))  # both follow a longer ceiling
+    assert (longer.hard_limit_s, longer.soft_limit_s) == (3540.0, 3480.0)
     one_at_a_time = llama_tune.spec_from_args(parse([*base, "--parallel", "1"]))
     assert one_at_a_time.params.n_parallel == 1
     for bad in (
@@ -985,6 +988,7 @@ def test_the_arguments_resolve_the_models_head_file_and_alternatives_from_the_hu
         ["--speculation", "ngram-mod", "--draft-file", "MTP/mtp.gguf"],  # nothing takes the file
         ["--speculation", "draft-mtp", "--draft-file", "MTP/missing.gguf"],  # a tune never downloads
         ["--alternative", "Q4/missing.gguf"],
+        ["--soft-limit-s", str(llama_tune.HARD_LIMIT_S + 1)],  # a step could start that the hard limit cuts
     ):
         with pytest.raises(SystemExit):
             llama_tune.spec_from_args(parse([*base, *bad]))
