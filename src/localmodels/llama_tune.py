@@ -1067,6 +1067,7 @@ class LlamaTune:
         """
         self._stop_after_a_guard_kill()
         name = Path(cmd[0]).name
+        log.info("running %s", shlex.join(cmd))  # its flags in the log: -ub, -lm (D30), the files
         proc = await asyncio.create_subprocess_exec(
             *oom_wrapped(cmd, OOM_SCORE_ADJ),
             stdout=asyncio.subprocess.PIPE,
