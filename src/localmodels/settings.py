@@ -79,8 +79,10 @@ _SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _BAD_FILE: Final = (OSError, ValueError, KeyError, TypeError, RecursionError)  # what a damaged file raises
 _ANY_MODEL: Final = "any"  # a rules.md stamp's model= for a training method
 HISTORY_KEPT: Final = 5  # replaced records kept per model and kind
+# a candidate must beat the incumbent by more than the larger of the reference's spread, timed twice, and 5 %
+# (measured-settings design 5.5: so D1's automatic adoption does not flip a setting on noise)
 MIN_PASSES: Final = 2  # timed passes needed to measure a spread
-SPEED_MARGIN: Final = 0.05  # a candidate must beat the incumbent by more than this (and the timing spread)
+SPEED_MARGIN: Final = 0.05
 TUNING_ENV: Final = "LOCALMODELS_TUNING"  # set to TUNING_ON in a tune job: its loads queue no tune
 TUNING_ON: Final = "1"
 RETUNE_ENV: Final = (

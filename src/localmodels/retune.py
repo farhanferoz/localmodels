@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 
 from pydantic import BaseModel
 
+from localmodels import config
 from localmodels.atomic import write_text_atomically
 from localmodels.settings import (
     NO_STACK_STAMP,
@@ -57,14 +58,12 @@ DEFAULT_SUBMIT: Final = Path("~/dev/turing/preflight/slurm/submit.py")
 SYSTEM_PYTHON: Final = Path(
     "/usr/bin/python3"
 )  # the machine's interpreter, never a project's venv (design 5.2)
-MAX_LIVE_TUNES: Final = 2  # simultaneous localmodels tune jobs (design 12, question 2)
 SUBMIT_TIMEOUT_S: Final = 30
 SUBMITTING_STALE_S: Final = SUBMIT_TIMEOUT_S + 30  # a ``submitting`` file this old was left by a dead process
 RETRY_AFTER_S: Final = 3600  # a failed submission is tried again by a later lookup after this
 SLURM_TIMEOUT_S: Final = 10  # for each squeue or sacct call
 SACCT_MARGIN_S: Final = 60  # sacct is asked from this long before the attempt it looks for
 TUNE_LIMIT_S: Final = 2400  # the hard ceiling, by ``timeout``: 40 minutes (D19, was D2's 15)
-KILL_AFTER_S: Final = 30
 # slurm's ``--no-check`` reason: a tune is a GPU measurement, and a project's tune command has no CPU dry run
 NO_CHECK: Final = "the tune is itself a GPU measurement; the project's tune command has no CPU dry run"
 _CHANGE_ID_CHARS: Final = 8
@@ -263,7 +262,7 @@ def _live_count(folder: Path, now: float, queue: _Queue) -> int:
                     path,
                     pending.model_copy(update={"state": PendingState.JOB_ENDED_WITHOUT_RECORD, "at": now}),
                 )
-        if count >= MAX_LIVE_TUNES:
+        if count >= config.job_settings().retune.max_live_tunes:
             break
     return count
 
@@ -402,7 +401,7 @@ def _submit_argv(
         "--workdir", str(recipe.workdir or Path.cwd()),
         "--log", str(log_path),
         "--",
-        "timeout", f"--kill-after={KILL_AFTER_S}", str(TUNE_LIMIT_S),
+        "timeout", f"--kill-after={config.job_settings().retune.kill_after_s}", str(TUNE_LIMIT_S),
         "env", f"{TUNING_ENV}={TUNING_ON}", f"{TUNE_CHANGE_ENV}={change}",
         *recipe.command,
     ]  # fmt: skip
@@ -485,8 +484,9 @@ def _claim(path: Path, claim: Pending, change: _Change, stale: list[str]) -> Out
         if (earlier := _earlier_job(path, claim, change, found.since, queue)) is not None:
             return earlier
         path.unlink(missing_ok=True)
-    if _live_count(path.parent, claim.at, queue) >= MAX_LIVE_TUNES:
-        note = f"{MAX_LIVE_TUNES} tune jobs are already queued; a later lookup will queue it"
+    max_live = config.job_settings().retune.max_live_tunes
+    if _live_count(path.parent, claim.at, queue) >= max_live:
+        note = f"{max_live} tune jobs are already queued; a later lookup will queue it"
         return Outcome(TuneState.WAITING, None, note)
     if not _create(path, claim):
         return Outcome(TuneState.ALREADY_QUEUED, None, "another process queued it just now")

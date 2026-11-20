@@ -1,0 +1,52 @@
+# What the monthly digest (`localmodels digest run`) watches. Read by localmodels.config.digest_sources().
+# Extend a list here in a reviewed commit; the source URLs and the formats they answer in stay in digest.py.
+# Patterns are Python regular expressions; (?i) makes one ignore case.
+
+max_lines_per_source = 15  # findings printed per source; the rest are counted
+
+# llama.cpp: commits under these paths whose title matches llama_title_words, and these discussions
+llama_paths = [
+    "ggml/src/ggml-cuda",
+    "src/llama-context.cpp",
+    "common/fit.cpp",
+    "tools/server",
+    "tools/llama-bench",
+]
+llama_title_words = "(?i)nvfp4|mxfp4|blackwell|sm_12|gb10|spark|unified|fit|kv|spec|mtp|embed|rerank|load|deprecat"
+llama_discussions = [16578, 16514]
+
+# releases of these libraries that mention the GB10
+library_repos = [
+    "pytorch/ao",
+    "NVIDIA/TransformerEngine",
+    "flashinfer-ai/flashinfer",
+    "huggingface/transformers",
+]
+gb10_words = "(?i)sm_?12|GB10|DGX Spark|nvfp4|mxfp"
+engine_repos = ["vllm-project/vllm", "sgl-project/sglang", "NVIDIA/TensorRT-LLM"]
+
+# NVIDIA's DGX Spark forum: topics whose title matches
+forum_words = "(?i)llama\\.cpp|GB10|sm_121|thermal|driver|kernel|regression|freeze|unified|NGC|vLLM|SGLang"
+
+# NVIDIA/dgx-spark-playbooks folders
+playbook_dirs = [
+    "vllm",
+    "sglang",
+    "trt-llm",
+    "llama-cpp",
+    "pytorch-fine-tune",
+    "nvfp4-quantization",
+    "speculative-decoding",
+]
+
+# Spark Arena's tools, watched for releases
+arena_tools = [
+    "eugr/llama-benchy",
+    "spark-arena/sparkrun",
+    "eugr/spark-vllm-docker",
+    "timothystewart6/vllm-gb10",
+]
+
+# Hugging Face: organisations whose new models are checked, and the model families we serve
+hf_orgs = ["Qwen", "unsloth", "google", "microsoft", "openai", "nvidia", "ggml-org"]
+hf_families = "(?i)qwen|phi|gemma|gpt-oss|nemotron|glm|llama"

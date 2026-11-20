@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from localmodels import cli, engine_bench
+from localmodels import cli, config, engine_bench
 from localmodels.engine_bench import (
     TINY,
     Phase,
@@ -196,7 +196,7 @@ def test_a_failing_phase_is_recorded_as_not_measured(
     assert "no teacher-forced scoring" in no_path.phases[Phase.TEACHER_FORCED].reason
 
     def hung_benchy(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd, engine_bench.BENCHY_TIMEOUT_S)
+        raise subprocess.TimeoutExpired(cmd, config.job_settings().engine_bench.timeout_s)
 
     folder, pins = prompts
     hung = engine_bench.measure(

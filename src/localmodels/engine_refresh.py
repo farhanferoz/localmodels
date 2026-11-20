@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final, NamedTuple
 import httpx
 from pydantic import BaseModel, Field
 
-from . import engine_bench, engines, refresh, retune
+from . import config, engine_bench, engines, refresh, retune
 from .atomic import read_model, write_model, write_text_atomically
 from .container_run import (
     SEED_NEED_GIB,
@@ -107,20 +107,7 @@ HOST_RESERVE_GIB: Final = 10.0  # D22's margin
 GUARDS: Final = MemoryGuards(
     kill_below_gib=KILL_BELOW_GIB, host_reserve_gib=HOST_RESERVE_GIB, server_oom_score_adj=OOM_SCORE_ADJ
 )
-#: Hard stops by ``timeout``, seconds: a measure job (design 4.2, 40 minutes), a calibration, the same-client
-#: job, and the sparkrun comparison for each engine that has a ``current``.
-MEASURE_LIMIT_S: Final = 2400
-CALIBRATE_LIMIT_S: Final = 3600
-SAME_CLIENT_LIMIT_S: Final = 600
-SPARKRUN_LIMIT_S: Final = 2400
-JOB_MEM_MARGIN_GIB: Final = 4  # a GPU job's ``--mem`` is its whole need plus this
-#: ``timeout``'s grace after its SIGTERM: a container's stop (sparkrun stop, docker rm, up to 120 s) and the
-#: result file come first; refresh's own 30 s would SIGKILL a job mid-stop.
-KILL_AFTER_S: Final = 180
-PULL_MEM: Final = "4G"
-PULL_CPUS: Final = 2
-PULL_TIMEOUT_S: Final = 1800.0
-MIN_FREE_DISK_GB: Final = 100
+# The jobs' hard stops, memory margin, pull asks and disk floor: ``config.job_settings().engine_refresh``.
 TOOL_FETCH_TIMEOUT_S: Final = 600.0  # uvx fetching llama-benchy into its cache
 GB: Final = 1000**3
 PPL_MARGIN: Final = 0.01  # D18's perplexity rule: the noise arms' largest ratio plus this
@@ -1573,12 +1560,14 @@ class PullJob:
         self.tools = tools or (lambda cmd: run_command(cmd, timeout=TOOL_FETCH_TIMEOUT_S))
         self.folder = engine_folder(run, engine, tag)
         self.docker = docker
-        self.pull = pull or (lambda cmd: run_command(cmd, timeout=PULL_TIMEOUT_S))
+        self.pull = pull or (
+            lambda cmd: run_command(cmd, timeout=config.job_settings().engine_refresh.pull_timeout_s)
+        )
         self.sparkrun = sparkrun
         self.free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
 
     def disk_problem(self) -> str | None:
-        """Why the pull is refused for want of disk: the Docker root has under 100 GB free."""
+        """Why the pull is refused for want of disk: the Docker root has under the settings' floor free."""
         done = self.docker(["docker", "info", "--format", "{{.DockerRootDir}}"])
         root = done.stdout.strip()
         if done.returncode != 0 or not root:
@@ -1589,8 +1578,9 @@ class PullJob:
             free = self.free_bytes(root)
         except OSError as exc:
             return f"cannot read the free space of {root}: {exc}"
-        if free < MIN_FREE_DISK_GB * GB:
-            return f"refused: {root} has {free / GB:.0f} GB free, a pull needs {MIN_FREE_DISK_GB} GB"
+        floor_gb = config.job_settings().engine_refresh.min_free_disk_gb
+        if free < floor_gb * GB:
+            return f"refused: {root} has {free / GB:.0f} GB free, a pull needs {floor_gb} GB"
         return None
 
     def pulled_image(self, record: VersionRecord) -> tuple[str, str | None]:
@@ -1715,14 +1705,15 @@ def _gpu_flags(need_gib: float, after: Sequence[str]) -> list[str]:
         "restart",
         "--gpu",
         "--mem",
-        f"{math.ceil(need_gib + JOB_MEM_MARGIN_GIB)}G",
+        f"{math.ceil(need_gib + config.job_settings().engine_refresh.job_mem_margin_gib)}G",
         *_after_flags(after),
     ]
 
 
 def _timed(limit_s: int, command: Sequence[str]) -> list[str]:
     """``command`` under ``timeout``: the hard stop of the whole job."""
-    return ["timeout", f"--kill-after={KILL_AFTER_S}", str(limit_s), *command]
+    kill_after_s = config.job_settings().engine_refresh.kill_after_s
+    return ["timeout", f"--kill-after={kill_after_s}", str(limit_s), *command]
 
 
 def _job_argv(
@@ -1753,7 +1744,9 @@ def pull_argv(
     after: Sequence[str] = (),
 ) -> list[str]:
     """The CPU pull job: small, resumable (docker pull continues), and not placed on another machine."""
-    flags = ["--class", "resume", "--resume-ok", "--no-anywhere", "--cpus", str(PULL_CPUS), "--mem", PULL_MEM]
+    jobs = config.job_settings().engine_refresh
+    flags = ["--class", "resume", "--resume-ok", "--no-anywhere", "--cpus", str(jobs.pull_cpus), "--mem"]
+    flags.append(jobs.pull_mem)
     command = [
         *refresh._refresh_command(home, "engine-pull"),  # noqa: SLF001
         *("--run", str(run), "--engine", engine.value, "--tag", tag, "--publisher", publisher.value),
@@ -1795,7 +1788,7 @@ def measure_job_argv(  # noqa: PLR0913 - one job's argv: every argument is a dis
         f"{tag}-approved-{_slug(model)}" if mode is MeasureMode.APPROVED and model else tag,  # its own log
         what,
         _gpu_flags(need, after),
-        _timed(MEASURE_LIMIT_S, command),
+        _timed(config.job_settings().engine_refresh.measure_limit_s, command),
     )
 
 
@@ -1824,18 +1817,18 @@ def calibrate_argv(
         tag,
         what,
         _gpu_flags(need, after),
-        _timed(CALIBRATE_LIMIT_S, command),
+        _timed(config.job_settings().engine_refresh.calibrate_limit_s, command),
     )
 
 
 def same_client_argv(script: Path, run: Path, *, home: str | None, after: Sequence[str] = ()) -> list[str]:
     """The GPU job that measures llama.cpp's `current` on the container engines' client (10-minute stop)."""
     command = [*refresh._refresh_command(home, "same-client"), "--run", str(run)]  # noqa: SLF001
-    flags = ["--class", "restart", "--gpu", "--mem", refresh.MEASURE_MEM, *_after_flags(after)]
+    jobs = config.job_settings()
+    flags = ["--class", "restart", "--gpu", "--mem", jobs.refresh.measure_mem, *_after_flags(after)]
     what = f"llama.cpp same-client measurement (refresh {run.name})"
-    return _job_argv(
-        script, run, EngineJob.SAME_CLIENT, None, "", what, flags, _timed(SAME_CLIENT_LIMIT_S, command)
-    )
+    timed = _timed(jobs.engine_refresh.same_client_limit_s, command)
+    return _job_argv(script, run, EngineJob.SAME_CLIENT, None, "", what, flags, timed)
 
 
 def sparkrun_argv(
@@ -1857,7 +1850,7 @@ def sparkrun_argv(
         new,
         what,
         _gpu_flags(need, after),
-        _timed(SPARKRUN_LIMIT_S * max(len(current), 1), command),
+        _timed(config.job_settings().engine_refresh.sparkrun_limit_s * max(len(current), 1), command),
     )
 
 

@@ -26,6 +26,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from . import config
 from .atomic import write_text_atomically
 from .enums import WorkloadKind
 
@@ -40,27 +41,11 @@ DEFAULT_OUT_DIR = Path.home() / "cache" / "localmodels" / "digests"
 FIRST_RUN_DAYS = 35
 HTTP_TIMEOUT_S = 30
 BROWSER_AGENT = "Mozilla/5.0"
-MAX_LINES_PER_SOURCE = 15
 SHORT_SHA = 7
 
+# What is watched (paths, repositories, keywords, organisations): config.digest_sources().
 LLAMA_REPO = "ggml-org/llama.cpp"
-LLAMA_PATHS = (
-    "ggml/src/ggml-cuda",
-    "src/llama-context.cpp",
-    "common/fit.cpp",
-    "tools/server",
-    "tools/llama-bench",
-)
-LLAMA_TITLE_WORDS = re.compile(
-    r"nvfp4|mxfp4|blackwell|sm_12|gb10|spark|unified|fit|kv|spec|mtp|embed|rerank|load|deprecat",
-    re.IGNORECASE,
-)
 DEPRECATION = re.compile("deprecat", re.IGNORECASE)
-LLAMA_DISCUSSIONS = (16578, 16514)
-GB10_WORDS = re.compile(r"sm_?12|GB10|DGX Spark|nvfp4|mxfp", re.IGNORECASE)
-FORUM_WORDS = re.compile(
-    r"llama\.cpp|GB10|sm_121|thermal|driver|kernel|regression|freeze|unified|NGC|vLLM|SGLang", re.IGNORECASE
-)
 FORUM_URL = "https://forums.developer.nvidia.com/c/accelerated-computing/dgx-spark-gb10/719.json"
 FORUM_TOPIC_URL = "https://forums.developer.nvidia.com/t/{slug}/{id}"
 SPARK_DOCS = (
@@ -76,34 +61,9 @@ PYPI_RELEASE = "https://pypi.org/project/{package}/{version}/"  # the page a rea
 TORCH_ARCH_FILE = ".ci/manywheel/build_env_setup.py"
 AARCH64_ARCHS = re.compile(r'"aarch64"\s*:\s*\{([^}]*)\}')
 SM121 = "121"
-LIBRARY_REPOS = (
-    "pytorch/ao",
-    "NVIDIA/TransformerEngine",
-    "flashinfer-ai/flashinfer",
-    "huggingface/transformers",
-)
-ENGINE_REPOS = ("vllm-project/vllm", "sgl-project/sglang", "NVIDIA/TensorRT-LLM")
 PLAYBOOK_REPO = "NVIDIA/dgx-spark-playbooks"
-PLAYBOOK_DIRS = (
-    "vllm",
-    "sglang",
-    "trt-llm",
-    "llama-cpp",
-    "pytorch-fine-tune",
-    "nvfp4-quantization",
-    "speculative-decoding",
-)
 ARENA_REPO = "spark-arena/recipe-registry"
-ARENA_TOOLS = (
-    "eugr/llama-benchy",
-    "spark-arena/sparkrun",
-    "eugr/spark-vllm-docker",
-    "timothystewart6/vllm-gb10",
-)
 AWESOME_REPO = "bidual/awesome-dgx-spark"
-# Organisations whose new models are checked, and the model families we serve (extend both here).
-HF_ORGS = ("Qwen", "unsloth", "google", "microsoft", "openai", "nvidia", "ggml-org")
-HF_FAMILIES = re.compile(r"qwen|phi|gemma|gpt-oss|nemotron|glm|llama", re.IGNORECASE)
 HF_LIST_URL = "https://huggingface.co/api/models?author={org}&sort=lastModified&direction=-1&limit=20"
 HF_MODEL_URL = "https://huggingface.co/api/models/{repo}?blobs=true"  # each file with its LFS SHA-256
 HF_CACHE_PREFIX = "models--"
@@ -293,9 +253,10 @@ def check_llama_cpp(ctx: Context) -> list[Finding]:
         )
     ]
     seen: set[str] = set()
-    for path in LLAMA_PATHS:
+    watched = config.digest_sources()
+    for path in watched.llama_paths:
         for commit in ctx.commits(LLAMA_REPO, path):
-            if commit["sha"] in seen or not LLAMA_TITLE_WORDS.search(_title(commit)):
+            if commit["sha"] in seen or not watched.llama_title_words.search(_title(commit)):
                 continue
             seen.add(commit["sha"])
             red = "RED " if DEPRECATION.search(_title(commit)) else ""
@@ -309,9 +270,9 @@ def check_llama_bench_numbers(ctx: Context) -> list[Finding]:
 
 
 def check_llama_discussions(ctx: Context) -> list[Finding]:
-    """D3: discussions #16578 and #16514 updated since the last run."""
+    """D3: the watched discussions updated since the last run."""
     found = []
-    for number in LLAMA_DISCUSSIONS:
+    for number in config.digest_sources().llama_discussions:
         item = ctx.net.gh_json(f"repos/{LLAMA_REPO}/discussions/{number}")
         if item["updated_at"] > ctx.since:
             found.append(Finding(f"#{number} updated: {item['title']}", item["html_url"]))
@@ -358,13 +319,14 @@ def check_llama_cpp_python(ctx: Context) -> list[Finding]:
 
 
 def check_libraries(ctx: Context) -> list[Finding]:
-    """D5: torchao, TransformerEngine, FlashInfer, transformers releases that mention GB10."""
-    return _release_findings(ctx, LIBRARY_REPOS, pattern=GB10_WORDS)
+    """D5: releases of the watched libraries (torchao, TransformerEngine, ...) that mention GB10."""
+    watched = config.digest_sources()
+    return _release_findings(ctx, watched.library_repos, pattern=watched.gb10_words)
 
 
 def check_engines(ctx: Context) -> list[Finding]:
     """D6: a new vLLM, SGLang or TRT-LLM version, and a change of the NGC vLLM release-notes index."""
-    found = _release_findings(ctx, ENGINE_REPOS, pattern=None)
+    found = _release_findings(ctx, config.digest_sources().engine_repos, pattern=None)
     if ctx.changed("ngc_etag", ctx.net.head(NGC_VLLM_NOTES).get("etag", "")):
         found.append(Finding("NGC vLLM release-notes index changed", NGC_VLLM_NOTES))
     return found
@@ -392,14 +354,14 @@ def check_forum(ctx: Context) -> list[Finding]:
     return [
         Finding(t["title"], FORUM_TOPIC_URL.format(slug=t["slug"], id=t["id"]))
         for t in topics
-        if t["created_at"] > ctx.since and FORUM_WORDS.search(t["title"])
+        if t["created_at"] > ctx.since and config.digest_sources().forum_words.search(t["title"])
     ]
 
 
 def check_playbooks(ctx: Context) -> list[Finding]:
     """D9: new commits under the playbook folders we follow."""
     found: list[Finding] = []
-    for folder in PLAYBOOK_DIRS:
+    for folder in config.digest_sources().playbook_dirs:
         found += _commit_findings(ctx.commits(PLAYBOOK_REPO, f"nvidia/{folder}"), f"playbook {folder}: ")
     return found
 
@@ -407,7 +369,7 @@ def check_playbooks(ctx: Context) -> list[Finding]:
 def check_arena(ctx: Context) -> list[Finding]:
     """D10: Spark Arena benchmarking profile commits and new releases of its tools."""
     found = _commit_findings(ctx.commits(ARENA_REPO, "benchmarking"), "benchmarking profile: ")
-    return found + _release_findings(ctx, ARENA_TOOLS, pattern=None)
+    return found + _release_findings(ctx, config.digest_sources().arena_tools, pattern=None)
 
 
 def check_awesome(ctx: Context) -> list[Finding]:
@@ -418,9 +380,10 @@ def check_awesome(ctx: Context) -> list[Finding]:
 def check_models(ctx: Context) -> list[Finding]:
     """D12: models created since the last run, by the organisations and in the families we serve."""
     found = []
-    for org in HF_ORGS:
+    watched = config.digest_sources()
+    for org in watched.hf_orgs:
         for model in json.loads(ctx.net.get(HF_LIST_URL.format(org=org))):
-            if model.get("createdAt", "") > ctx.since and HF_FAMILIES.search(model["id"]):
+            if model.get("createdAt", "") > ctx.since and watched.hf_families.search(model["id"]):
                 found.append(Finding(f"new model {model['id']}", f"https://huggingface.co/{model['id']}"))  # noqa: PERF401
     return found
 
@@ -598,9 +561,10 @@ def render_note(day: str, since: str, outcomes: dict[Source, Outcome]) -> str:
     """The dated note: finding lines, then quiet sources, then failed sources."""
     lines = [f"# localmodels digest {day}", "", f"Changes since {since}.", "", "## Findings", ""]
     body: list[str] = []
+    most = config.digest_sources().max_lines_per_source
     for source, outcome in outcomes.items():
-        body += [format_line(source, f) for f in outcome.findings[:MAX_LINES_PER_SOURCE]]
-        if (hidden := len(outcome.findings) - MAX_LINES_PER_SOURCE) > 0:
+        body += [format_line(source, f) for f in outcome.findings[:most]]
+        if (hidden := len(outcome.findings) - most) > 0:
             body.append(format_line(source, Finding(f"{hidden} more in the raw file", ".raw")))
     lines += body or ["None."]
     quiet = [f"{s} {SOURCES[s].name}" for s, o in outcomes.items() if o.failed is None and not o.findings]

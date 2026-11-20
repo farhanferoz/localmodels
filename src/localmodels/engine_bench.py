@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 from pydantic import BaseModel, Field
 
+from . import config
 from .atomic import write_model, write_text_atomically
 from .settings import state_dir
 
@@ -70,11 +71,8 @@ END_OF_TURN: Final = ["<|im_end|>", "<|im_start|>"]
 CHARS_PER_TOKEN: Final = 4
 MIN_CHUNKS_FOR_RATE: Final = 3
 REQUEST_TIMEOUT_S: Final = 900.0
-BENCHY_TIMEOUT_S: Final = 900.0
 BENCHY_PACKAGE: Final = "llama-benchy==0.4.0"
-BENCHY_PROMPT_TOKENS: Final = 2048
 BENCHY_WRITE_TOKENS: Final = 32
-BENCHY_RUNS: Final = 3
 # what llama-benchy 0.4.0 prints (corpus.py) when it cannot load the named tokenizer and counts with gpt2's
 BENCHY_GPT2_FALLBACK: Final = "Falling back to 'gpt2' tokenizer"
 # How llama-benchy 0.4.0 (client.py) prints a refused request: it still exits 0 and saves a result whose
@@ -755,20 +753,21 @@ def phase_teacher_forced(target: Target, sizes: Sizes, text: str, engine: str) -
 
 
 def benchy_command(url: str, model: str, result_file: Path, *, tokenizer: str | None = None) -> list[str]:
-    """``uvx llama-benchy==0.4.0`` against ``url``: prompt 2,048, writing 32 tokens, JSON saved to a file.
+    """``uvx llama-benchy==0.4.0`` against ``url``: the settings' prompt and runs, writing 32 tokens, as JSON.
 
     llama-benchy appends ``/models`` and ``/chat/completions`` to its base URL itself, so it gets ``url/v1``;
     ``--model`` also names its tokenizer, so the served id travels as ``--served-model-name``.
     """
+    benchy = config.job_settings().engine_bench
     cmd = [
         "uvx",
         BENCHY_PACKAGE,
         *("--base-url", f"{url.rstrip('/')}/v1"),
         *("--model", model),
         *("--served-model-name", model),
-        *("--pp", str(BENCHY_PROMPT_TOKENS)),
+        *("--pp", str(benchy.prompt_tokens)),
         *("--tg", str(BENCHY_WRITE_TOKENS)),
-        *("--runs", str(BENCHY_RUNS)),
+        *("--runs", str(benchy.runs)),
         *("--format", "json"),
         *("--save-result", str(result_file)),
     ]
@@ -778,9 +777,9 @@ def benchy_command(url: str, model: str, result_file: Path, *, tokenizer: str | 
 
 
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    """The real runner: the command, its output captured, stopped after ``BENCHY_TIMEOUT_S``."""
+    """The real runner: the command, its output captured, stopped after the settings' ``timeout_s``."""
     return subprocess.run(  # noqa: S603 - argv built by benchy_command from fixed words and the caller's URL
-        cmd, capture_output=True, text=True, timeout=BENCHY_TIMEOUT_S, check=False
+        cmd, capture_output=True, text=True, timeout=config.job_settings().engine_bench.timeout_s, check=False
     )
 
 

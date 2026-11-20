@@ -34,7 +34,8 @@ if TYPE_CHECKING:
 #: The figures are measured at 1 and 16 requests in flight and nothing between: below 16, llama.cpp
 #: (at one request the container engines were slower, 0.82x, D16).
 MIN_CONCURRENCY: Final = 16
-#: The projected saving must be at least this many times the extra start time the container engine needs.
+#: The projected saving must be at least this many times the extra start time the container engine needs
+#: (engine registry design section 6, rule 3c: twice the break-even).
 BREAK_EVEN_FACTOR: Final = 2.0
 WRITE_FIGURE: Final = "write_tps_16_at_once"
 READ_FIGURE: Final = re.compile(r"read_tps_prefill_(\d+)")

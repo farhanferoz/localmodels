@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 
 from pydantic import BaseModel, Field
 
-from . import rules
+from . import config, rules
 from .atomic import read_model, write_model
 from .enums import WorkloadKind
 from .lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
@@ -86,16 +86,10 @@ NOTHING_TO_DO: Final = "nothing to do"  # the front of ``RunRecord.skipped`` whe
 JOB_PLACEHOLDER: Final = "<build job id>"  # what a dry run shows for the id of a job it did not submit
 LS_REMOTE_TIMEOUT_S: Final = 60
 
-# The slurm jobs (design 2.1).
-BUILD_CPUS: Final = 8
-BUILD_MEM: Final = "8G"  # measured: b12189 peaked at 5.2 GB on 8 cores (8 min 9 s), slurm advised 6G
-MEASURE_MEM: Final = "52G"  # measured: slurm 2157 peaked at 42.4 GB (GPU memory included) of 42.9 GB asked
-MEASURE_LIMIT_S: Final = 1200  # the hard stop of the whole measurement, by ``timeout``
-KILL_AFTER_S: Final = 30
+# The slurm jobs (design 2.1): their asks and hard stops are ``config.job_settings().refresh``.
 # `run --urgent`: the measure job goes through slurm's urgent.py (beside submit.py), which pauses what can be
 # paused in its way; it has no --after, so the candidate must already be built.
 URGENT_SCRIPT: Final = "urgent.py"
-URGENT_TIME: Final = "1:30:00"  # slurm's limit: the job wrapper's wait for the card (up to 1 h), then 1200 s
 URGENT_TIMEOUT_S: Final = 300  # for urgent.py itself, which looks at what is in the way before submitting
 _URGENT_JOB = re.compile(r"\[urgent\] job (\d+) submitted")
 #: slurm's pending reason for a job whose ``--after`` job did not end cleanly: it can never start, and this
@@ -113,7 +107,9 @@ SLOT_COUNTS: Final = (1, 4, 16)  # llama-batched-bench's -npl: requests at once
 # K3 on the final current (design 3; October: within +/-5e-5 of the base, 100 % same top token).
 K3_MAX_KL: Final = 1e-4
 K3_MIN_TOP: Final = 0.999
-KL_CHUNKS: Final = 40  # of 512 tokens: about 5 GB for the base file at a 248k vocabulary (design 2.3)
+# of 512 tokens: about 5 GB for the base file at a 248k vocabulary (design 2.3); D18 calibrated its limits on
+# these 40 chunks, so a change re-calibrates them
+KL_CHUNKS: Final = 40
 KL_CONTEXT: Final = 512
 COMPARISON_STEP: Final = "cmp-"  # the front of every step name that belongs to the comparison
 STEP_OK: Final = "ok"
@@ -515,7 +511,8 @@ def _refresh_command(home: str | None, command: str) -> list[str]:
 def _measure_command(home: str | None, run: Path) -> list[str]:
     """``refresh measure`` under ``timeout``, the hard stop of the whole measurement."""
     measure = [*_refresh_command(home, "measure"), "--run", str(run)]
-    return ["timeout", f"--kill-after={KILL_AFTER_S}", str(MEASURE_LIMIT_S), *measure]
+    jobs = config.job_settings().refresh
+    return ["timeout", f"--kill-after={jobs.kill_after_s}", str(jobs.measure_limit_s), *measure]
 
 
 def _submit(
@@ -549,15 +546,16 @@ def _submit(
 
 def build_argv(script: Path, run: Path, tag: str, home: str | None) -> list[str]:
     """The ``submit.py`` call of the CPU build job (resume: cmake continues an interrupted build)."""
+    jobs = config.job_settings().refresh
     flags = [
         "--class",
         "resume",
         "--resume-ok",
         "--no-anywhere",
         "--cpus",
-        str(BUILD_CPUS),
+        str(jobs.build_cpus),
         "--mem",
-        BUILD_MEM,
+        jobs.build_mem,
     ]
     what = f"llama.cpp {tag} candidate build (refresh {run.name})"
     return _submit(
@@ -573,7 +571,8 @@ def build_argv(script: Path, run: Path, tag: str, home: str | None) -> list[str]
 
 def measure_argv(script: Path, run: Path, after: str | None, home: str | None) -> list[str]:
     """The ``submit.py`` call of the GPU measure job, chained after the build job when there is one."""
-    flags = ["--class", "restart", "--gpu", "--mem", MEASURE_MEM, *(["--after", after] if after else [])]
+    mem = config.job_settings().refresh.measure_mem
+    flags = ["--class", "restart", "--gpu", "--mem", mem, *(["--after", after] if after else [])]
     what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name})"
     command = _measure_command(home, run)
     return _submit(script, run, JobName.MEASURE, what, flags, command, no_check=NO_CHECK[JobName.MEASURE])
@@ -581,7 +580,8 @@ def measure_argv(script: Path, run: Path, after: str | None, home: str | None) -
 
 def urgent_argv(script: Path, run: Path, home: str | None) -> list[str]:
     """The ``urgent.py`` call (beside ``script``) of the GPU measure job, for ``run --urgent``."""
-    flags = ["--time", URGENT_TIME, "--gpu", "--mem", MEASURE_MEM, "--wait"]
+    jobs = config.job_settings().refresh
+    flags = ["--time", jobs.urgent_time, "--gpu", "--mem", jobs.measure_mem, "--wait"]
     what = f"llama.cpp comparison and K1-K3 re-measure (refresh {run.name}, urgent)"
     return _submit(
         script.with_name(URGENT_SCRIPT),

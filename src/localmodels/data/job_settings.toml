@@ -1,0 +1,40 @@
+# Job settings: the slurm asks, hard stops and measurement sizes of the jobs localmodels submits or runs.
+# Read by localmodels.config.job_settings(). Every timer and job runs this checkout, so a change here, made in a
+# reviewed commit, is the change. Values that are ratified decisions or calibrate one stay in code with their
+# decision: D13's figures (refresh.SLOT_COUNTS), D18's 40 chunks (refresh.KL_CHUNKS), D19's 40-minute tune
+# ceiling (retune.TUNE_LIMIT_S), D21's limits (llama_tune.UB_LIMITS).
+
+[refresh]  # `localmodels refresh run`: the llama.cpp candidate's build and measure jobs (design 2.1)
+build_cpus = 8
+build_mem = "8G"  # measured: b12189 peaked at 5.2 GB on 8 cores (8 min 9 s), slurm advised 6G
+measure_mem = "52G"  # measured: slurm 2157 peaked at 42.4 GB (GPU memory included) of 42.9 GB asked
+measure_limit_s = 1200  # the hard stop of the whole measurement, by `timeout`
+kill_after_s = 30  # `timeout`'s grace after its SIGTERM
+# `run --urgent`: slurm's limit covers the job wrapper's wait for the card (up to 1 h), then measure_limit_s
+urgent_time = "1:30:00"
+
+[engine_refresh]  # the container engines' pull, measure, calibrate, same-client and sparkrun jobs
+measure_limit_s = 2400  # a measure job's hard stop by `timeout` (design 4.2, 40 minutes)
+calibrate_limit_s = 3600
+same_client_limit_s = 600
+sparkrun_limit_s = 2400  # for each engine that has a `current`
+job_mem_margin_gib = 4  # a GPU job's --mem is its whole need plus this
+# `timeout`'s grace after its SIGTERM: a container's stop (sparkrun stop, docker rm, up to 120 s) and the
+# result file come first; refresh's own 30 s would SIGKILL a job mid-stop.
+kill_after_s = 180
+pull_mem = "4G"
+pull_cpus = 2
+pull_timeout_s = 1800.0
+min_free_disk_gb = 100  # a pull is refused below this (an image is 26-37 GB, D25)
+
+[engine_bench]  # llama-benchy, the cross-check client (D23)
+timeout_s = 900.0
+prompt_tokens = 2048
+runs = 3
+
+[llama_tune]
+bench_repetitions = 3  # llama-bench's -r for each -ub candidate
+
+[retune]  # the tune jobs `settings.lookup` queues by itself (D2)
+max_live_tunes = 2  # simultaneous localmodels tune jobs (measured-settings design 12, question 2)
+kill_after_s = 30  # `timeout`'s grace after its SIGTERM

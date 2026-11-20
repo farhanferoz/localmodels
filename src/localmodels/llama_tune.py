@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 import httpx
 from pydantic import BaseModel, Field
 
+from localmodels import config
 from localmodels.bench import BenchError, bench_command, parse_bench_output
 from localmodels.enums import ServingRole, WorkloadKind
 from localmodels.hardware import (
@@ -160,7 +161,6 @@ CHECK_TIMEOUT_MIN_S: Final = 60.0
 # for a job submitted by hand with a longer ``timeout`` (a model whose steps need more: Flash-Next on mmap)
 HARD_LIMIT_S: Final = hard_limit_s(TUNE_LIMIT_S)  # no step runs past it: to stop and write before SIGTERM
 SOFT_LIMIT_S: Final = soft_limit_s(TUNE_LIMIT_S)  # no step starts that would end past it
-BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
 OUT_OF_TIME: Final = "not measured: out of time"  # a step the hard limit cut short
 NO_ROOM: Final = (
@@ -659,7 +659,8 @@ class LlamaTune:
         bench = 0.0
         if not self.bench:
             speed = self.reference.prompt_per_second or 1.0
-            bench = self.start_s + len(UB_CANDIDATES) * BENCH_REPETITIONS * self.spec.prompt_tokens / speed
+            repetitions = config.job_settings().llama_tune.bench_repetitions
+            bench = self.start_s + len(UB_CANDIDATES) * repetitions * self.spec.prompt_tokens / speed
         return bench + base + self._ppl_cost()
 
     def _ub_arm_cost(self) -> float:
@@ -974,9 +975,10 @@ class LlamaTune:
         """One ``llama-bench`` run for every -ub (it reloads the model only when its parameters change)."""
         bench_bin = self.spec.server_bin.with_name("llama-bench")
         ubatches = ",".join(str(u) for u in (UB_REFERENCE, *UB_CANDIDATES))
+        repetitions = config.job_settings().llama_tune.bench_repetitions
         cmd = bench_command(
             bench_bin, self.spec.reference.path, n_prompt=self.spec.prompt_tokens, n_gen=0,
-            repetitions=BENCH_REPETITIONS, extra_flags=("-ub", ubatches, *self.tool_load_flags),
+            repetitions=repetitions, extra_flags=("-ub", ubatches, *self.tool_load_flags),
         )  # fmt: skip
         try:
             result = parse_bench_output(await self._run_tool(cmd, max(self.left(), 1.0), with_stderr=False))

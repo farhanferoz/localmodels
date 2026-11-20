@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from localmodels import digest
+from localmodels import config, digest
 from localmodels.digest import Context, Source
 
 FIXTURES = Path(__file__).parent / "fixtures" / "digest"
@@ -44,7 +44,7 @@ class FixtureNet:
             self.json[f"{base}/commits?since={SINCE}&per_page=100&path=ggml/src/ggml-cuda"] = _fixture(
                 "llama_cuda_commits.json"
             )
-            for path in digest.LLAMA_PATHS[1:]:
+            for path in config.digest_sources().llama_paths[1:]:
                 self.json[f"{base}/commits?since={SINCE}&per_page=100&path={path}"] = []
         if forum:
             self.pages[digest.FORUM_URL] = (FIXTURES / "forum.json").read_text()
