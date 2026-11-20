@@ -86,6 +86,9 @@ def test_a_long_job_on_an_unmeasured_model_is_refused_with_the_tune_to_run_and_l
         "rule-other-model",  # K6's rule, measured on other models: not a record of this one
     )
     assert line["stamp"]["status"] == "rule-other-model"
+    gguf = ModelIdentity(repository="example/m-gguf", files=(PinnedFile(path="m.gguf", sha256="0" * 64),))
+    refused = tune_gate.require(gguf, WorkloadKind.K1, engine=Engine.LLAMA_CPP, hours=24)
+    assert "--revision <revision> --file m.gguf --kind K1" in refused.remedy  # named without its commit
     assert _require(hours="0.5") == 0  # a short job needs no record
     assert "ALLOWED" in capsys.readouterr().err
     assert _log()[-1]["allowed"] is True
@@ -121,7 +124,7 @@ def test_a_rule_or_another_identity_is_not_a_measured_record(capsys: pytest.Capt
 
 
 def test_a_call_that_can_never_find_a_record_is_refused_naming_what_to_fix(
-    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     with_file = MESMER.model_copy(update={"files": (PinnedFile(path="m.gguf", sha256="0" * 64),)})
     refused = tune_gate.require(with_file, WorkloadKind.K6, engine=Engine.PYTORCH, hours=24)
@@ -134,7 +137,22 @@ def test_a_call_that_can_never_find_a_record_is_refused_naming_what_to_fix(
         cli.main(["settings", "require", "--model", "m", "--revision", "c" * 40, "--kind", "K2",
                   "--engine", "vllm", "--hours", "24"])  # fmt: skip
     assert len(_log()) == 3  # every decision is logged, the parser's refusal is not a decision
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("store unreadable")
+
+    monkeypatch.setattr(settings, "lookup", broken)
+    failed = tune_gate.require(MESMER, WorkloadKind.K6, engine=Engine.PYTORCH, hours=24)  # never raises
+    assert (failed.allowed, failed.reason) == (False, "the check failed: RuntimeError: store unreadable")
+    assert _log()[-1]["reason"] == failed.reason
     capsys.readouterr()
+    log = settings.settings_dir() / tune_gate.GATE_LOG
+    log.unlink()
+    log.mkdir()  # a log that cannot be written
+    assert not tune_gate.require(MESMER, WorkloadKind.K6, engine=Engine.PYTORCH, hours=24).allowed
+    err = capsys.readouterr().err
+    assert "REFUSED example/mesmer-4b" in err
+    assert f"the decision is not in {log}" in err
 
 
 def test_a_hidden_gpu_is_named_instead_of_looking_up_a_cpu_record(
@@ -149,8 +167,12 @@ def test_a_hidden_gpu_is_named_instead_of_looking_up_a_cpu_record(
     assert f"this process sees no GPU though the host has one ({driver})" in err
     assert "the submitting shell, not a CPU-only job" in err
     monkeypatch.setattr(tune_gate, "DRIVER_FILES", (tmp_path / "absent",))  # a host without a GPU
+    monkeypatch.setattr(settings, "inspect_hardware", lambda: CPU)
+    _store(MESMER, hardware=hardware_key(CPU))  # a CPU measurement is no record of the job's GPU
     assert _require() == 1
-    assert "sees no GPU" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "this host has no GPU, so no record of the job's GPU can be found here" in err
+    assert "the machine whose GPU the job will use" in err
 
 
 def test_with_the_loader_given_the_check_queues_the_tune_and_names_its_job(
@@ -182,3 +204,18 @@ def test_with_the_loader_given_the_check_queues_the_tune_and_names_its_job(
     assert (line["tune"], line["tune_detail"]) == (TuneState.QUEUED.value, "101")
     assert _require(*loader[:4]) == 1  # some of the loader's flags but not all
     assert "give --project, --loader, --entry and --texts together" in capsys.readouterr().err
+    real_lookup = settings.lookup
+
+    def being_queued(*args: Any, **kwargs: Any) -> settings.SettingsAnswer:
+        answer = real_lookup(*args, **kwargs)  # as when another process is submitting the tune right now
+        return answer.model_copy(update={"tune": TuneState.ALREADY_QUEUED, "tune_detail": None})
+
+    monkeypatch.setattr(settings, "lookup", being_queued)
+    assert _require(*loader) == 1
+    err = capsys.readouterr().err
+    assert "run the check again in a minute for its slurm job id" in err
+    assert "localmodels settings tune" not in err  # a second tune by hand would duplicate it
+    broken = [*loader[:3], "fake_gate_project:missing", *loader[4:]]
+    assert _require(*broken) == 1
+    assert "the loader fake_gate_project:missing gave no declaration for mesmer-4b" in _log()[-1]["reason"]
+    assert _require(*broken, hours="0.5") == 0  # a short job does not build the tune

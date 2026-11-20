@@ -16,7 +16,7 @@ import shlex
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -73,16 +73,17 @@ def _tune_command(model: ModelIdentity, kind: WorkloadKind, engine: Engine, reci
     """The command that measures ``model`` here: the recipe's, else the tune's with placeholders to fill."""
     if recipe is not None:
         return shlex.join(recipe.command)
+    revision = model.revision or "<revision>"  # a file-set identity may be named without its commit
     if engine is Engine.LLAMA_CPP:
         files = " ".join(f"--file {shlex.quote(f.path)}" for f in model.files)
         return (
-            f"python -m localmodels.llama_tune --repository {model.repository} --revision {model.revision} "
+            f"python -m localmodels.llama_tune --repository {model.repository} --revision {revision} "
             f"{files} --kind {kind.value} --role <role> --prompts <prompts.jsonl> --prompt-tokens <n> "
             "--run-dir <dir>"
         )
     return (
         f"localmodels settings tune --project <project> --loader <module:function> --entry <entry> "
-        f"--model {model.repository} --revision {model.revision} --kind {kind.value} --texts <texts.jsonl>"
+        f"--model {model.repository} --revision {revision} --kind {kind.value} --texts <texts.jsonl>"
     )
 
 
@@ -102,11 +103,28 @@ def _shape_problem(model: ModelIdentity, kind: WorkloadKind, engine: Engine) -> 
     return ""
 
 
-def _hidden_gpu(report: HardwareReport) -> str:
-    """The driver file of a GPU this process cannot see ("" when it sees one, or the host has none)."""
+class _NoGpu(NamedTuple):
+    reason: str
+    remedy: str
+
+
+def _no_gpu(report: HardwareReport) -> _NoGpu | None:
+    """Why this process can find no record of the job's GPU, and the remedy; None when it sees a GPU.
+
+    A GPU hidden from this process (a CPU-only slurm job) and a host without one are told apart by a driver's
+    file, which neither the device cgroup nor ``CUDA_VISIBLE_DEVICES`` hides.
+    """
     if report.device is not DeviceType.CPU:
-        return ""
-    return next((str(path) for path in DRIVER_FILES if path.exists()), "")
+        return None
+    if driver := next((str(path) for path in DRIVER_FILES if path.exists()), ""):
+        return _NoGpu(
+            f"this process sees no GPU though the host has one ({driver}), so no GPU record can be found",
+            "run the check where the job's GPU is visible: the submitting shell, not a CPU-only job",
+        )
+    return _NoGpu(
+        "this host has no GPU, so no record of the job's GPU can be found here",
+        "run the check on the machine whose GPU the job will use",
+    )
 
 
 def _why_refused(answer: SettingsAnswer, hardware: str) -> str:
@@ -137,8 +155,11 @@ def _why_refused(answer: SettingsAnswer, hardware: str) -> str:
 def _remedy(answer: SettingsAnswer, command: str) -> str:
     """What to do about a refusal, by what ``lookup`` did about the tune."""
     detail = answer.tune_detail or ""
-    if answer.tune in _JOB_QUEUED and detail.isdigit():
-        return f"wait for the tune, slurm job {detail}, to end; then submit again"
+    if answer.tune in _JOB_QUEUED:
+        if detail:
+            return f"wait for the tune, slurm job {detail}, to end; then submit again"
+        # retune.py: another process is submitting the tune right now; a second one by hand would duplicate it
+        return "another process is queuing the tune now: run the check again in a minute for its slurm job id"
     why = f" (automatic tune: {answer.tune.value}{f', {detail}' if detail else ''})"
     return f"run the tune on this machine, through slurm with --gpu: {command}{why}"
 
@@ -163,10 +184,9 @@ def _decide(
         return GateDecision(allowed=True, reason=reason), None
     report = inspect_hardware()
     hardware = hardware_key(report)
-    if driver := _hidden_gpu(report):
-        reason = f"this process sees no GPU though the host has one ({driver}), so no GPU record can be found"
-        remedy = "run the check where the job's GPU is visible: the submitting shell, not a CPU-only job"
-        return GateDecision(allowed=False, reason=reason, remedy=remedy, hardware=hardware), None
+    if no_gpu := _no_gpu(report):
+        refused = GateDecision(allowed=False, reason=no_gpu.reason, remedy=no_gpu.remedy, hardware=hardware)
+        return refused, None
     answer = settings.lookup(model, kind, engine=engine, libraries=library_versions(), recipe=recipe)
     record_id = f"{answer.record.path}@{answer.record.measured_at.isoformat()}" if answer.record else None
     common: dict[str, Any] = {
@@ -206,9 +226,34 @@ def _log(decision: GateDecision, asked: dict[str, Any], answer: SettingsAnswer |
         "stamp": answer.stamp().model_dump(mode="json") if answer is not None else None,
     }
     path = settings_dir() / GATE_LOG
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line) + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line) + "\n")
+    except OSError as exc:  # the stderr line above still records the decision
+        sys.stderr.write(f"settings require: the decision is not in {path}: {exc}; fix the settings store\n")
+
+
+def _logged(
+    decision: GateDecision,
+    answer: SettingsAnswer | None,
+    model: ModelIdentity,
+    kind: WorkloadKind,
+    engine: Engine,
+    hours: float,
+    max_untuned_hours: float,
+) -> GateDecision:
+    """``decision``, after logging it with what was asked."""
+    asked = {
+        "model": model.repository,
+        "model_key": model.key,
+        "kind": kind.value,
+        "engine": engine.value,
+        "hours": hours,
+        "max_untuned_hours": max_untuned_hours,
+    }
+    _log(decision, asked, answer)
+    return decision
 
 
 def require(
@@ -223,19 +268,16 @@ def require(
     """Whether a GPU job expected to run ``hours`` may load ``model`` for ``kind`` work here; it never raises.
 
     ``recipe`` (the project's tune, ``inprocess_tune.in_process_recipe``) lets ``lookup`` queue a tune that is
-    due (D2) and is the command a refusal names. The decision is logged, allows included.
+    due (D2) and is the command a refusal names. The decision is logged, allows included; a check that fails
+    is a logged refusal naming the error, so a project's submit script gets a decision, not a traceback.
     """
-    decision, answer = _decide(model, kind, engine, hours, max_untuned_hours, recipe)
-    asked = {
-        "model": model.repository,
-        "model_key": model.key,
-        "kind": kind.value,
-        "engine": engine.value,
-        "hours": hours,
-        "max_untuned_hours": max_untuned_hours,
-    }
-    _log(decision, asked, answer)
-    return decision
+    try:
+        decision, answer = _decide(model, kind, engine, hours, max_untuned_hours, recipe)
+    except Exception as exc:  # noqa: BLE001 - a guard decides; an error it cannot settle refuses the job
+        reason = f"the check failed: {type(exc).__name__}: {exc}"
+        decision = GateDecision(allowed=False, reason=reason, remedy="fix the error, then check again")
+        answer = None
+    return _logged(decision, answer, model, kind, engine, hours, max_untuned_hours)
 
 
 def cmd_settings_require(args: argparse.Namespace) -> int:
@@ -254,7 +296,17 @@ def cmd_settings_require(args: argparse.Namespace) -> int:
         sys.stderr.write(f"settings require: cannot identify the model (give --revision or --file): {exc}\n")
         return 1
     kind, engine = WorkloadKind(args.kind), Engine(args.engine)
-    recipe = _recipe(args, model, kind) if all(loader_flags) and engine is Engine.PYTORCH else None
+    recipe = None
+    if all(loader_flags) and engine is Engine.PYTORCH and args.hours > args.max_untuned_hours:
+        try:
+            recipe = _recipe(args, model, kind)
+        except Exception as exc:  # noqa: BLE001 - the project's own loader code; any failure is a logged refusal
+            failure = f"{type(exc).__name__}: {exc}"
+            reason = f"the loader {args.loader} gave no declaration for {args.entry}: {failure}"
+            remedy = "fix --loader or --entry: the factory must import and declare the entry"
+            refused = GateDecision(allowed=False, reason=reason, remedy=remedy)
+            _logged(refused, None, model, kind, engine, args.hours, args.max_untuned_hours)
+            return 1
     decision = require(
         model, kind, engine=engine, hours=args.hours, max_untuned_hours=args.max_untuned_hours, recipe=recipe
     )
