@@ -1343,15 +1343,24 @@ def record_from_tune(
     )
 
 
+def identity_of(repository: str, revision: str | None, files: list[str] | None) -> ModelIdentity:
+    """The identity a command's ``--model``, ``--revision`` and ``--file`` flags name, as tunes file records.
+
+    Files make a file-set identity (a GGUF model, read from the Hub cache), else the repository and revision.
+
+    Raises:
+        ValueError: no revision and no file, or a file whose blob is not a SHA-256.
+    """
+    if files:
+        return ModelIdentity.from_hub_files(repository, revision or "", files)
+    return ModelIdentity(repository=repository, revision=revision or "")
+
+
 def cmd_settings_show(args: argparse.Namespace) -> int:
     """`localmodels settings show`: print one lookup answer; nothing is loaded and nothing is queued."""
     kind, engine = WorkloadKind(args.kind), Engine(args.engine)
     try:
-        model = (
-            ModelIdentity.from_hub_files(args.model, args.revision or "", args.file)
-            if args.file
-            else ModelIdentity(repository=args.model, revision=args.revision or "")
-        )
+        model = identity_of(args.model, args.revision, args.file)
     except ValueError as exc:  # no --revision or --file, or a file whose blob is not a hash
         sys.stderr.write(f"cannot identify the model (give --revision or --file): {exc}\n")
         return 1

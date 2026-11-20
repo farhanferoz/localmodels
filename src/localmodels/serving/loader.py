@@ -121,6 +121,11 @@ class LoaderDeclaration(BaseModel):
         """The reference setting: what a project passes as ``lookup``'s ``default``."""
         return self.reference
 
+    def reference_name(self) -> str:
+        """The reference candidate's name as ``candidates`` gives it (a recipe's ``reference``)."""
+        dtype = next(d for d in self.dtypes if d == self.reference.dtype)
+        return _name(dtype, {name: self.reference.options[name] for name in self.options})
+
     def complete(self, settings: Settings) -> Settings:
         """``settings`` with a missing dtype or option filled from the reference.
 

@@ -42,6 +42,7 @@ from .setup import (
     run_setup,
 )
 from .stack import Engine
+from .tune_gate import register_require
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -310,6 +311,7 @@ def _build_settings_parser(subparsers: argparse._SubParsersAction[argparse.Argum
     check_p.add_argument("--home", default=None, help="llama home, where the `current` build is")
     check_p.set_defaults(fn=cmd_settings_check)
     register_tune(commands)
+    register_require(commands)
 
 
 def build_parser() -> argparse.ArgumentParser:
