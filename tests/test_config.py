@@ -31,6 +31,9 @@ def test_the_tracked_files_load_and_a_broken_one_is_refused_naming_it(
     edited.write_text(shipped.replace("[retune]", "[retunes]"))  # a misspelt section is not silently ignored
     with pytest.raises(ValueError, match="retunes"):
         config._read(config.JOB_SETTINGS_FILE, config.JobSettings)
+    edited.unlink()
+    with pytest.raises(ValueError, match=rf"cannot read {tmp_path}/data/job_settings\.toml: .*reinstall"):
+        config._read(config.JOB_SETTINGS_FILE, config.JobSettings)
 
 
 def test_a_changed_setting_is_what_each_job_and_the_digest_use(

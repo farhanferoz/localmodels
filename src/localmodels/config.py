@@ -17,7 +17,15 @@ import tomllib
 from importlib import resources
 from typing import Annotated, Any, Final
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    StringConstraints,
+    ValidationError,
+)
 
 JOB_SETTINGS_FILE: Final = "data/job_settings.toml"
 DIGEST_SOURCES_FILE: Final = "data/digest_sources.toml"
@@ -50,7 +58,7 @@ class EngineRefreshJobs(_Section):
     calibrate_limit_s: PositiveInt
     same_client_limit_s: PositiveInt
     sparkrun_limit_s: PositiveInt
-    job_mem_margin_gib: PositiveInt
+    job_mem_margin_gib: NonNegativeInt
     kill_after_s: PositiveInt
     pull_mem: SlurmMem
     pull_cpus: PositiveInt
@@ -95,7 +103,7 @@ class DigestSources(_Section):
     max_lines_per_source: PositiveInt
     llama_paths: tuple[str, ...]
     llama_title_words: re.Pattern[str]
-    llama_discussions: tuple[int, ...]
+    llama_discussions: tuple[PositiveInt, ...]
     library_repos: tuple[str, ...]
     gb10_words: re.Pattern[str]
     engine_repos: tuple[str, ...]
@@ -110,14 +118,18 @@ def _read[T: BaseModel](name: str, model: type[T]) -> T:
     """The packaged file ``name`` as ``model``.
 
     Raises:
-        ValueError: the file is not valid TOML or does not match ``model``, naming the file and the field.
+        ValueError: the file cannot be read, is not valid TOML or does not match ``model``, naming the file
+            (where this installation holds it) and the field.
     """
-    text = resources.files("localmodels").joinpath(name).read_text(encoding="utf-8")
+    resource = resources.files("localmodels").joinpath(name)
     try:
-        data: dict[str, Any] = tomllib.loads(text)
+        data: dict[str, Any] = tomllib.loads(resource.read_text(encoding="utf-8"))
         return model.model_validate(data)
+    except OSError as exc:
+        msg = f"cannot read {resource}: {exc}; reinstall localmodels, or restore the file from git"
+        raise ValueError(msg) from exc
     except (tomllib.TOMLDecodeError, ValidationError) as exc:
-        msg = f"src/localmodels/{name} is not valid: {exc}; fix that file"
+        msg = f"{resource} is not valid: {exc}; fix that file"
         raise ValueError(msg) from exc
 
 
