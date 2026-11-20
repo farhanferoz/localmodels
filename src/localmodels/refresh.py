@@ -44,7 +44,6 @@ from .enums import WorkloadKind
 from .lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
 from .llama_builds import (
     COMPARISON_FILE,
-    REFERENCE_BUILD,
     REPO_URL,
     builds_dir,
     compile_commit,
@@ -53,6 +52,7 @@ from .llama_builds import (
     folder_for,
     llama_home,
     prune_builds,
+    reference_build,
     server_binary,
     switch,
 )
@@ -1402,7 +1402,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     build.add_argument("--run", required=True, help="the run folder")
     build.add_argument("--commit", required=True, help="the release tag to build")
     build.add_argument(
-        "--reference", default=str(REFERENCE_BUILD), help="build whose CMakeCache.txt to reproduce"
+        "--reference", default=str(reference_build()), help="build whose CMakeCache.txt to reproduce"
     )
     build.set_defaults(fn=cmd_build)
 

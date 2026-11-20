@@ -82,7 +82,8 @@ log = logging.getLogger(__name__)
 GIB: Final = 1024**3
 TELEMETRY_ENV: Final = {"SPARKRUN_NO_TELEMETRY": "1"}
 SPARKRUN_REPO: Final = "https://github.com/spark-arena/sparkrun"
-SPARKRUN_ROOT: Final = Path.home() / "cache" / "localmodels" / "sparkrun"
+SPARKRUN_ROOT_ENV: Final = "LOCALMODELS_SPARKRUN_ROOT"
+DEFAULT_SPARKRUN_ROOT: Final = Path("~/cache/localmodels/sparkrun")
 HUB_ROOT: Final = Path.home() / ".cache" / "huggingface"
 RUN_LABEL: Final = "localmodels.run"
 JOB_LABEL: Final = "slurm-job"  # preflight's gpu_jobs.JOB_LABEL
@@ -159,9 +160,14 @@ def run_sparkrun(
     return run_command(argv, timeout=timeout, env=env)
 
 
-def ensure_sparkrun(tag: str, *, root: Path = SPARKRUN_ROOT, runner: Runner = docker_runner) -> Path:
+def sparkrun_root() -> Path:
+    """Where pinned sparkrun checkouts live: ``$LOCALMODELS_SPARKRUN_ROOT``, else the default folder."""
+    return Path(os.environ.get(SPARKRUN_ROOT_ENV) or DEFAULT_SPARKRUN_ROOT).expanduser()
+
+
+def ensure_sparkrun(tag: str, *, root: Path | None = None, runner: Runner = docker_runner) -> Path:
     """The sparkrun binary of ``tag``, installed from its git tag on first use; telemetry off."""
-    home = root / tag
+    home = (root or sparkrun_root()) / tag
     binary = home / "venv" / "bin" / "sparkrun"
     if binary.is_file():
         return binary

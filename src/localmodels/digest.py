@@ -37,7 +37,6 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 
 DEFAULT_OUT_DIR = Path.home() / "cache" / "localmodels" / "digests"
-LLAMA_CPP_DIR = Path.home() / "dev" / "llama.cpp"
 FIRST_RUN_DAYS = 35
 HTTP_TIMEOUT_S = 30
 BROWSER_AGENT = "Mozilla/5.0"
@@ -275,11 +274,11 @@ def _release_findings(
 
 def _installed_llama_commit(net: Net) -> str:
     """The build ``current`` points to (what projects run); else the hand-made build's commit."""
-    from .llama_builds import current_commit, llama_home  # noqa: PLC0415 - llama_builds does not import this
+    from .llama_builds import current_commit, llama_home, reference_checkout  # noqa: PLC0415 - llama_builds does not import this
 
     return (
         current_commit(llama_home())
-        or net.run(["git", "-C", str(LLAMA_CPP_DIR), "rev-parse", "HEAD"]).strip()
+        or net.run(["git", "-C", str(reference_checkout()), "rev-parse", "HEAD"]).strip()
     )
 
 

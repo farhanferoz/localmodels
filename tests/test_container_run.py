@@ -671,3 +671,16 @@ async def _serve_answer(
 ) -> container_run.BulkServer:
     async with container_run.bulk_server(answer, fallback=fallback) as served:
         return served
+
+
+def test_the_sparkrun_folder_follows_its_setting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed sparkrun is found under ``$LOCALMODELS_SPARKRUN_ROOT``, with nothing run."""
+    monkeypatch.setenv(container_run.SPARKRUN_ROOT_ENV, str(tmp_path))
+    binary = tmp_path / "v0.4.2" / "venv" / "bin" / "sparkrun"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("nothing is installed when the binary is there")
+
+    assert container_run.ensure_sparkrun("v0.4.2", runner=refuse) == binary  # type: ignore[arg-type]

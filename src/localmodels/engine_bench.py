@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import statistics
 import subprocess
 import tempfile
@@ -86,8 +87,12 @@ VARIANT_STRIDE: Final = 7919  # a prime, so successive variants start far apart 
 # Where D16 read its inputs from, and what they hash to. The pinned text is the text of llama.cpp's docs/*.md
 # (sorted, read with errors ignored, joined by a blank line) at commit ccc3646 (unchanged since 2026-09-07,
 # before D16 ran); the judge prompts are tracecraft's rendered judge prompts of hl5.
-D16_DOCS_DIR: Final = Path("/home/ff235/dev/llama.cpp/docs")
-D16_JUDGE_PROMPTS: Final = Path("/home/ff235/cache/localmodels/hl5/prompts.jsonl")
+# The docs folder is ``docs`` of the reference checkout (``llama_builds.reference_checkout()``); the judge
+# prompts' folder is ``$LOCALMODELS_HL5_DIR``, else where HL5 left them. The SHA-256 pins are the record.
+D16_DOCS_SUBDIR: Final = "docs"
+HL5_DIR_ENV: Final = "LOCALMODELS_HL5_DIR"
+DEFAULT_HL5_DIR: Final = Path("~/cache/localmodels/hl5")
+D16_JUDGE_FILE: Final = "prompts.jsonl"
 JUDGE_FILE: Final = "judge_prompts.jsonl"
 TEXT_FILE: Final = "pinned_text.txt"
 JUDGE_SHA256: Final = "30a293c19cfb15e580dd3e757b18f3b25d9e089d95fac445df9ba4a877d4236f"
@@ -347,13 +352,22 @@ def load_prompts(folder: Path | None = None, pins: PromptPins | None = None) -> 
 def install_prompts(
     folder: Path | None = None,
     *,
-    docs_dir: Path = D16_DOCS_DIR,
-    judge_source: Path = D16_JUDGE_PROMPTS,
+    docs_dir: Path | None = None,
+    judge_source: Path | None = None,
     pins: PromptPins | None = None,
 ) -> list[Path]:
-    """Copy what D16 used into ``folder``, refusing a source whose SHA-256 is not the pinned one."""
+    """Copy what D16 used into ``folder``, refusing a source whose SHA-256 is not the pinned one.
+
+    ``docs_dir`` defaults to the reference checkout's ``docs``; ``judge_source`` to ``prompts.jsonl`` in
+    ``$LOCALMODELS_HL5_DIR``, else ``~/cache/localmodels/hl5``.
+    """
+    from .llama_builds import reference_checkout  # noqa: PLC0415 - only an install reads the checkout
+
     folder = folder or prompts_dir()
     pins = pins or PINS
+    docs_dir = docs_dir or reference_checkout() / D16_DOCS_SUBDIR
+    hl5 = Path(os.environ.get(HL5_DIR_ENV) or DEFAULT_HL5_DIR).expanduser()
+    judge_source = judge_source or hl5 / D16_JUDGE_FILE
     try:
         judge = judge_source.read_bytes()
         text = "\n\n".join(p.read_text(errors="ignore") for p in sorted(docs_dir.glob("*.md"))).encode()

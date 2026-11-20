@@ -229,7 +229,7 @@ def test_a_server_that_cannot_answer_skips_the_slow_phases(prompts: tuple[Path, 
 
 
 def test_a_changed_prompt_file_is_refused_by_its_hash(
-    stub: StubEngine, prompts: tuple[Path, PromptPins], tmp_path: Path
+    stub: StubEngine, prompts: tuple[Path, PromptPins], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     folder, pins = prompts
     _write(folder / engine_bench.TEXT_FILE, "w0 w1 changed")
@@ -251,6 +251,13 @@ def test_a_changed_prompt_file_is_refused_by_its_hash(
     written = engine_bench.install_prompts(tmp_path / "out", docs_dir=docs, judge_source=judge, pins=good)
     assert sorted(p.name for p in written) == sorted([engine_bench.JUDGE_FILE, engine_bench.TEXT_FILE])
     assert engine_bench.load_prompts(tmp_path / "out", good).judge == ("p",)
+    # with no paths given, the sources are found through their settings, not this machine's home folder
+    monkeypatch.setenv("LOCALMODELS_LLAMA_CHECKOUT", str(tmp_path))  # its docs/ is the folder above
+    monkeypatch.setenv(engine_bench.HL5_DIR_ENV, str(tmp_path / "hl5"))
+    (tmp_path / "hl5").mkdir()
+    judge.rename(tmp_path / "hl5" / engine_bench.D16_JUDGE_FILE)
+    engine_bench.install_prompts(tmp_path / "out2", pins=good)
+    assert engine_bench.load_prompts(tmp_path / "out2", good).judge == ("p",)
 
 
 def test_benchy_command_is_pinned_and_its_json_read(tmp_path: Path) -> None:

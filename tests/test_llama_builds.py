@@ -6,7 +6,7 @@ import json
 from typing import TYPE_CHECKING
 
 from localmodels.cli import main
-from localmodels.llama_builds import cmake_options, prune_builds, switch
+from localmodels.llama_builds import CHECKOUT_ENV, cmake_options, current_server, prune_builds, switch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,8 +66,10 @@ def test_build_reproduces_the_command_line_options_and_not_the_rest(
 
 
 def test_switch_is_refused_until_a_comparison_passed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv(CHECKOUT_ENV, str(tmp_path / "checkout"))  # before any switch: the hand-made build's
+    assert current_server(tmp_path) == tmp_path / "checkout" / "build" / "bin" / "llama-server"
     make_build(tmp_path, "abc1234")
     base = ["llama", "--home", str(tmp_path), "switch", "abc1234"]
     assert main(base) == 1

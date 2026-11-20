@@ -47,9 +47,11 @@ EXIT_ERROR: Final = 1
 
 HOME_ENV: Final = "LOCALMODELS_LLAMA_HOME"
 DEFAULT_HOME: Final = Path.home() / "cache" / "llama.cpp"
-#: The hand-made build that is in use today: its CMakeCache.txt is the configuration to reproduce, and
-#: its llama-server is "current" until a build is switched to.
-REFERENCE_BUILD: Final = Path.home() / "dev" / "llama.cpp" / "build"
+CHECKOUT_ENV: Final = "LOCALMODELS_LLAMA_CHECKOUT"
+DEFAULT_CHECKOUT: Final = Path("~/dev/llama.cpp")
+#: The hand-made build inside the reference checkout (a fact of that checkout's layout): its CMakeCache.txt is
+#: the configuration to reproduce, and its llama-server is "current" until a build is switched to.
+REFERENCE_BUILD_DIR: Final = "build"
 REPO_URL: Final = "https://github.com/ggml-org/llama.cpp"
 SERVER_BINARY: Final = Path("bin") / "llama-server"
 CURRENT: Final = "current"
@@ -98,10 +100,20 @@ def server_binary(build: Path) -> Path:
     return build / SERVER_BINARY
 
 
-def current_server(home: Path, reference: Path = REFERENCE_BUILD) -> Path:
-    """The ``llama-server`` of the ``current`` build, else of the hand-made reference build."""
+def reference_checkout() -> Path:
+    """The hand-made llama.cpp checkout: ``$LOCALMODELS_LLAMA_CHECKOUT``, else ``~/dev/llama.cpp``."""
+    return Path(os.environ.get(CHECKOUT_ENV) or DEFAULT_CHECKOUT).expanduser()
+
+
+def reference_build() -> Path:
+    """The hand-made build in the reference checkout (``reference_checkout() / "build"``)."""
+    return reference_checkout() / REFERENCE_BUILD_DIR
+
+
+def current_server(home: Path, reference: Path | None = None) -> Path:
+    """The ``llama-server`` of the ``current`` build, else of ``reference`` (or ``reference_build()``)."""
     link = server_binary(builds_dir(home) / CURRENT)
-    return link if link.is_file() else server_binary(reference)
+    return link if link.is_file() else server_binary(reference or reference_build())
 
 
 def cmake_options(cache_file: Path) -> list[str]:
@@ -403,7 +415,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     build.add_argument("--commit", required=True, help="commit (or branch) of ggml-org/llama.cpp")
     build.add_argument(
-        "--reference", default=str(REFERENCE_BUILD), help="build whose CMakeCache.txt to reproduce"
+        "--reference", default=str(reference_build()), help="build whose CMakeCache.txt to reproduce"
     )
     build.add_argument("--dry-run", action="store_true", help="print the git and cmake commands and stop")
     build.set_defaults(fn=cmd_build)
