@@ -76,9 +76,10 @@ from .enums import ModelSizeClass
 from .launcher import LocalServerManager, MemoryGuards, ServerStartError
 from .lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardTimeoutError
 from .llama_builds import current_commit, current_server, link_target, llama_home
-from .llama_tune import KILL_BELOW_GIB, OOM_SCORE_ADJ
+from .llama_tune import OOM_SCORE_ADJ
 from .params import ServingParams
 from .process import ServerSpec
+from .serving.tune import KILL_BELOW_GIB
 from .stack import Engine
 
 if TYPE_CHECKING:

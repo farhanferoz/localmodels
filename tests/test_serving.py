@@ -11,12 +11,14 @@ import os
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from localmodels.enums import DeviceTier, DeviceType
+from localmodels.enums import DeviceTier, DeviceType, Precision
 from localmodels.hardware import HardwareReport
 from localmodels.lease import GpuLease, GpuLeaseClient
 from localmodels.serving import (
@@ -24,6 +26,8 @@ from localmodels.serving import (
     InferMessage,
     LazyRegistry,
     LoadedMessage,
+    LoaderDeclaration,
+    LoaderServer,
     LoadMessage,
     Message,
     ModelHost,
@@ -35,11 +39,15 @@ from localmodels.serving import (
     ServingError,
     ServingErrorCode,
     ShutdownMessage,
+    TooManyCandidates,
+    candidates,
     decode,
     encode,
     require_device,
+    resolve_factory,
     serve,
 )
+from localmodels.stack import Settings
 from tests.echo_server import EchoServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -333,3 +341,177 @@ def test_network_access_is_refused_and_counted_while_local_sockets_still_work() 
         [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
     )
     assert out.stdout.strip() == "['connect', 'lookup']"
+
+
+# ---- the loader server and the candidates taken from a loader's declaration ----------------------
+
+GIB = 1024**3
+BF16, FP16 = Precision.BFLOAT16, Precision.FLOAT16
+REFERENCE_OPTIONS = {"int8": False, "tokens": 1000}
+DECLARATION = LoaderDeclaration(
+    dtypes=(BF16, FP16),
+    options={"int8": (False, True), "tokens": (1000, 2000, 4000)},
+    reference=Settings(dtype=BF16, options=REFERENCE_OPTIONS),
+)
+
+
+class _FakeLoader:
+    """A project's loader; the entry name picks what its scorer does."""
+
+    def __init__(self, entry: str) -> None:
+        self.entry = entry
+
+    def declare(self) -> LoaderDeclaration:
+        return DECLARATION
+
+    def load(self, model_dir: Path, settings: Settings, device: str) -> Any:
+        if self.entry == "missing":
+            raise FileNotFoundError(2, "no such file", str(model_dir / "weights.bin"))
+        assert (settings.dtype, device) == (BF16, "cuda")
+        return {
+            "short": lambda texts: [1.0] * (len(texts) - 1),
+            "nan": lambda texts: [float("nan")] * len(texts),
+        }.get(self.entry, lambda texts: [len(t) / 10 for t in texts])
+
+
+@pytest.fixture
+def fake_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A project module with a loader factory, a stub PyTorch and the texts of one request in ``tmp_path``."""
+    project = types.ModuleType("fake_project_loaders")
+    project.model = _FakeLoader  # type: ignore[attr-defined]
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        memory_allocated=lambda: 2 * GIB,
+        memory_reserved=lambda: 3 * GIB,
+        reset_peak_memory_stats=lambda: None,
+        max_memory_allocated=lambda: 5 * GIB,
+    )
+    monkeypatch.setitem(sys.modules, "fake_project_loaders", project)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr("localmodels.serving.server.block_network", list)  # it would patch this process
+    rows = [{"id": "a", "text": "four"}, {"id": "b", "text": "twelve chars"}]
+    (tmp_path / "texts.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return tmp_path
+
+
+def _loader_replies(entry: str, folder: Path, *, dtype: Precision = BF16, **options: object) -> list[Message]:
+    load = LoadMessage(model_dir=str(folder), revision="r", dtype=dtype, options=options)
+    out = io.BytesIO()
+    lines = [encode(load), encode(InferMessage(request_id="q", input_dir=str(folder)))]
+    serve(LoaderServer("fake_project_loaders:model", entry), io.BytesIO(b"".join(lines)), out)
+    return [decode(line) for line in out.getvalue().splitlines()]
+
+
+def test_the_loader_server_scores_the_texts_by_id_and_reports_memory(fake_project: Path) -> None:
+    loaded, result = _loader_replies("ok", fake_project, int8=False, tokens=2000)
+    assert isinstance(loaded, LoadedMessage)
+    assert (loaded.torch_allocated_gib, loaded.torch_reserved_gib) == (2.0, 3.0)
+    assert isinstance(result, ResultMessage)
+    assert result.native_outputs == {"scores": {"a": 0.4, "b": 1.2}}
+    assert (result.request_id, result.peak_allocated_gib) == ("q", 5.0)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "options", "named"),
+    [
+        (Precision.FLOAT32, {}, "float32"),
+        (BF16, {"int8": "maybe"}, "'maybe'"),
+        (BF16, {"int8": 1}, "1"),  # True is declared, 1 is not
+        (BF16, {"cuda_graphs": True}, "'cuda_graphs'"),
+    ],
+    ids=["dtype", "value", "value-of-another-type", "option"],
+)
+def test_the_loader_server_refuses_what_the_loader_did_not_declare(
+    fake_project: Path, dtype: Precision, options: dict[str, object], named: str
+) -> None:
+    error = _loader_replies("ok", fake_project, dtype=dtype, **options)[0]
+    assert isinstance(error, ErrorMessage)
+    assert error.code == ServingErrorCode.BAD_INPUT
+    assert named in error.message
+    assert "declared" in error.message
+
+
+def test_a_weight_file_the_snapshot_lacks_is_named_by_its_path(fake_project: Path) -> None:
+    error = _loader_replies("missing", fake_project)[0]
+    assert isinstance(error, ErrorMessage)
+    assert error.code == ServingErrorCode.BAD_INPUT
+    assert (
+        error.message
+        == f"{fake_project / 'weights.bin'} is missing from the snapshot; download it before tuning"
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ("short", "the scorer returned 1 values for 2 texts"),
+        ("nan", "the scorer returned a non-finite score for a"),
+    ],
+)
+def test_a_scorer_that_returns_too_few_or_a_non_finite_score_is_an_internal_error(
+    fake_project: Path, entry: str, message: str
+) -> None:
+    error = _loader_replies(entry, fake_project)[1]
+    assert isinstance(error, ErrorMessage)
+    assert (error.code, error.message) == (ServingErrorCode.INTERNAL, message)
+
+
+@pytest.mark.parametrize(
+    ("change", "refusal"),
+    [
+        ({"dtypes": ()}, "at least one dtype"),
+        (
+            {"reference": Settings(dtype=Precision.FLOAT32, options={"int8": False, "tokens": 1000})},
+            "float32",
+        ),
+        (
+            {"reference": Settings(dtype=BF16, options={"int8": False})},
+            "exactly one value per declared option",
+        ),
+        ({"reference": Settings(dtype=BF16, options={"int8": False, "tokens": 3})}, "3 of option 'tokens'"),
+        ({"options": {"int8": (), "tokens": (1000,)}}, "Option 'int8' declares no values"),
+    ],
+    ids=["no-dtype", "reference-dtype", "reference-lacks-option", "reference-value", "option-without-values"],
+)
+def test_a_declaration_whose_reference_is_not_among_its_declared_values_is_refused(
+    change: dict[str, Any], refusal: str
+) -> None:
+    with pytest.raises(ValidationError, match=refusal):
+        LoaderDeclaration(**{**DECLARATION.model_dump(), **change})
+
+
+def test_candidates_are_the_product_with_the_reference_first_then_single_changes_then_pairs() -> None:
+    names = [c.name for c in candidates(DECLARATION, 12)]
+    assert names == [
+        "bfloat16,int8=false,tokens=1000",  # the reference
+        "float16,int8=false,tokens=1000",  # one change each: dtype, then int8, then tokens in declared order
+        "bfloat16,int8=true,tokens=1000",
+        "bfloat16,int8=false,tokens=2000",
+        "bfloat16,int8=false,tokens=4000",
+        "float16,int8=true,tokens=1000",  # two changes
+        "float16,int8=false,tokens=2000",
+        "float16,int8=false,tokens=4000",
+        "bfloat16,int8=true,tokens=2000",
+        "bfloat16,int8=true,tokens=4000",
+        "float16,int8=true,tokens=2000",  # three
+        "float16,int8=true,tokens=4000",
+    ]
+    assert candidates(DECLARATION, 12)[2].options == {"int8": True, "tokens": 1000}
+    with pytest.raises(TooManyCandidates, match=r"12 candidates.*cap of 11.*declare fewer values"):
+        candidates(DECLARATION, 11)
+    alone = LoaderDeclaration(dtypes=(BF16,), options={}, reference=Settings(dtype=BF16))
+    assert [c.name for c in candidates(alone, 1)] == ["bfloat16"]
+
+
+def test_a_loader_factory_is_found_by_module_and_attribute_or_refused_naming_the_spec(
+    fake_project: Path,
+) -> None:
+    assert resolve_factory("fake_project_loaders:model") is _FakeLoader
+    for spec in (
+        "fake_project_loaders",
+        "fake_project_loaders:nothing",
+        "no_such_module_here:model",
+        ":model",
+    ):
+        with pytest.raises(ValueError, match=f"Loader '{spec}'.*MODULE:ATTRIBUTE"):
+            resolve_factory(spec)

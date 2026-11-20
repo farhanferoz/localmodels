@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,8 +16,10 @@ from localmodels.serving import (
     InferMessage,
     LoadMessage,
     ResultMessage,
+    TuneBudget,
     TuneCandidate,
     TuneError,
+    TuneMeasurement,
     TuneRecord,
     embedding_cosine,
     hardware_key,
@@ -26,7 +29,8 @@ from localmodels.serving import (
     score_agreement,
     text_agreement,
 )
-from localmodels.serving.tune import DEADLINE_ERROR
+from localmodels.serving import tune as tune_module
+from localmodels.serving.tune import DEADLINE_ERROR, free_margin_gib, measurement_line
 from tests.test_serving import ECHO_ARGV, ECHO_ENV
 
 if TYPE_CHECKING:
@@ -52,13 +56,13 @@ BROKEN = TuneCandidate(name="bad", dtype=Precision.FLOAT16, options={"fail_dtype
 def tune(
     *candidates: TuneCandidate,
     repeats: int = 1,
-    deadline: float | None = None,
+    budget: TuneBudget | None = None,
     inputs: list[InferMessage] = INPUTS,
 ) -> TuneRecord:
     return run_tune(
         argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=inputs, candidates=candidates,
         quality=text_agreement(0.9), quality_name="text 0.9", headroom_gib=0.0, hardware=CPU,
-        repeats=repeats, deadline=deadline,
+        repeats=repeats, budget=budget,
     )  # fmt: skip
 
 
@@ -85,14 +89,37 @@ def test_the_reference_reports_its_libraries_and_each_timed_pass_is_totalled() -
     assert reference.pass_s == pytest.approx([times[0] + times[1], times[2] + times[3]])
 
 
-def test_a_deadline_stops_new_candidates_but_never_the_reference_and_keeps_what_was_measured() -> None:
-    passed = time.monotonic() - 1
-    record = tune(SLOW, FAST, deadline=passed)  # the reference runs even though the deadline has passed
-    assert record.chosen.name == "fp32"
+def _clock_in_hundreds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each reading of the tune's clock is 100 s after the last (the timed passes keep the real one)."""
+    ticks = iter(range(100, 10_000, 100))
+    clock = SimpleNamespace(monotonic=lambda: next(ticks), perf_counter=time.perf_counter)
+    monkeypatch.setattr(tune_module, "time", clock)
+
+
+def test_a_budget_stops_a_candidate_that_would_end_past_the_soft_limit_but_never_the_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the reference is measured from 100 s to 200 s (cost 100 s); the next candidate is asked about at 300 s
+    _clock_in_hundreds(monkeypatch)
+    assert tune(SLOW, FAST, budget=TuneBudget(started=0.0, soft_limit_s=400.0)).chosen.name == "bf16"
+    _clock_in_hundreds(monkeypatch)
+    record = tune(SLOW, FAST, budget=TuneBudget(started=0.0, soft_limit_s=399.0))  # would end 1 s late
+    assert record.chosen.name == "fp32"  # the reference runs whatever the budget, and is chosen alone
     skipped = record.measurements[1]
     assert (skipped.candidate.name, skipped.error) == ("bf16", DEADLINE_ERROR)
     assert record.measurements[0].infer_s_median is not None
-    assert tune(SLOW, FAST, deadline=time.monotonic() + 600).chosen.name == "bf16"  # not reached: as today
+
+
+def test_the_free_memory_margin_is_never_below_the_kill_floor() -> None:
+    assert free_margin_gib(4.0) == 10.0
+    assert free_margin_gib(12.0) == 12.0
+
+
+def test_a_measurement_prints_as_one_line_with_dashes_for_what_was_not_measured() -> None:
+    failed = TuneMeasurement(candidate=FAST, error="boom")
+    assert measurement_line(failed, "bf16") == "bf16       failed: boom"
+    partial = TuneMeasurement(candidate=FAST, load_s=1.25, fits=True)
+    assert measurement_line(partial, "bf16") == "bf16       load 1.2 s  -  -  -  fits  <- chosen"
 
 
 def test_a_candidate_that_cannot_run_is_recorded_and_skipped() -> None:

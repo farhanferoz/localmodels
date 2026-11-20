@@ -40,7 +40,36 @@ if TYPE_CHECKING:
 GIB: Final = 1024**3
 DEADLINE_ERROR: Final = "not measured: the tune's deadline passed"
 
+# shared by every tune command (llama_tune, the in-process tune); the numbers are facts of this host's guards
+KILL_BELOW_GIB: Final = 10.0  # service_c's floor: above earlyoom's SIGTERM at 8 GiB on this host
+DEFAULT_HEADROOM_GIB: Final = 4.0  # as service_b's tune uses (commands/tune.py:42)
+STOP_MARGIN_S: Final = (
+    60.0  # a tune stops this long before the job's ceiling, and starts no step this long before that stop
+)
+
+# exit codes of a tune command
+EXIT_ADOPTED: Final = 0
+EXIT_FAILED: Final = 1
+EXIT_NOT_ADOPTED: Final = 2
+
+UNKNOWN: Final = "-"  # a cell of the printed table that was not measured
+
 log = logging.getLogger(__name__)
+
+
+def fits_budget(elapsed_s: float, cost_s: float, soft_limit_s: float) -> bool:
+    """Whether a step estimated at ``cost_s`` can finish inside the soft limit."""
+    return elapsed_s + cost_s <= soft_limit_s
+
+
+def soft_limit_s(limit_s: float) -> float:
+    """The time after which no step is started: the job's ceiling ``limit_s`` less two stop margins."""
+    return limit_s - 2 * STOP_MARGIN_S
+
+
+def free_margin_gib(headroom_gib: float) -> float:
+    """What a server must leave available: the headroom, never less than the floor its guard kills at."""
+    return max(headroom_gib, KILL_BELOW_GIB)
 
 
 class TuneError(Exception):
@@ -81,6 +110,15 @@ class TuneMeasurement(BaseModel):
     agreement: Agreement | None = None
     fits: bool = False
     error: str | None = None
+
+
+class TuneBudget(BaseModel):
+    """The time a tune may use: ``soft_limit_s`` seconds from ``started`` (a ``time.monotonic()`` instant)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    started: float
+    soft_limit_s: float
 
 
 class TuneRecord(BaseModel):
@@ -191,6 +229,25 @@ def embedding_cosine(key: str, min_cosine: float = 0.999) -> QualityCheck:
     return check
 
 
+def measurement_line(measurement: TuneMeasurement, chosen: str) -> str:
+    """One printed line of a candidate: load seconds, median inference seconds, peak GiB, agreement."""
+    name = measurement.candidate.name
+    if measurement.error is not None:
+        return f"{name:<10} failed: {measurement.error}"
+    agreement = measurement.agreement
+    cells = [
+        f"load {measurement.load_s:.1f} s" if measurement.load_s is not None else UNKNOWN,
+        f"median {measurement.infer_s_median:.2f} s" if measurement.infer_s_median is not None else UNKNOWN,
+        f"peak {measurement.peak_gib:.1f} GiB" if measurement.peak_gib is not None else UNKNOWN,
+        f"agreement {agreement.score:.4f} ({'pass' if agreement.passed else 'fail'})"
+        if agreement
+        else UNKNOWN,
+        "fits" if measurement.fits else "does not fit",
+        "<- chosen" if name == chosen else "",
+    ]
+    return f"{name:<10} " + "  ".join(cells).rstrip()
+
+
 def hardware_key(report: HardwareReport) -> str:
     """Device type, device name, memory in whole GB and architecture, joined with ':'."""
     return ":".join(
@@ -262,14 +319,15 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     cancel_check: Callable[[], bool] = lambda: False,
     hardware: HardwareReport | None = None,
     quiet_card: QuietCard | None = None,
-    deadline: float | None = None,
+    budget: TuneBudget | None = None,
 ) -> TuneRecord:
     """Measure every candidate and choose the fastest that agrees with ``candidates[0]`` and fits in memory.
 
     ``quiet_card``, when given, is held around the measurements so that stay-up services have unloaded
-    (``lease.QuietCard``); without it nothing changes. ``deadline`` is a ``time.monotonic()`` instant checked
-    only before each candidate after the reference (which always runs): once passed, the rest are not started
-    and are recorded with ``DEADLINE_ERROR``, and the choice is made among those measured.
+    (``lease.QuietCard``); without it nothing changes. ``budget``, when given, is checked only before each
+    candidate after the reference (which always runs): a candidate that, costing as long as the reference's
+    whole measurement (load, warm-up and timed passes), would end past ``budget.soft_limit_s`` is not
+    started but recorded with ``DEADLINE_ERROR``, and the choice is made among those measured.
 
     Raises:
         ValueError: two candidates have one name (nothing has been measured).
@@ -283,13 +341,19 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     report = hardware or inspect_hardware()
     measurements: list[TuneMeasurement] = []
     reference_outputs: list[ResultMessage] = []
+    reference_wall_s = 0.0
     libraries: dict[str, str] = {}
     with quiet_card if quiet_card is not None else contextlib.nullcontext():
         for position, candidate in enumerate(candidates):
-            if position and deadline is not None and time.monotonic() >= deadline:
+            if (
+                position
+                and budget is not None
+                and not fits_budget(time.monotonic() - budget.started, reference_wall_s, budget.soft_limit_s)
+            ):
                 measurements.append(TuneMeasurement(candidate=candidate, error=DEADLINE_ERROR))
                 continue
             free = available_memory(report.device.value)
+            began = time.monotonic()
             try:
                 measurement, outputs, reported = _measure(
                     candidate,
@@ -313,6 +377,7 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
             measurement.fits = free is None or measurement.peak_gib + headroom_gib <= free.bytes / GIB
             if position == 0:
                 reference_outputs, libraries = outputs, reported
+                reference_wall_s = time.monotonic() - began
                 measurement.agreement = Agreement(score=1.0, passed=True, detail="reference")
             else:
                 measurement.agreement = quality(reference_outputs, outputs)

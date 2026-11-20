@@ -74,7 +74,20 @@ from localmodels.process import (
 from localmodels.pull import _default_hub_cache
 from localmodels.retune import TUNE_LIMIT_S
 from localmodels.serving.protocol import ResultMessage
-from localmodels.serving.tune import Agreement, hardware_key, text_agreement
+from localmodels.serving.tune import (
+    DEFAULT_HEADROOM_GIB,
+    EXIT_ADOPTED,
+    EXIT_FAILED,
+    EXIT_NOT_ADOPTED,
+    KILL_BELOW_GIB,
+    STOP_MARGIN_S,
+    Agreement,
+    fits_budget,
+    free_margin_gib,
+    hardware_key,
+    soft_limit_s,
+    text_agreement,
+)
 from localmodels.settings import (
     MIN_PASSES,
     SPEED_MARGIN,
@@ -132,7 +145,6 @@ SPEC_MIN_SIMILARITY: Final = 0.65  # a tripwire for a broken draft setup, not a 
 # servers (design 6.2)
 HOST: Final = "127.0.0.1"
 SERVER_READY_TIMEOUT_S: Final = 1800.0  # a 94 GB model read from the local disk (service_c's allowance)
-KILL_BELOW_GIB: Final = 10.0  # service_c's floor: above earlyoom's SIGTERM at 8 GiB on this host
 OOM_SCORE_ADJ: Final = 1000  # the server, never the tune, is the kernel's first pick
 REQUEST_TIMEOUT_S: Final = 900.0
 WARMUP_TOKENS: Final = 8
@@ -145,9 +157,8 @@ CHECK_TIMEOUT_MIN_S: Final = 60.0
 # time (design 5.4, 6.7)
 # both limits follow the job's ceiling: ``retune.TUNE_LIMIT_S`` (D19) for the tunes it submits, ``--limit-s``
 # for a job submitted by hand with a longer ``timeout`` (a model whose steps need more: Flash-Next on mmap)
-STOP_MARGIN_S: Final = 60.0
 HARD_LIMIT_S: Final = TUNE_LIMIT_S - STOP_MARGIN_S  # no step runs past it: to stop and write before SIGTERM
-SOFT_LIMIT_S: Final = HARD_LIMIT_S - STOP_MARGIN_S  # no step starts that would end past it
+SOFT_LIMIT_S: Final = soft_limit_s(TUNE_LIMIT_S)  # no step starts that would end past it
 BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
 OUT_OF_TIME: Final = "not measured: out of time"  # a step the hard limit cut short
@@ -156,14 +167,8 @@ NO_ROOM: Final = (
 )
 SIGTERM_EXIT: Final = 128 + signal.SIGTERM
 
-# exit codes of the command
-EXIT_ADOPTED: Final = 0
-EXIT_FAILED: Final = 1
-EXIT_NOT_ADOPTED: Final = 2
-
 DEFAULT_MAX_PROMPTS: Final = 24
 DEFAULT_MAX_TOKENS: Final = 128
-DEFAULT_HEADROOM_GIB: Final = 4.0  # as service_b's tune uses (commands/tune.py:42)
 
 
 class LlamaTuneError(LocalModelsError):
@@ -348,11 +353,6 @@ class Planned(NamedTuple):
 def in_priority_order(steps: Sequence[Planned]) -> list[Planned]:
     """The steps most valuable first; equal priorities keep their order (the stages' own)."""
     return sorted(steps, key=lambda step: step.priority)
-
-
-def fits_budget(elapsed_s: float, cost_s: float, soft_limit_s: float) -> bool:
-    """Whether a step estimated at ``cost_s`` can finish inside the soft limit."""
-    return elapsed_s + cost_s <= soft_limit_s
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -1154,7 +1154,7 @@ class LlamaTune:
     @property
     def margin_gib(self) -> float:
         """What a server must leave available: the headroom, never less than the floor its guard kills at."""
-        return max(self.spec.headroom_gib, KILL_BELOW_GIB)
+        return free_margin_gib(self.spec.headroom_gib)
 
     # -- a server arm ----------------------------------------------------------------------------------
 
@@ -1696,7 +1696,7 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
         msg = f"--limit-s {args.limit_s:g}: give the job's timeout in seconds, above {2 * STOP_MARGIN_S:g}"
         raise SystemExit(msg)
     hard = args.limit_s - STOP_MARGIN_S
-    soft = hard - STOP_MARGIN_S if args.soft_limit_s is None else args.soft_limit_s
+    soft = soft_limit_s(args.limit_s) if args.soft_limit_s is None else args.soft_limit_s
     if not 0 < soft <= hard:
         msg = (
             f"--soft-limit-s {soft:g}: give it above 0 and at most {hard:g} s (--limit-s less "
