@@ -22,6 +22,7 @@ from localmodels.engine_bench import (
     ScoringError,
     ScoringPath,
 )
+from localmodels.llama_builds import CHECKOUT_ENV
 
 from .stub_engine import StubEngine, expected_logprobs, expected_top_tokens
 
@@ -252,7 +253,7 @@ def test_a_changed_prompt_file_is_refused_by_its_hash(
     assert sorted(p.name for p in written) == sorted([engine_bench.JUDGE_FILE, engine_bench.TEXT_FILE])
     assert engine_bench.load_prompts(tmp_path / "out", good).judge == ("p",)
     # with no paths given, the sources are found through their settings, not this machine's home folder
-    monkeypatch.setenv("LOCALMODELS_LLAMA_CHECKOUT", str(tmp_path))  # its docs/ is the folder above
+    monkeypatch.setenv(CHECKOUT_ENV, str(tmp_path))  # its docs/ is the folder above
     monkeypatch.setenv(engine_bench.HL5_DIR_ENV, str(tmp_path / "hl5"))
     (tmp_path / "hl5").mkdir()
     judge.rename(tmp_path / "hl5" / engine_bench.D16_JUDGE_FILE)
