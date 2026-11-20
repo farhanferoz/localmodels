@@ -139,7 +139,15 @@ class TuneBudget(BaseModel):
 
     @classmethod
     def for_job(cls, started: float, limit_s: float) -> TuneBudget:
-        """The budget of a job whose ceiling (its ``timeout``) is ``limit_s`` seconds after ``started``."""
+        """The budget of a job whose ceiling (its ``timeout``) is ``limit_s`` seconds after ``started``.
+
+        Raises:
+            ValueError: ``limit_s`` leaves no time after the two stop margins.
+        """
+        if not limit_s > 2 * STOP_MARGIN_S:
+            floor = 2 * STOP_MARGIN_S
+            msg = f"A tune's limit of {limit_s:g} s leaves no time: give the job's timeout, above {floor:g} s"
+            raise ValueError(msg)
         return cls(started=started, soft_limit_s=soft_limit_s(limit_s), hard_limit_s=hard_limit_s(limit_s))
 
 
@@ -350,11 +358,16 @@ class _Timekeeper:
         self.longest_s = max(self.longest_s, wall_s)
 
     def stop_check(self) -> bool:
-        """The caller's cancel check, also true from the hard limit on (remembered in ``out_of_time``)."""
+        """The caller's cancel check, also true from the hard limit on (remembered in ``out_of_time``).
+
+        The caller's cancel is asked first, so a cancel at the hard limit is still the caller's.
+        """
+        if self.cancel_check():
+            return True
         if self.budget is not None and self._elapsed() >= self.budget.hard_limit_s:
             self.out_of_time = True
             return True
-        return self.cancel_check()
+        return False
 
     def stopped_reason(self) -> str:
         """Why the reference had to be given up when the hard limit stopped it."""

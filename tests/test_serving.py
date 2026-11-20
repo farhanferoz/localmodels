@@ -367,6 +367,8 @@ class _FakeLoader:
     def load(self, model_dir: Path, settings: Settings, device: str) -> Any:
         if self.entry == "missing":
             raise FileNotFoundError(2, "no such file", str(model_dir / "weights.bin"))
+        if self.entry == "missing-unnamed":
+            raise FileNotFoundError("the weights")  # a library that names no path
         assert (settings.dtype, device) == (BF16, "cuda")
         return {
             "short": lambda texts: [1.0] * (len(texts) - 1),
@@ -414,12 +416,13 @@ def test_the_loader_server_scores_the_texts_by_id_and_reports_memory(fake_projec
 @pytest.mark.parametrize(
     ("dtype", "options", "named"),
     [
-        (Precision.FLOAT32, {}, "float32"),
-        (BF16, {"int8": "maybe"}, "'maybe'"),
-        (BF16, {"int8": 1}, "1"),  # True is declared, 1 is not
-        (BF16, {"cuda_graphs": True}, "'cuda_graphs'"),
+        (Precision.FLOAT32, REFERENCE_OPTIONS, "float32"),
+        (BF16, {"int8": "maybe", "tokens": 1000}, "'maybe'"),
+        (BF16, {"int8": 1, "tokens": 1000}, "1"),  # True is declared, 1 is not
+        (BF16, {**REFERENCE_OPTIONS, "cuda_graphs": True}, "'cuda_graphs'"),
+        (BF16, {"int8": False}, "['tokens'] are declared but not given"),
     ],
-    ids=["dtype", "value", "value-of-another-type", "option"],
+    ids=["dtype", "value", "value-of-another-type", "option", "missing-option"],
 )
 def test_the_loader_server_refuses_what_the_loader_did_not_declare(
     fake_project: Path, dtype: Precision, options: dict[str, object], named: str
@@ -432,13 +435,16 @@ def test_the_loader_server_refuses_what_the_loader_did_not_declare(
 
 
 def test_a_weight_file_the_snapshot_lacks_is_named_by_its_path(fake_project: Path) -> None:
-    error = _loader_replies("missing", fake_project)[0]
+    error = _loader_replies("missing", fake_project, **REFERENCE_OPTIONS)[0]
     assert isinstance(error, ErrorMessage)
     assert error.code == ServingErrorCode.BAD_INPUT
     assert (
         error.message
         == f"{fake_project / 'weights.bin'} is missing from the snapshot; download it before tuning"
     )
+    unnamed = _loader_replies("missing-unnamed", fake_project, **REFERENCE_OPTIONS)[0]
+    assert isinstance(unnamed, ErrorMessage)
+    assert unnamed.message == "the weights is missing from the snapshot; download it before tuning"
 
 
 @pytest.mark.parametrize(
@@ -451,7 +457,7 @@ def test_a_weight_file_the_snapshot_lacks_is_named_by_its_path(fake_project: Pat
 def test_a_scorer_that_returns_too_few_or_a_non_finite_score_is_an_internal_error(
     fake_project: Path, entry: str, message: str
 ) -> None:
-    error = _loader_replies(entry, fake_project)[1]
+    error = _loader_replies(entry, fake_project, **REFERENCE_OPTIONS)[1]
     assert isinstance(error, ErrorMessage)
     assert (error.code, error.message) == (ServingErrorCode.INTERNAL, message)
 
@@ -471,6 +477,8 @@ def test_a_scorer_that_returns_too_few_or_a_non_finite_score_is_an_internal_erro
         ({"reference": Settings(dtype=BF16, options={"int8": False, "tokens": 3})}, "3 of option 'tokens'"),
         ({"options": {"int8": (), "tokens": (1000,)}}, "Option 'int8' declares no values"),
         ({"reference": Settings(dtype=BF16, options=REFERENCE_OPTIONS, n_ubatch=512)}, "llama.cpp fields"),
+        ({"dtypes": (BF16, BF16)}, "repeat one"),
+        ({"options": {"int8": (False, True), "tokens": (1000, 1000)}}, "'tokens' repeats a value"),
     ],
     ids=[
         "no-dtype",
@@ -479,6 +487,8 @@ def test_a_scorer_that_returns_too_few_or_a_non_finite_score_is_an_internal_erro
         "reference-value",
         "option-without-values",
         "llama-field",
+        "dtype-twice",
+        "value-twice",
     ],
 )
 def test_a_declaration_whose_reference_is_not_among_its_declared_values_is_refused(
@@ -515,6 +525,10 @@ def test_candidates_are_the_product_with_the_reference_first_then_single_changes
     assert candidates(DECLARATION, 12)[2].options == {"int8": True, "tokens": 1000}
     with pytest.raises(TooManyCandidates, match=r"12 candidates.*cap of 11.*declare fewer values"):
         candidates(DECLARATION, 11)
+    reordered = DECLARATION.model_copy(  # the reference may list its options in another order
+        update={"reference": Settings(dtype=BF16, options={"tokens": 1000, "int8": False})}
+    )
+    assert [c.name for c in candidates(reordered, 12)] == names
     alone = LoaderDeclaration(dtypes=(BF16,), options={}, reference=Settings(dtype=BF16))
     assert [c.name for c in candidates(alone, 1)] == ["bfloat16"]
 

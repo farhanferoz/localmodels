@@ -104,7 +104,7 @@ class _Clock:
         return self.now
 
 
-def _costed(monkeypatch: pytest.MonkeyPatch, costs: dict[str, float], stopped: str = "") -> None:
+def _costed(monkeypatch: pytest.MonkeyPatch, costs: dict[str, float], stopped: str = "") -> _Clock:
     """Each candidate's measurement takes ``costs[name]`` seconds of the tune's clock.
 
     ``stopped`` is still running when its time has passed: the client then asks the stop check, as it does
@@ -121,6 +121,7 @@ def _costed(monkeypatch: pytest.MonkeyPatch, costs: dict[str, float], stopped: s
         return measure(candidate, **kw)
 
     monkeypatch.setattr(tune_module, "_measure", costed)
+    return clock
 
 
 def test_a_budget_stops_a_candidate_that_would_end_past_the_soft_limit_but_never_the_reference(
@@ -156,6 +157,16 @@ def test_the_hard_limit_stops_a_running_candidate_and_the_tune_still_chooses(
     _costed(monkeypatch, {"fp32": 200}, stopped="fp32")
     with pytest.raises(ReferenceFailedError, match="still running at the tune's hard limit"):
         tune(SLOW, FAST, budget=budget)
+    # the caller's own cancel at the hard limit is the caller's: it propagates, nothing is recorded
+    clock = _costed(monkeypatch, {"fp32": 10, "bf16": 200}, stopped="bf16")
+    with pytest.raises(ServingCancelled):
+        run_tune(
+            argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=INPUTS, candidates=[SLOW, FAST],
+            quality=text_agreement(0.9), quality_name="text 0.9", headroom_gib=0.0, hardware=CPU,
+            budget=budget, cancel_check=lambda: clock.now >= budget.hard_limit_s,
+        )  # fmt: skip
+    with pytest.raises(ValueError, match="leaves no time"):
+        TuneBudget.for_job(started=0, limit_s=120)
 
 
 def test_a_tune_where_nothing_fits_has_nothing_to_adopt_which_is_not_a_failed_reference() -> None:

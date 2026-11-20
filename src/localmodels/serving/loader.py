@@ -73,14 +73,24 @@ class LoaderDeclaration(BaseModel):
     reference: Settings
 
     @model_validator(mode="after")
-    def _consistent(self) -> LoaderDeclaration:
+    def _values_declared_once(self) -> LoaderDeclaration:
         if not self.dtypes:
             msg = "A loader must declare at least one dtype."
+            raise ValueError(msg)
+        if len(set(self.dtypes)) != len(self.dtypes):
+            msg = f"The dtypes {self.dtypes} repeat one; declare each once."
             raise ValueError(msg)
         for name, values in self.options.items():
             if not values:
                 msg = f"Option {name!r} declares no values; declare at least one."
                 raise ValueError(msg)
+            if len({(type(v), v) for v in values}) != len(values):
+                msg = f"Option {name!r} repeats a value in {values}; declare each once."
+                raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _reference_is_declared(self) -> LoaderDeclaration:
         llama_fields = sorted(f for f in _LLAMA_FIELDS if getattr(self.reference, f) is not None)
         if llama_fields:
             msg = (
@@ -180,7 +190,11 @@ def candidates(declaration: LoaderDeclaration, max_candidates: int) -> list[Tune
             "declare fewer values or raise --max-candidates."
         )
         raise TooManyCandidates(msg)
-    reference = [declaration.reference.dtype, *declaration.reference.options.values()]
+    # by the declaration's option order: the reference may list its options in another
+    reference = [
+        declaration.reference.dtype,
+        *(declaration.reference.options[name] for name in declaration.options),
+    ]
     reference_at = [
         next(i for i, v in enumerate(values) if _same(v, ref))
         for values, ref in zip(fields, reference, strict=True)
@@ -235,7 +249,7 @@ class LoaderServer(ModelServer):
         except FileNotFoundError as exc:
             raise ServingError(
                 ServingErrorCode.BAD_INPUT,
-                f"{exc.filename} is missing from the snapshot; download it before tuning",
+                f"{exc.filename or exc} is missing from the snapshot; download it before tuning",
             ) from None
         return LoadedMessage(
             seconds=time.perf_counter() - started,
@@ -249,6 +263,12 @@ class LoaderServer(ModelServer):
             raise ServingError(
                 ServingErrorCode.BAD_INPUT,
                 f"dtype {msg.dtype} is not declared; declared: {list(declaration.dtypes)}",
+            )
+        missing = sorted(declaration.options.keys() - msg.options.keys())
+        if missing:
+            raise ServingError(
+                ServingErrorCode.BAD_INPUT,
+                f"options {missing} are declared but not given; give one value each",
             )
         for name, value in msg.options.items():
             if name not in declaration.options:
