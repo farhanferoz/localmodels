@@ -6,14 +6,18 @@ text must not reach the manager) and ``exit`` (the process dies mid-request).
 Load options shape every inference after them: ``sleep_s`` (each
 inference sleeps that long), ``text`` (``raw_text`` is that, not the input directory), ``peak_gib`` (reported
 as ``peak_allocated_gib``), ``fail_dtype`` (a load in that dtype is refused as not implemented) and
-``libraries`` (added to the versions the ``loaded`` reply reports).
+``libraries`` (added to the versions the ``loaded`` reply reports) and ``score_shift`` (an in-process tune's
+loader: each text of ``texts.jsonl`` in the input directory scores its length / 10 plus the shift, under
+``"scores"`` by id).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from localmodels.serving import (
@@ -28,6 +32,7 @@ from localmodels.serving import (
     ServingErrorCode,
     run,
 )
+from localmodels.serving.loader import SCORES_KEY, TEXTS_FILE
 
 if TYPE_CHECKING:
     from localmodels.serving import ProgressEmitter
@@ -65,9 +70,14 @@ class EchoServer(ModelServer):
             emit_progress(
                 ProgressMessage(request_id=msg.request_id, stage=ProgressStage.DECODE, new_tokens=step + 1)
             )
+        scores = {}
+        if "score_shift" in self.options:
+            rows = (json.loads(line) for line in (Path(msg.input_dir) / TEXTS_FILE).read_text().splitlines())
+            scores = {SCORES_KEY: {r["id"]: len(r["text"]) / 10 + self.options["score_shift"] for r in rows}}
         return ResultMessage(
             request_id=msg.request_id,
             raw_text=self.options.get("text", msg.input_dir),
+            native_outputs=scores,
             peak_allocated_gib=self.options.get("peak_gib", 0.0),
         )
 

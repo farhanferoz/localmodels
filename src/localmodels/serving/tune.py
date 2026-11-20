@@ -47,6 +47,8 @@ STOP_MARGIN_S: Final = (
     60.0  # a tune stops this long before the job's ceiling, and starts no step this long before that stop
 )
 
+TUNE_LEASE_PROJECT: Final = "localmodels-tune"  # the name a tune's private lease and quiet request carry
+
 # exit codes of a tune command
 EXIT_ADOPTED: Final = 0
 EXIT_FAILED: Final = 1
@@ -211,7 +213,14 @@ def text_agreement(min_ratio: float = 0.9) -> QualityCheck:
     return check
 
 
-def score_agreement(key: str, min_spearman: float = 0.99, max_abs_diff: float = 0.05) -> QualityCheck:
+#: K6's quality check after a change (rules.md K6): the rule's own numbers, recorded by name in each record
+K6_MIN_SPEARMAN: Final = 0.99
+K6_MAX_ABS_DIFF: Final = 0.05
+
+
+def score_agreement(
+    key: str, min_spearman: float = K6_MIN_SPEARMAN, max_abs_diff: float = K6_MAX_ABS_DIFF
+) -> QualityCheck:
     """Rank agreement and largest difference of the name -> float scores in ``native_outputs[key]``.
 
     Every (input, name) pair present in both outputs is pooled; passes when the Spearman correlation is at

@@ -81,6 +81,7 @@ from localmodels.serving.tune import (
     EXIT_NOT_ADOPTED,
     KILL_BELOW_GIB,
     STOP_MARGIN_S,
+    TUNE_LEASE_PROJECT,
     Agreement,
     fits_budget,
     free_margin_gib,
@@ -121,7 +122,6 @@ log = logging.getLogger(__name__)
 
 GIB: Final = 1024**3
 MIB_PER_GIB: Final = 1024
-PROJECT: Final = "localmodels-tune"  # the name on the private lease and the quiet request
 
 # -ub (design 6.1, 6.4)
 UB_REFERENCE: Final = 512  # llama.cpp's own default
@@ -582,7 +582,7 @@ class LlamaTune:
         self.ppl_s: float | None = None  # a teacher-forced run's measured time
         self.text: Path | None = None
         self.control: KlStats | None = None
-        self.lease = GpuLease(spec.run_dir / "lease", PROJECT)
+        self.lease = GpuLease(spec.run_dir / "lease", TUNE_LEASE_PROJECT)
         self._servers = 0
         self._unified = False  # whether the GPU shares the host's RAM, read with the available memory
         self.unverified: set[str] = set()  # neither passed nor failed: not restarted in time, or cut short
@@ -1482,7 +1482,8 @@ async def tune_and_adopt(spec: TuneSpec, started: float | None = None) -> int:
     condition when the time budget was the reason.
     """
     card = QuietCard(
-        GpuLease(DEFAULT_LEASE_DIR, PROJECT), reason=f"llama.cpp tune of {spec.reference.identity.repository}"
+        GpuLease(DEFAULT_LEASE_DIR, TUNE_LEASE_PROJECT),
+        reason=f"llama.cpp tune of {spec.reference.identity.repository}",
     )
     try:
         await asyncio.to_thread(card.__enter__)

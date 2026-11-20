@@ -26,6 +26,7 @@ from .catalogue import ModelSpec
 from .digest import register as register_digest
 from .engines import register as register_engines
 from .enums import WorkloadKind
+from .inprocess_tune import register_tune
 from .lease import DEFAULT_LEASE_DIR, GpuLease, GpuLeaseClient, LeaseRecord
 from .llama_builds import register as register_llama
 from .refresh import register as register_refresh
@@ -308,6 +309,7 @@ def _build_settings_parser(subparsers: argparse._SubParsersAction[argparse.Argum
     check_p = commands.add_parser("check", help="list stored records stale on this host; exit 1 when any")
     check_p.add_argument("--home", default=None, help="llama home, where the `current` build is")
     check_p.set_defaults(fn=cmd_settings_check)
+    register_tune(commands)
 
 
 def build_parser() -> argparse.ArgumentParser:

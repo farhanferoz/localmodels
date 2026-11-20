@@ -166,6 +166,16 @@ class Step(StrEnum):
     LAYOUT = "layout"
 
 
+class TuneInputs(BaseModel):
+    """The texts an in-process tune measured on: the file's SHA-256, its count of texts and its path."""
+
+    model_config = ConfigDict(frozen=True)
+
+    sha256: str
+    count: int
+    path: str
+
+
 class SettingsRecord(BaseModel):
     """The stored result of one tune on one machine (schema 1). Unknown fields are ignored."""
 
@@ -189,6 +199,7 @@ class SettingsRecord(BaseModel):
     previous: str | None = None  # the replaced record's candidate, or its settings described
     tune_job: str | None = None
     adopted_at: datetime | None = None
+    inputs: TuneInputs | None = None  # an in-process tune's texts; None for every other tune
     # llama.cpp tune measurements (``llama_tune``), one JSON object per step. Untyped on purpose and apart
     # from ``measurements``: a reader that met another shape there would drop the whole record.
     llama_measurements: list[dict[str, Any]] = Field(default_factory=list)
@@ -1270,6 +1281,7 @@ def record_from_tune(
     recipe_project: str | None = None,
     tune_job: str | None = None,
     legacy_path: Path | None = None,
+    inputs: TuneInputs | None = None,
 ) -> SettingsRecord:
     """The store record for a PyTorch ``tune``, after the speed margin of design 5.5; adopt it with ``adopt``.
 
@@ -1278,7 +1290,8 @@ def record_from_tune(
     reference or the incumbent is chosen only if its median inference time beats the incumbent's by more than
     the larger of ``SPEED_MARGIN`` and the reference's timing spread (whole passes, as a fraction of the
     quickest); otherwise the incumbent stays, so timing noise cannot change the settings. ``libraries`` are
-    the caller's versions, added for names the tune's server did not report.
+    the caller's versions, added for names the tune's server did not report. ``inputs`` are the texts an
+    in-process tune measured on, kept on the record.
 
     Raises:
         AdoptError: the tune's chosen candidate is not an eligible measurement (it failed, does not fit or
@@ -1326,6 +1339,7 @@ def record_from_tune(
         reference=tune.reference,
         measurements=tune.measurements,
         tune_job=tune_job,
+        inputs=inputs,
     )
 
 
