@@ -84,6 +84,7 @@ from localmodels.serving.tune import (
     Agreement,
     fits_budget,
     free_margin_gib,
+    hard_limit_s,
     hardware_key,
     soft_limit_s,
     text_agreement,
@@ -157,7 +158,7 @@ CHECK_TIMEOUT_MIN_S: Final = 60.0
 # time (design 5.4, 6.7)
 # both limits follow the job's ceiling: ``retune.TUNE_LIMIT_S`` (D19) for the tunes it submits, ``--limit-s``
 # for a job submitted by hand with a longer ``timeout`` (a model whose steps need more: Flash-Next on mmap)
-HARD_LIMIT_S: Final = TUNE_LIMIT_S - STOP_MARGIN_S  # no step runs past it: to stop and write before SIGTERM
+HARD_LIMIT_S: Final = hard_limit_s(TUNE_LIMIT_S)  # no step runs past it: to stop and write before SIGTERM
 SOFT_LIMIT_S: Final = soft_limit_s(TUNE_LIMIT_S)  # no step starts that would end past it
 BENCH_REPETITIONS: Final = 3
 OUT_OF_BUDGET: Final = "not measured: out of budget"
@@ -1695,7 +1696,7 @@ def spec_from_args(args: argparse.Namespace) -> TuneSpec:
     if not 2 * STOP_MARGIN_S < args.limit_s < math.inf:
         msg = f"--limit-s {args.limit_s:g}: give the job's timeout in seconds, above {2 * STOP_MARGIN_S:g}"
         raise SystemExit(msg)
-    hard = args.limit_s - STOP_MARGIN_S
+    hard = hard_limit_s(args.limit_s)
     soft = soft_limit_s(args.limit_s) if args.soft_limit_s is None else args.soft_limit_s
     if not 0 < soft <= hard:
         msg = (

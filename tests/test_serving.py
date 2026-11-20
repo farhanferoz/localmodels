@@ -470,14 +470,30 @@ def test_a_scorer_that_returns_too_few_or_a_non_finite_score_is_an_internal_erro
         ),
         ({"reference": Settings(dtype=BF16, options={"int8": False, "tokens": 3})}, "3 of option 'tokens'"),
         ({"options": {"int8": (), "tokens": (1000,)}}, "Option 'int8' declares no values"),
+        ({"reference": Settings(dtype=BF16, options=REFERENCE_OPTIONS, n_ubatch=512)}, "llama.cpp fields"),
     ],
-    ids=["no-dtype", "reference-dtype", "reference-lacks-option", "reference-value", "option-without-values"],
+    ids=[
+        "no-dtype",
+        "reference-dtype",
+        "reference-lacks-option",
+        "reference-value",
+        "option-without-values",
+        "llama-field",
+    ],
 )
 def test_a_declaration_whose_reference_is_not_among_its_declared_values_is_refused(
     change: dict[str, Any], refusal: str
 ) -> None:
     with pytest.raises(ValidationError, match=refusal):
         LoaderDeclaration(**{**DECLARATION.model_dump(), **change})
+
+
+def test_an_answer_with_missing_fields_is_completed_from_the_reference() -> None:
+    rule_answer = Settings(dtype=BF16)  # what lookup answers from K6's rule: a dtype and no options
+    assert DECLARATION.complete(rule_answer) == Settings(dtype=BF16, options=REFERENCE_OPTIONS)
+    tuned = Settings(dtype=FP16, options={"tokens": 4000})
+    assert DECLARATION.complete(tuned) == Settings(dtype=FP16, options={"int8": False, "tokens": 4000})
+    assert DECLARATION.complete(Settings()) == DECLARATION.reference_settings()
 
 
 def test_candidates_are_the_product_with_the_reference_first_then_single_changes_then_pairs() -> None:

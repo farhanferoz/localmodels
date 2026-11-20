@@ -43,6 +43,8 @@ type TextScorer = Callable[[Sequence[str]], Sequence[float]]
 TEXTS_FILE: Final = "texts.jsonl"  # in the request's input_dir: one {"id": str, "text": str} per line
 SCORES_KEY: Final = "scores"  # the name -> float map in the result's native_outputs, as score_agreement reads
 _CUDA_DEVICE: Final = "cuda"  # the only device a model server runs on (open_load refuses without a GPU)
+#: ``Settings`` fields that belong to llama.cpp's tune, never to a loader's reference
+_LLAMA_FIELDS: Final = frozenset({"n_ubatch", "spec", "spec_draft_file", "model_file"})
 
 
 class TooManyCandidates(ValueError):  # noqa: N818 - reads as a refusal of the declaration, not an error state
@@ -79,6 +81,12 @@ class LoaderDeclaration(BaseModel):
             if not values:
                 msg = f"Option {name!r} declares no values; declare at least one."
                 raise ValueError(msg)
+        llama_fields = sorted(f for f in _LLAMA_FIELDS if getattr(self.reference, f) is not None)
+        if llama_fields:
+            msg = (
+                f"The reference sets llama.cpp fields {llama_fields}; a loader's has dtype and options only."
+            )
+            raise ValueError(msg)
         if self.reference.dtype not in self.dtypes:
             msg = (
                 f"The reference dtype {self.reference.dtype} is not among the declared dtypes {self.dtypes}."
@@ -102,6 +110,17 @@ class LoaderDeclaration(BaseModel):
     def reference_settings(self) -> Settings:
         """The reference setting: what a project passes as ``lookup``'s ``default``."""
         return self.reference
+
+    def complete(self, settings: Settings) -> Settings:
+        """``settings`` with a missing dtype or option filled from the reference.
+
+        A lookup answer from a rule carries a dtype and no options; production loads
+        ``declaration.complete(answer.settings)`` so the loader always gets one value per declared option.
+        """
+        return Settings(
+            dtype=settings.dtype or self.reference.dtype,
+            options={**self.reference.options, **settings.options},
+        )
 
 
 class ScorerLoader(Protocol):
@@ -253,7 +272,8 @@ class LoaderServer(ModelServer):
         del emit_progress  # a scorer reports no progress
         import torch  # noqa: PLC0415 - only the model-server process imports PyTorch
 
-        assert self._scorer is not None  # noqa: S101 - the manager loads before it infers
+        if self._scorer is None:
+            raise ServingError(ServingErrorCode.BAD_INPUT, "infer before load: load the model first")
         lines = (Path(msg.input_dir) / TEXTS_FILE).read_text(encoding="utf-8").splitlines()
         rows = [json.loads(line) for line in lines if line.strip()]
         torch.cuda.reset_peak_memory_stats()

@@ -26,7 +26,7 @@ from localmodels.atomic import write_text_atomically
 from localmodels.enums import Precision  # noqa: TC001 - pydantic needs it at runtime
 from localmodels.hardware import HardwareReport, available_memory, inspect_hardware
 from localmodels.serving.client import ModelServerProcess
-from localmodels.serving.errors import ServingError
+from localmodels.serving.errors import ServingCancelled, ServingError
 from localmodels.serving.protocol import InferMessage, LoadMessage, ResultMessage
 from localmodels.stack import fingerprint, stale_components
 from localmodels.version import package_version
@@ -62,9 +62,14 @@ def fits_budget(elapsed_s: float, cost_s: float, soft_limit_s: float) -> bool:
     return elapsed_s + cost_s <= soft_limit_s
 
 
+def hard_limit_s(limit_s: float) -> float:
+    """The time after which nothing runs: the job's ceiling ``limit_s`` less one stop margin."""
+    return limit_s - STOP_MARGIN_S
+
+
 def soft_limit_s(limit_s: float) -> float:
     """The time after which no step is started: the job's ceiling ``limit_s`` less two stop margins."""
-    return limit_s - 2 * STOP_MARGIN_S
+    return hard_limit_s(limit_s) - STOP_MARGIN_S
 
 
 def free_margin_gib(headroom_gib: float) -> float:
@@ -74,6 +79,14 @@ def free_margin_gib(headroom_gib: float) -> float:
 
 class TuneError(Exception):
     """A tune that cannot give a choice: the reference failed, or no candidate is eligible."""
+
+
+class ReferenceFailedError(TuneError):
+    """The reference could not be measured, so nothing could be compared: the tune failed."""
+
+
+class NoEligibleCandidateError(TuneError):
+    """Everything was measured, and no candidate agrees with the reference and fits: nothing to adopt."""
 
 
 class TuneCandidate(BaseModel):
@@ -113,12 +126,21 @@ class TuneMeasurement(BaseModel):
 
 
 class TuneBudget(BaseModel):
-    """The time a tune may use: ``soft_limit_s`` seconds from ``started`` (a ``time.monotonic()`` instant)."""
+    """The time a tune may use, in seconds from ``started`` (a ``time.monotonic()`` instant).
+
+    No candidate starts that would end past ``soft_limit_s``; one running at ``hard_limit_s`` is stopped.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     started: float
     soft_limit_s: float
+    hard_limit_s: float
+
+    @classmethod
+    def for_job(cls, started: float, limit_s: float) -> TuneBudget:
+        """The budget of a job whose ceiling (its ``timeout``) is ``limit_s`` seconds after ``started``."""
+        return cls(started=started, soft_limit_s=soft_limit_s(limit_s), hard_limit_s=hard_limit_s(limit_s))
 
 
 class TuneRecord(BaseModel):
@@ -305,6 +327,51 @@ def _measure(
     return measurement, outputs, loaded.libraries
 
 
+class _Timekeeper:
+    """A tune's time against its budget: whether the next candidate may start, and the hard stop."""
+
+    def __init__(self, budget: TuneBudget | None, cancel_check: Callable[[], bool]) -> None:
+        self.budget = budget
+        self.cancel_check = cancel_check
+        self.longest_s = 0.0  # the longest whole measurement so far: what the next candidate is taken to cost
+        self.out_of_time = False  # the budget's hard limit stopped a candidate
+
+    def _elapsed(self) -> float:
+        return time.monotonic() - self.budget.started if self.budget is not None else 0.0
+
+    def may_start(self) -> bool:
+        """Whether a candidate costing ``longest_s`` ends inside the soft limit (always, with no budget)."""
+        if self.budget is None:
+            return True
+        return not self.out_of_time and fits_budget(self._elapsed(), self.longest_s, self.budget.soft_limit_s)
+
+    def measured(self, wall_s: float) -> None:
+        """Count one whole measurement's wall time."""
+        self.longest_s = max(self.longest_s, wall_s)
+
+    def stop_check(self) -> bool:
+        """The caller's cancel check, also true from the hard limit on (remembered in ``out_of_time``)."""
+        if self.budget is not None and self._elapsed() >= self.budget.hard_limit_s:
+            self.out_of_time = True
+            return True
+        return self.cancel_check()
+
+    def stopped_reason(self) -> str:
+        """Why the reference had to be given up when the hard limit stopped it."""
+        limit = self.budget.hard_limit_s if self.budget is not None else math.inf
+        return f"was still running at the tune's hard limit ({limit:g} s); raise the job's limit"
+
+
+def _not_measured(
+    position: int, candidate: TuneCandidate, error: str, reference_reason: str
+) -> TuneMeasurement:
+    """A candidate not measured, recorded with ``error``; for the reference, ``TuneError`` instead."""
+    if position == 0:
+        msg = f"Reference candidate {candidate.name} {reference_reason}, so nothing can be compared"
+        raise ReferenceFailedError(msg)
+    return TuneMeasurement(candidate=candidate, error=error)
+
+
 def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are the whole contract
     *,
     argv: Sequence[str],
@@ -324,14 +391,17 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     """Measure every candidate and choose the fastest that agrees with ``candidates[0]`` and fits in memory.
 
     ``quiet_card``, when given, is held around the measurements so that stay-up services have unloaded
-    (``lease.QuietCard``); without it nothing changes. ``budget``, when given, is checked only before each
-    candidate after the reference (which always runs): a candidate that, costing as long as the reference's
-    whole measurement (load, warm-up and timed passes), would end past ``budget.soft_limit_s`` is not
-    started but recorded with ``DEADLINE_ERROR``, and the choice is made among those measured.
+    (``lease.QuietCard``); without it nothing changes. ``budget``, when given, is checked before each
+    candidate after the reference (which always starts): a candidate that, costing as long as the longest
+    whole measurement so far (load, warm-up and timed passes), would end past ``budget.soft_limit_s`` is not
+    started but recorded with ``DEADLINE_ERROR``. A candidate still running at ``budget.hard_limit_s`` is
+    stopped and recorded the same way, as is every one after it; the choice is made among those measured, so
+    the record is written before the job's own ceiling.
 
     Raises:
         ValueError: two candidates have one name (nothing has been measured).
-        TuneError: the reference candidate failed, or no candidate is eligible.
+        ReferenceFailedError: the reference failed or reached the budget's hard limit (a ``TuneError``).
+        NoEligibleCandidateError: no candidate is eligible (a ``TuneError``).
         ServingCancelled: ``cancel_check()`` turned true.
         QuietCardTimeoutError: ``quiet_card`` found a service still loaded after its timeout.
     """
@@ -341,15 +411,11 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     report = hardware or inspect_hardware()
     measurements: list[TuneMeasurement] = []
     reference_outputs: list[ResultMessage] = []
-    reference_wall_s = 0.0
+    clock = _Timekeeper(budget, cancel_check)
     libraries: dict[str, str] = {}
     with quiet_card if quiet_card is not None else contextlib.nullcontext():
         for position, candidate in enumerate(candidates):
-            if (
-                position
-                and budget is not None
-                and not fits_budget(time.monotonic() - budget.started, reference_wall_s, budget.soft_limit_s)
-            ):
+            if position and not clock.may_start():
                 measurements.append(TuneMeasurement(candidate=candidate, error=DEADLINE_ERROR))
                 continue
             free = available_memory(report.device.value)
@@ -362,22 +428,23 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
                     load=load,
                     inputs=inputs,
                     repeats=repeats,
-                    cancel_check=cancel_check,
+                    cancel_check=clock.stop_check,
                 )
+            except ServingCancelled:
+                if not clock.out_of_time:
+                    raise
+                measurements.append(
+                    _not_measured(position, candidate, DEADLINE_ERROR, clock.stopped_reason())
+                )
+                continue
             except ServingError as exc:
-                if position == 0:
-                    msg = (
-                        f"Reference candidate {candidate.name} failed, so nothing can be compared: "
-                        f"{exc.message}"
-                    )
-                    raise TuneError(msg) from exc
-                measurements.append(TuneMeasurement(candidate=candidate, error=exc.message))
+                measurements.append(_not_measured(position, candidate, exc.message, f"failed: {exc.message}"))
                 continue
             assert measurement.peak_gib is not None  # noqa: S101 - narrowing for mypy
             measurement.fits = free is None or measurement.peak_gib + headroom_gib <= free.bytes / GIB
+            clock.measured(time.monotonic() - began)
             if position == 0:
                 reference_outputs, libraries = outputs, reported
-                reference_wall_s = time.monotonic() - began
                 measurement.agreement = Agreement(score=1.0, passed=True, detail="reference")
             else:
                 measurement.agreement = quality(reference_outputs, outputs)
@@ -391,7 +458,7 @@ def run_tune(  # noqa: PLR0913 - one keyword-only entry point; the arguments are
     ]
     if not eligible:
         msg = "No candidate agrees with the reference and fits in memory; see the measurements."
-        raise TuneError(msg)
+        raise NoEligibleCandidateError(msg)
     best = min(eligible, key=lambda m: m.infer_s_median if m.infer_s_median is not None else math.inf)
     return TuneRecord(
         hardware=hardware_key(report),

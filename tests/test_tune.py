@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -15,10 +14,12 @@ from localmodels.lease import GpuLease, QuietCard
 from localmodels.serving import (
     InferMessage,
     LoadMessage,
+    NoEligibleCandidateError,
+    ReferenceFailedError,
     ResultMessage,
+    ServingCancelled,
     TuneBudget,
     TuneCandidate,
-    TuneError,
     TuneMeasurement,
     TuneRecord,
     embedding_cosine,
@@ -89,25 +90,78 @@ def test_the_reference_reports_its_libraries_and_each_timed_pass_is_totalled() -
     assert reference.pass_s == pytest.approx([times[0] + times[1], times[2] + times[3]])
 
 
-def _clock_in_hundreds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each reading of the tune's clock is 100 s after the last (the timed passes keep the real one)."""
-    ticks = iter(range(100, 10_000, 100))
-    clock = SimpleNamespace(monotonic=lambda: next(ticks), perf_counter=time.perf_counter)
+_MEASURE = tune_module._measure
+
+
+class _Clock:
+    """The tune's clock: still unless a measurement moves it (the timed passes keep the real one)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.perf_counter = time.perf_counter
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _costed(monkeypatch: pytest.MonkeyPatch, costs: dict[str, float], stopped: str = "") -> None:
+    """Each candidate's measurement takes ``costs[name]`` seconds of the tune's clock.
+
+    ``stopped`` is still running when its time has passed: the client then asks the stop check, as it does
+    once a second, and is cancelled if the check says so.
+    """
+    clock = _Clock()
     monkeypatch.setattr(tune_module, "time", clock)
+    measure = _MEASURE  # the real one, also when an earlier call already replaced it
+
+    def costed(candidate: TuneCandidate, **kw: Any) -> Any:
+        clock.now += costs[candidate.name]
+        if candidate.name == stopped and kw["cancel_check"]():
+            raise ServingCancelled
+        return measure(candidate, **kw)
+
+    monkeypatch.setattr(tune_module, "_measure", costed)
 
 
 def test_a_budget_stops_a_candidate_that_would_end_past_the_soft_limit_but_never_the_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # the reference is measured from 100 s to 200 s (cost 100 s); the next candidate is asked about at 300 s
-    _clock_in_hundreds(monkeypatch)
-    assert tune(SLOW, FAST, budget=TuneBudget(started=0.0, soft_limit_s=400.0)).chosen.name == "bf16"
-    _clock_in_hundreds(monkeypatch)
-    record = tune(SLOW, FAST, budget=TuneBudget(started=0.0, soft_limit_s=399.0))  # would end 1 s late
+    # the reference costs 100 s, so the next candidate, asked about at 100 s, would end at 200 s
+    _costed(monkeypatch, {"fp32": 100, "bf16": 100})
+    roomy = TuneBudget(started=0, soft_limit_s=200, hard_limit_s=1e9)
+    assert tune(SLOW, FAST, budget=roomy).chosen.name == "bf16"
+    _costed(monkeypatch, {"fp32": 300, "bf16": 1})
+    record = tune(SLOW, FAST, budget=roomy)
     assert record.chosen.name == "fp32"  # the reference runs whatever the budget, and is chosen alone
     skipped = record.measurements[1]
     assert (skipped.candidate.name, skipped.error) == ("bf16", DEADLINE_ERROR)
     assert record.measurements[0].infer_s_median is not None
+    # the cost is the longest measurement so far, not the reference's: fp16's 100 s stops bf16 at 110 s
+    _costed(monkeypatch, {"fp32": 10, "fp16": 100, "bf16": 1})
+    record = tune(
+        SLOW, FAST_BUT_WRONG, FAST, budget=TuneBudget(started=0, soft_limit_s=150, hard_limit_s=1e9)
+    )
+    assert [m.error for m in record.measurements] == [None, None, DEADLINE_ERROR]
+
+
+def test_the_hard_limit_stops_a_running_candidate_and_the_tune_still_chooses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = TuneBudget.for_job(started=0, limit_s=200)  # hard limit 140 s, soft limit 80 s
+    assert (budget.hard_limit_s, budget.soft_limit_s) == (140, 80)
+    _costed(monkeypatch, {"fp32": 10, "bf16": 200, "fp16": 1}, stopped="bf16")
+    record = tune(SLOW, FAST, FAST_BUT_WRONG, budget=budget)
+    assert record.chosen.name == "fp32"
+    assert [m.error for m in record.measurements] == [None, DEADLINE_ERROR, DEADLINE_ERROR]  # none after it
+    _costed(monkeypatch, {"fp32": 200}, stopped="fp32")
+    with pytest.raises(ReferenceFailedError, match="still running at the tune's hard limit"):
+        tune(SLOW, FAST, budget=budget)
+
+
+def test_a_tune_where_nothing_fits_has_nothing_to_adopt_which_is_not_a_failed_reference() -> None:
+    too_big = SLOW.model_copy(update={"options": {**SLOW.options, "peak_gib": 1e6}})
+    with pytest.raises(NoEligibleCandidateError, match="No candidate agrees"):
+        tune(too_big)
 
 
 def test_the_free_memory_margin_is_never_below_the_kill_floor() -> None:
@@ -131,7 +185,7 @@ def test_a_candidate_that_cannot_run_is_recorded_and_skipped() -> None:
 
 def test_a_reference_that_cannot_run_or_two_candidates_of_one_name_end_the_tune() -> None:
     reference = TuneCandidate(name="fp32", dtype=Precision.FLOAT32, options={"fail_dtype": "float32"})
-    with pytest.raises(TuneError, match="Reference candidate fp32 failed"):
+    with pytest.raises(ReferenceFailedError, match="Reference candidate fp32 failed"):
         tune(reference, FAST)
     with pytest.raises(ValueError, match="unique"):
         tune(SLOW, FAST, FAST.model_copy(update={"dtype": Precision.FLOAT16}))
@@ -196,7 +250,7 @@ def test_a_record_made_on_another_stack_warns_once_and_still_gives_its_choice(
 
 def test_the_quiet_card_is_withdrawn_when_the_tune_fails(tmp_path: Path) -> None:
     card = QuietCard(GpuLease(tmp_path, project="tuner"), reason="tune", timeout_s=1, poll_s=0.02)
-    with pytest.raises(TuneError, match="Reference candidate bad failed"):
+    with pytest.raises(ReferenceFailedError, match="Reference candidate bad failed"):
         run_tune(
             argv=ECHO_ARGV, env=ECHO_ENV, load=LOAD, inputs=INPUTS, candidates=[BROKEN, FAST],
             quality=text_agreement(0.9), quality_name="text 0.9", headroom_gib=0.0, hardware=CPU,
