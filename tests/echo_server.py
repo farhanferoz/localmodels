@@ -72,7 +72,10 @@ class EchoServer(ModelServer):
             )
         scores = {}
         if "score_shift" in self.options:
-            rows = (json.loads(line) for line in (Path(msg.input_dir) / TEXTS_FILE).read_text().splitlines())
+            lines = (Path(msg.input_dir) / TEXTS_FILE).read_text().splitlines()
+            rows = (
+                json.loads(line) for line in lines if line.strip()
+            )  # blank lines skipped, as LoaderServer
             scores = {SCORES_KEY: {r["id"]: len(r["text"]) / 10 + self.options["score_shift"] for r in rows}}
         return ResultMessage(
             request_id=msg.request_id,

@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -27,7 +26,7 @@ from localmodels.lease import DEFAULT_LEASE_DIR, GpuLease, QuietCard, QuietCardT
 from localmodels.pinned import snapshot_dir
 from localmodels.pull import _default_hub_cache
 from localmodels.serving.errors import ServingCancelled
-from localmodels.serving.loader import SCORES_KEY, TEXTS_FILE, candidates, resolve_factory
+from localmodels.serving.loader import SCORES_KEY, TEXTS_FILE, LoaderDeclaration, candidates, resolve_factory
 from localmodels.serving.protocol import InferMessage, LoadMessage
 from localmodels.serving.server import library_versions
 from localmodels.serving.tune import (
@@ -83,8 +82,12 @@ def _snapshot(model: ModelIdentity) -> Path:
     return folder
 
 
-def _read_texts(path: Path, minimum: int, maximum: int) -> TuneInputs:
-    """Check the texts file (one ``{"id": str, "text": str}`` per line, unique ids, a count in range)."""
+def _read_texts(path: Path, minimum: int, maximum: int) -> tuple[TuneInputs, bytes]:
+    """Check the texts file (one ``{"id": str, "text": str}`` per line, unique ids, a count in range).
+
+    The bytes checked come back with the record's description of them: they, not a second read of the file,
+    are what the servers score.
+    """
     from localmodels.settings import TuneInputs  # noqa: PLC0415 - the lookup's module, loaded by the command
 
     try:
@@ -92,8 +95,13 @@ def _read_texts(path: Path, minimum: int, maximum: int) -> TuneInputs:
     except OSError as exc:
         msg = f"the texts file {path} cannot be read: {exc}"
         raise TuneInputError(msg) from exc
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        msg = f"the texts file {path} is not UTF-8 (byte {exc.start}); write it as UTF-8 JSONL"
+        raise TuneInputError(msg) from exc
     ids: set[str] = set()
-    for number, line in enumerate(data.decode("utf-8").splitlines(), start=1):
+    for number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -116,7 +124,28 @@ def _read_texts(path: Path, minimum: int, maximum: int) -> TuneInputs:
             "(--min-texts, --max-texts)"
         )
         raise TuneInputError(msg)
-    return TuneInputs(sha256=hashlib.sha256(data).hexdigest(), count=len(ids), path=str(path.resolve()))
+    inputs = TuneInputs(sha256=hashlib.sha256(data).hexdigest(), count=len(ids), path=str(path.resolve()))
+    return inputs, data
+
+
+def _declaration(spec: str, entry: str) -> LoaderDeclaration:
+    """The loader's declaration; a project's factory or loader that fails on ``entry`` is a refused input."""
+    factory = resolve_factory(spec)
+    try:
+        return factory(entry).declare()
+    except (KeyError, AttributeError, TypeError) as exc:
+        msg = f"the loader {spec} cannot give a declaration for {entry!r} ({type(exc).__name__}: {exc})"
+        raise TuneInputError(msg) from exc
+
+
+def _check_numbers(args: argparse.Namespace) -> None:
+    """The run's own numbers: at least one timed pass, a headroom that is not negative."""
+    if args.repeats < 1:
+        msg = f"--repeats {args.repeats}: give at least 1 timed pass (the reference's spread needs 2)"
+        raise TuneInputError(msg)
+    if args.headroom_gib < 0:
+        msg = f"--headroom-gib {args.headroom_gib:g}: give the memory to leave free, 0 or more"
+        raise TuneInputError(msg)
 
 
 def cmd_settings_tune(args: argparse.Namespace) -> int:
@@ -138,8 +167,9 @@ def cmd_settings_tune(args: argparse.Namespace) -> int:
         model = ModelIdentity(repository=args.model, revision=args.revision)
         snapshot = _snapshot(model)
         texts = Path(args.texts)
-        inputs = _read_texts(texts, args.min_texts, args.max_texts)
-        declaration = resolve_factory(args.loader)(args.entry).declare()
+        _check_numbers(args)
+        inputs, checked = _read_texts(texts, args.min_texts, args.max_texts)
+        declaration = _declaration(args.loader, args.entry)
         measured = candidates(declaration, args.max_candidates)
         budget = TuneBudget.for_job(started=started, limit_s=args.limit_s)
     except (
@@ -148,7 +178,7 @@ def cmd_settings_tune(args: argparse.Namespace) -> int:
         sys.stderr.write(f"not tuned: {exc}\n")
         return EXIT_FAILED
     with tempfile.TemporaryDirectory(prefix="localmodels-tune-") as folder:
-        shutil.copyfile(texts, Path(folder) / TEXTS_FILE)
+        (Path(folder) / TEXTS_FILE).write_bytes(checked)
         try:
             record = _run(args, snapshot, Path(folder), measured, budget)
             stored = adopt(
@@ -165,7 +195,7 @@ def cmd_settings_tune(args: argparse.Namespace) -> int:
         except (NoEligibleCandidateError, AdoptError) as exc:
             sys.stderr.write(f"measured, nothing adopted: {exc}\n")
             return EXIT_NOT_ADOPTED
-        except (ReferenceFailedError, QuietCardTimeoutError) as exc:
+        except (ReferenceFailedError, QuietCardTimeoutError, OSError) as exc:  # OSError: the lease folder
             sys.stderr.write(f"not tuned: {exc}\n")
             return EXIT_FAILED
         except ServingCancelled:
@@ -198,7 +228,7 @@ def _run(
     )
 
 
-def in_process_recipe(
+def in_process_recipe(  # noqa: PLR0913 - keyword-only; the arguments are the command's flags
     *,
     project: str,
     loader: str,
@@ -208,11 +238,17 @@ def in_process_recipe(
     texts: Path,
     workdir: Path,
     reference: str,
+    min_texts: int = DEFAULT_MIN_TEXTS,
+    max_texts: int = DEFAULT_MAX_TEXTS,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> TuneRecipe:
-    """The tune command as ``lookup``'s automatic re-tune runs it, in the project's environment and folder."""
+    """The tune command as ``lookup``'s automatic re-tune runs it, in the project's environment and folder.
+
+    A limit the project set away from its default goes into the command, so the re-tune takes the same input.
+    """
     from localmodels.settings import TuneRecipe  # noqa: PLC0415 - a project building a recipe has the lookup loaded
 
-    command = (
+    command: tuple[str, ...] = (
         str(Path(sys.executable).with_name("localmodels")),
         "settings",
         "tune",
@@ -230,6 +266,14 @@ def in_process_recipe(
         kind.value,
         "--texts",
         str(texts),
+    )
+    limits = (
+        ("--min-texts", min_texts, DEFAULT_MIN_TEXTS),
+        ("--max-texts", max_texts, DEFAULT_MAX_TEXTS),
+        ("--max-candidates", max_candidates, DEFAULT_MAX_CANDIDATES),
+    )
+    command += tuple(
+        item for flag, value, default in limits if value != default for item in (flag, str(value))
     )
     return TuneRecipe(
         project=project, command=command, workdir=workdir, reference=reference, quality=QUALITY_NAME

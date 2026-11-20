@@ -36,6 +36,8 @@ DECLARATION = LoaderDeclaration(
 
 class _Loader:
     def __init__(self, entry: str) -> None:
+        if entry == "unknown":  # a project's registry that does not know the name
+            raise KeyError(entry)
         self.entry = entry
 
     def declare(self) -> LoaderDeclaration:
@@ -78,7 +80,8 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., in
     monkeypatch.setattr(inprocess_tune, "loader_argv", argv)
     monkeypatch.setattr("localmodels.serving.tune.available_memory", lambda _device: None)  # taken to fit
     texts = tmp_path / "texts.jsonl"
-    texts.write_text("".join(json.dumps({"id": f"t{i}", "text": "x" * i}) + "\n" for i in range(5)))
+    rows = [json.dumps({"id": f"t{i}", "text": "x" * i}) for i in range(5)]
+    texts.write_text("\n".join([*rows[:2], "", *rows[2:]]) + "\n")  # a blank line is skipped, not refused
 
     def run(*extra: str, entry: str = "ok") -> int:
         flags = {
@@ -135,6 +138,9 @@ def test_the_fastest_agreeing_candidate_is_adopted_with_the_texts_it_was_measure
         (("--max-candidates", "5"), "6 candidates, above the cap of 5"),
         (("--loader", "fake_tune_project"), "MODULE:ATTRIBUTE"),
         (("--limit-s", "100"), "leaves no time"),
+        (("--entry", "unknown"), "cannot give a declaration for 'unknown' (KeyError"),
+        (("--repeats", "0"), "--repeats 0: give at least 1 timed pass"),
+        (("--headroom-gib", "-1"), "--headroom-gib -1: give the memory to leave free"),
     ],
     ids=[
         "too-few",
@@ -144,6 +150,9 @@ def test_the_fastest_agreeing_candidate_is_adopted_with_the_texts_it_was_measure
         "too-many-candidates",
         "bad-loader",
         "limit",
+        "unknown-entry",
+        "no-pass",
+        "negative-headroom",
     ],
 )
 def test_input_that_cannot_be_tuned_is_refused_before_any_server_starts(
@@ -162,6 +171,9 @@ def test_a_texts_file_with_a_repeated_id_is_refused_before_any_server_starts(
         handle.write(json.dumps({"id": "t1", "text": "again"}) + "\n")
     assert project() == EXIT_FAILED
     assert "repeats the id 't1'" in capsys.readouterr().err
+    project.texts.write_bytes(b"\xff\n")
+    assert project() == EXIT_FAILED
+    assert f"the texts file {project.texts} is not UTF-8" in capsys.readouterr().err
     assert project.started == []
 
 
@@ -170,6 +182,8 @@ def test_a_failed_reference_is_a_failure_and_nothing_eligible_is_measured_not_ad
 ) -> None:
     assert project(entry="broken") == EXIT_FAILED
     assert "Reference candidate" in capsys.readouterr().err
+    assert project("--lease-dir", "/dev/null/lease") == EXIT_FAILED  # a lease folder that cannot be made
+    assert "not tuned:" in capsys.readouterr().err
     # 8 GiB free: the 4 GiB headroom alone would fit, but no candidate may leave less than the 10 GiB floor
     full = SimpleNamespace(bytes=8 * 1024**3)
     monkeypatch.setattr("localmodels.serving.tune.available_memory", lambda _device: full)
@@ -189,9 +203,14 @@ def test_the_recipe_is_the_command_the_cli_parses(tmp_path: Path) -> None:
         texts=tmp_path / "t.jsonl",
         workdir=tmp_path,
         reference="bfloat16,score_shift=0.0",
+        min_texts=30,
     )
     assert recipe.command[0] == str(Path(sys.executable).with_name("localmodels"))
     args = cli.build_parser().parse_args(recipe.command[1:])
+    assert (args.min_texts, args.max_texts) == (
+        30,
+        inprocess_tune.DEFAULT_MAX_TEXTS,
+    )  # only the changed limit
     assert args.fn is inprocess_tune.cmd_settings_tune
     parsed = (args.project, args.loader, args.entry, args.model, args.revision, args.kind, args.texts)
     assert parsed == (
