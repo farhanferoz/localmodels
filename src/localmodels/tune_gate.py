@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from localmodels.hardware import HardwareReport
     from localmodels.settings import ModelIdentity, SettingsAnswer, TuneRecipe
 
-#: owner-approved request of 2026-11-19 (tracecraft): "refuses a GPU job expected over ~1 h"; a flag's default
+#: owner-approved request of 2026-11-19: "refuses a GPU job expected over ~1 h"; a flag's default
 DEFAULT_MAX_UNTUNED_HOURS: Final = 1.0
 GATE_LOG: Final = "gate.jsonl"  # in the settings store, beside the records
 #: the engines a record can be measured for here: this package's in-process tune and llama_tune

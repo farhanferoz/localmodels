@@ -1,8 +1,7 @@
 # localmodels
 
 Hardware-aware local model serving, GPU-lease coordination and a model catalogue shape, extracted
-from [service_a](https://github.com/farhanferoz/service_a),
-[service_c](https://github.com/farhanferoz/service_c) and service_b so every project that runs
+from service_a, service_c and service_b, three research projects, so every project that runs
 local models — a `llama-server` text model, or a PyTorch model of any kind in its own process —
 shares one implementation.
 
@@ -10,6 +9,12 @@ shares one implementation.
 `sysconf`/`sysctl`, never through `torch.cuda`, and the serving manager only starts processes and
 exchanges JSON. A caller can depend on this package without pulling in a CUDA build meant for a
 different accelerator; only a model server's own process imports PyTorch.
+
+## How it fits the setup
+
+localmodels is the model-serving and GPU-sharing layer of the
+[claude-code-setup](https://github.com/farhanferoz/claude-code-setup) map. It runs beside Claude Code and does not
+touch its configuration. The setup repository installs it from this repository with the command above.
 
 ## What it does
 
@@ -105,9 +110,14 @@ different accelerator; only a model server's own process imports PyTorch.
 
 ## Installing
 
+Install it as a tool from a clone (it needs Python 3.12 or 3.13, and is not published on PyPI):
+
 ```
-uv add localmodels
+uv tool install --editable .
+localmodels --help
 ```
+
+To use it from another project, add the clone as a dependency, for example `uv add --editable /path/to/localmodels`.
 
 `huggingface_hub` is a core dependency (Apache-2.0): `localmodels setup` needs it unconditionally
 to download a model, not just the callers who use `pull_model` directly. It is declared as a range
@@ -123,9 +133,11 @@ localmodels setup [--role chat] [--models-dir DIR] [--catalogue FILE] [--yes]
 localmodels serve --config <toml>
 localmodels lease {status,acquire,wait,begin-wait,admitted,release} --project NAME ...
 localmodels rules {show KIND,check}
-localmodels settings {show --model REPO (--revision REV | --file NAME) --kind KIND,check}
+localmodels settings {show --model REPO (--revision REV | --file NAME) --kind KIND,check,tune,require}
 localmodels llama {build --commit SHA,list,switch COMMIT,prune}
 localmodels digest run
+localmodels refresh {run,build,measure,status,engine-pull,engine-measure,engine-calibrate,same-client,sparkrun-compare}
+localmodels engines {list,switch,pull,calibrate,approve,approvals,prune,measure,prompts,reap}
 ```
 
 `localmodels setup` inspects the host, picks the largest OSI-licensed catalogue model for the
@@ -156,6 +168,24 @@ is `~/.local/state/gpu-lease` unless `GPU_LEASE_DIR` says otherwise), so a
 caller that cannot import this package (e.g. a bash queue) can still speak the protocol. After
 `begin-wait`, `wait` takes its turn in request order (`GpuLeaseClient`); without a waiting lease of
 its own it waits for every other live lease, as before.
+
+## Configuration
+
+Every location is an environment variable with a default. A caller or a flag overrides each of them.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GPU_LEASE_DIR` | `~/.local/state/gpu-lease` | Lease directory shared by the projects on one GPU |
+| `LLAMA_SERVER_BIN` | unset, then `PATH` | The `llama-server` binary |
+| `LOCALMODELS_STATE_DIR` | `~/.local/state/localmodels` | Tune records, rule records and the settings store |
+| `LOCALMODELS_LLAMA_HOME` | `~/cache/llama.cpp` | llama.cpp builds, one folder per commit |
+| `LOCALMODELS_LLAMA_CHECKOUT` | `~/dev/llama.cpp` | The reference llama.cpp checkout |
+| `LOCALMODELS_REFRESH_DIR` | `~/cache/localmodels/refresh` | Run folders of `refresh` |
+| `LOCALMODELS_SPARKRUN_ROOT` | `~/cache/localmodels/sparkrun` | Pinned sparkrun checkouts |
+| `LOCALMODELS_HL5_DIR` | `~/cache/localmodels/hl5` | Judge prompts that the digest check D16 reads |
+| `LOCALMODELS_SUBMIT` | `~/dev/turing/preflight/slurm/submit.py` | The slurm submit script that a re-tune runs |
+| `LOCALMODELS_RETUNE` | unset (on) | Any value but `on` stops the automatic re-tune. It is off under pytest unless set to `on` |
+| `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | Hugging Face cache that models are served from |
 
 ## Rules and llama.cpp builds
 

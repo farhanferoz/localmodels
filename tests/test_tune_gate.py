@@ -24,7 +24,7 @@ from tests.test_retune import GPU, Slurm, slurm  # noqa: F401 - the fake slurm f
 if TYPE_CHECKING:
     from pathlib import Path
 
-MESMER = ModelIdentity(repository="example/mesmer-4b", revision="c" * 40)  # tracecraft's case, renamed
+MESMER = ModelIdentity(repository="example/mesmer-4b", revision="c" * 40)  # another project's case, renamed
 CPU = HardwareReport(
     platform="linux", arch="aarch64", device=DeviceType.CPU, device_name="CPU", total_memory_gb=122.0,
     tier=DeviceTier.SLOW_CPU,
@@ -72,7 +72,7 @@ def _store(model: ModelIdentity, **change: Any) -> None:
 def test_a_long_job_on_an_unmeasured_model_is_refused_with_the_tune_to_run_and_logged(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _require() == 1  # tracecraft's 24 GPU-hours on a setting never measured here
+    assert _require() == 1  # a research project's 24 GPU-hours on a setting never measured here
     err = capsys.readouterr().err
     assert "REFUSED example/mesmer-4b (K6, pytorch, 24 h): no measured record" in err
     assert "localmodels settings tune --project <project> --loader <module:function> --entry <entry> " in err

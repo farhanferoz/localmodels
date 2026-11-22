@@ -113,14 +113,14 @@ For every kind:
 
 - Rule K8.precision: fp32, no compile, no bf16 below about 2 M parameters. TF32 only where scores are not compared
   across settings: switching TF32 moved one system's published scores by 16-20 % (project_a D173, measured on
-  Isambard, not here). Batch size is the lever (10.3x throughput at 16x the batch, MH), but it changes gradient
+  another cluster, not here). Batch size is the lever (10.3x throughput at 16x the batch, MH), but it changes gradient
   noise, so the learning rate must be re-derived.
 - Evidence: gpu-job-settings (MH).
 - Quality check after a change: loss after 200 steps against fp32, same seed.
 - Stale when: PyTorch or the driver changes.
 - stamp: torch=2.10.0+cu130 driver=580.173.02 cuda=13.0 kernel=6.17.0-1031-nvidia dgx_os=7.6.0 date=2026-10-18 model=any
 - Recipe (about 4 GPU-minutes): `launch_bound_bench.py` and `crossover_sweep.py` from
-  /home/user1/dev/workspace-sync/dgx/scripts/bench at batch 128 and 2048, fp32 with TF32 against bf16, compile off
+  a private benchmark folder, at batch 128 and 2048, fp32 with TF32 against bf16, compile off
   and on.
 
 ## K9 training, larger models and heads on frozen encoders

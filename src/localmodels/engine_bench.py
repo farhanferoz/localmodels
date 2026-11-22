@@ -84,7 +84,7 @@ VARIANT_STRIDE: Final = 7919  # a prime, so successive variants start far apart 
 
 # Where D16 read its inputs from, and what they hash to. The pinned text is the text of llama.cpp's docs/*.md
 # (sorted, read with errors ignored, joined by a blank line) at commit ccc3646 (unchanged since 2026-09-07,
-# before D16 ran); the judge prompts are tracecraft's rendered judge prompts of hl5.
+# before D16 ran); the judge prompts are a research project's rendered judge prompts of hl5.
 # The docs folder is ``docs`` of the reference checkout (``llama_builds.reference_checkout()``); the judge
 # prompts' folder is ``$LOCALMODELS_HL5_DIR``, else where HL5 left them. The SHA-256 pins are the record.
 D16_DOCS_SUBDIR: Final = "docs"
